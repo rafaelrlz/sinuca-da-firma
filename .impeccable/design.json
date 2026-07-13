@@ -1,0 +1,142 @@
+{
+  "schemaVersion": 2,
+  "generatedAt": "2026-07-13T12:00:00-03:00",
+  "title": "Design System: Sinuca da Firma",
+  "extensions": {
+    "colorMeta": {
+      "match-green": { "role": "primary", "displayName": "Verde da Partida", "canonical": "#126347", "tonalRamp": ["#062419", "#083b2c", "#0c4a36", "#126347", "#16835c", "#21a071", "#8bd5b5", "#daf3e7"] },
+      "hall-green": { "role": "primary", "displayName": "Verde do Salão", "canonical": "#062c21", "tonalRamp": ["#031711", "#062c21", "#083b2c", "#0c4a36", "#126347", "#2d8766", "#8fcbb4", "#e4f3ed"] },
+      "control-green": { "role": "primary", "displayName": "Verde de Controle", "canonical": "#0c4a36", "tonalRamp": ["#041c14", "#062c21", "#083b2c", "#0c4a36", "#126347", "#28906b", "#91d1b8", "#e5f4ee"] },
+      "action-green": { "role": "primary", "displayName": "Verde de Ação", "canonical": "#21a071", "tonalRamp": ["#082a1e", "#0c4a36", "#126347", "#16835c", "#21a071", "#55bc90", "#9dddc1", "#e9f8f1"] },
+      "soft-green": { "role": "primary", "displayName": "Verde de Apoio", "canonical": "#daf3e7", "tonalRamp": ["#0a2d20", "#14513b", "#237557", "#439879", "#71b99b", "#a3d5bf", "#daf3e7", "#f1fbf6"] },
+      "scoreboard-white": { "role": "neutral", "displayName": "Branco do Placar", "canonical": "#ffffff", "tonalRamp": ["#222222", "#414141", "#626262", "#858585", "#aaaaaa", "#cecece", "#eeeeee", "#ffffff"] },
+      "table-background": { "role": "neutral", "displayName": "Fundo da Mesa", "canonical": "#f3f5f3", "tonalRamp": ["#1d211e", "#3b403c", "#5c625d", "#7f8580", "#a4aaa5", "#c9ceca", "#e7eae7", "#f3f5f3"] },
+      "quiet-surface": { "role": "neutral", "displayName": "Superfície Silenciosa", "canonical": "#f8faf8", "tonalRamp": ["#202421", "#404541", "#626763", "#858b86", "#abb0ac", "#d0d4d1", "#edf0ed", "#f8faf8"] },
+      "structural-surface": { "role": "neutral", "displayName": "Superfície Estrutural", "canonical": "#e9efeb", "tonalRamp": ["#19201c", "#35403a", "#526158", "#708279", "#91a49a", "#b5c6bd", "#d6e1db", "#eef5f1"] },
+      "table-graphite": { "role": "neutral", "displayName": "Grafite da Mesa", "canonical": "#17231d", "tonalRamp": ["#0c120f", "#17231d", "#304039", "#4d5e55", "#6e7e75", "#94a29a", "#c2cbc6", "#edf1ef"] },
+      "muted-ink": { "role": "neutral", "displayName": "Tinta Suave", "canonical": "#5d6b63", "tonalRamp": ["#18201b", "#303b35", "#48564f", "#5d6b63", "#7b8981", "#9eaaa3", "#c5cdc8", "#edf1ef"] },
+      "divider": { "role": "neutral", "displayName": "Divisória", "canonical": "#dce4df", "tonalRamp": ["#17201a", "#324039", "#4f6157", "#6f8278", "#91a59a", "#b5c8bd", "#dce4df", "#f2f6f3"] },
+      "victory-gold": { "role": "secondary", "displayName": "Ouro da Vitória", "canonical": "#c79223", "tonalRamp": ["#2a1d05", "#513909", "#79570f", "#a07617", "#c79223", "#dcaf51", "#ebcf8b", "#fbf0d2"] },
+      "attention-gold": { "role": "secondary", "displayName": "Ouro de Atenção", "canonical": "#fff5d8", "tonalRamp": ["#2b2209", "#554612", "#806b20", "#aa9135", "#d2b85a", "#ead483", "#fff0bd", "#fff8e5"] },
+      "error-red": { "role": "tertiary", "displayName": "Vermelho de Erro", "canonical": "#b33a3a", "tonalRamp": ["#2b0b0b", "#521717", "#792323", "#9c3030", "#b33a3a", "#cf6969", "#e8a3a3", "#f9dddd"] },
+      "error-soft": { "role": "tertiary", "displayName": "Vermelho Suave", "canonical": "#fde8e7", "tonalRamp": ["#2c1110", "#572220", "#823533", "#ac4e4a", "#cf7773", "#e6aaa7", "#f5d3d1", "#fff0ef"] },
+      "info-blue": { "role": "tertiary", "displayName": "Azul Informativo", "canonical": "#2877b5", "tonalRamp": ["#071d2e", "#0d3958", "#155681", "#2072a7", "#2877b5", "#579bcf", "#91c2e5", "#d8ecf8"] },
+      "info-soft": { "role": "tertiary", "displayName": "Azul Informativo Suave", "canonical": "#e5f2fb", "tonalRamp": ["#0a2233", "#15435f", "#246589", "#3a87af", "#67a9cf", "#9acbe4", "#cbe7f5", "#edf8fe"] }
+    },
+    "typographyMeta": {
+      "display": { "displayName": "Display", "purpose": "Hero público e momentos decisivos." },
+      "headline": { "displayName": "Headline", "purpose": "Título e contexto da tela." },
+      "title": { "displayName": "Title", "purpose": "Cabeçalhos de módulos e diálogos." },
+      "body": { "displayName": "Body", "purpose": "Conteúdo, instruções e controles." },
+      "label": { "displayName": "Label", "purpose": "Metadados, tabela e estados curtos." }
+    },
+    "shadows": [
+      { "name": "contact", "value": "0 1px 2px rgba(7, 38, 27, 0.08)", "purpose": "Separação mínima de cartões e controles." },
+      { "name": "float", "value": "0 12px 30px rgba(7, 38, 27, 0.10)", "purpose": "Hero e toast." },
+      { "name": "action", "value": "0 5px 13px rgba(18, 99, 71, 0.20)", "purpose": "Ação primária." },
+      { "name": "modal", "value": "0 26px 80px rgba(5, 35, 25, 0.28)", "purpose": "Diálogo sobre backdrop." }
+    ],
+    "motion": [
+      { "name": "state-fast", "value": "120ms cubic-bezier(0.22, 1, 0.36, 1)", "purpose": "Hover, active e foco." },
+      { "name": "surface-enter", "value": "180ms cubic-bezier(0.22, 1, 0.36, 1)", "purpose": "Toast, drawer e superfícies temporárias." }
+    ],
+    "breakpoints": [
+      { "name": "phone", "value": "640px" },
+      { "name": "drawer", "value": "840px" },
+      { "name": "compact-desktop", "value": "1100px" }
+    ]
+  },
+  "components": [
+    {
+      "name": "Primary Button",
+      "kind": "button",
+      "refersTo": "button-primary",
+      "description": "A ação dominante de um grupo.",
+      "html": "<button class=\"ds-btn-primary\">Salvar resultado</button>",
+      "css": ".ds-btn-primary { min-height: 40px; padding: 9px 15px; color: var(--surface, #fff); background: var(--green-700, #126347); border: 0; border-radius: 10px; box-shadow: 0 5px 13px rgba(18,99,71,.20); font: 750 13px/1.2 Inter, system-ui, sans-serif; cursor: pointer; transition: transform 120ms cubic-bezier(.22,1,.36,1), background 120ms cubic-bezier(.22,1,.36,1); } .ds-btn-primary:hover { background: var(--green-800, #0c4a36); transform: translateY(-1px); } .ds-btn-primary:active { transform: translateY(0); } .ds-btn-primary:focus-visible { outline: 3px solid rgba(33,160,113,.28); outline-offset: 2px; }"
+    },
+    {
+      "name": "Ghost Button",
+      "kind": "button",
+      "refersTo": "button-ghost",
+      "description": "Ação secundária sobre superfície clara.",
+      "html": "<button class=\"ds-btn-ghost\">Exportar</button>",
+      "css": ".ds-btn-ghost { min-height: 40px; padding: 9px 15px; color: var(--ink, #17231d); background: var(--surface, #fff); border: 1px solid var(--line, #dce4df); border-radius: 10px; box-shadow: 0 1px 2px rgba(7,38,27,.08); font: 750 13px/1.2 Inter, system-ui, sans-serif; cursor: pointer; transition: transform 120ms cubic-bezier(.22,1,.36,1), background 120ms cubic-bezier(.22,1,.36,1); } .ds-btn-ghost:hover { background: var(--surface-soft, #f8faf8); transform: translateY(-1px); } .ds-btn-ghost:focus-visible { outline: 3px solid rgba(33,160,113,.28); outline-offset: 2px; }"
+    },
+    {
+      "name": "Text Field",
+      "kind": "input",
+      "refersTo": "input",
+      "description": "Campo compacto para dados administrativos.",
+      "html": "<label class=\"ds-field\"><span>Nome do jogador</span><input placeholder=\"Digite o nome\"></label>",
+      "css": ".ds-field { display: grid; gap: 7px; color: var(--ink, #17231d); font-family: Inter, system-ui, sans-serif; } .ds-field span { font-size: 12px; font-weight: 750; } .ds-field input { min-height: 42px; padding: 10px 12px; color: var(--ink, #17231d); background: var(--surface, #fff); border: 1px solid var(--line, #dce4df); border-radius: 10px; font: 400 13px/1.4 Inter, system-ui, sans-serif; } .ds-field input::placeholder { color: var(--ink-soft, #5d6b63); } .ds-field input:focus-visible { outline: 3px solid rgba(33,160,113,.28); outline-offset: 2px; }"
+    },
+    {
+      "name": "Navigation Item",
+      "kind": "nav",
+      "description": "Destino ativo na navegação lateral.",
+      "html": "<button class=\"ds-nav-item ds-is-active\"><span aria-hidden=\"true\">◆</span> Liga por pontos</button>",
+      "css": ".ds-nav-item { width: 100%; display: flex; align-items: center; gap: 12px; padding: 12px 13px; color: rgba(255,255,255,.72); background: transparent; border: 0; border-radius: 10px; font: 400 13px/1.3 Inter, system-ui, sans-serif; text-align: left; cursor: pointer; transition: color 120ms, background 120ms; } .ds-nav-item:hover { color: #fff; background: rgba(255,255,255,.08); } .ds-nav-item.ds-is-active { color: #fff; background: rgba(255,255,255,.14); font-weight: 700; } .ds-nav-item:focus-visible { outline: 3px solid rgba(91,211,161,.45); outline-offset: 2px; }"
+    },
+    {
+      "name": "Status Badge",
+      "kind": "chip",
+      "refersTo": "badge",
+      "description": "Estado curto e escaneável.",
+      "html": "<span class=\"ds-badge\">Em andamento</span>",
+      "css": ".ds-badge { min-height: 24px; display: inline-flex; align-items: center; padding: 4px 8px; color: var(--green-800, #0c4a36); background: var(--green-100, #daf3e7); border-radius: 999px; font: 750 10px/1.2 Inter, system-ui, sans-serif; text-transform: uppercase; letter-spacing: .04em; }"
+    },
+    {
+      "name": "Data Card",
+      "kind": "card",
+      "refersTo": "card",
+      "description": "Agrupamento estrutural para dados relacionados.",
+      "html": "<section class=\"ds-card\"><h3>Próxima rodada</h3><p>Confira os confrontos agendados.</p></section>",
+      "css": ".ds-card { padding: 20px 22px 22px; color: var(--ink, #17231d); background: var(--surface, #fff); border: 1px solid var(--line, #dce4df); border-radius: 14px; box-shadow: 0 1px 2px rgba(7,38,27,.08); font-family: Inter, system-ui, sans-serif; } .ds-card h3 { margin: 0 0 4px; font-size: 15px; } .ds-card p { margin: 0; color: var(--ink-soft, #5d6b63); font-size: 13px; line-height: 1.6; } .ds-card:focus-within { outline: 3px solid rgba(33,160,113,.28); outline-offset: 2px; }"
+    },
+    {
+      "name": "Score Dialog",
+      "kind": "custom",
+      "description": "Superfície elevada para registrar placares.",
+      "html": "<section class=\"ds-dialog\"><header><h2>Registrar placar</h2><button aria-label=\"Fechar\">×</button></header><div><strong>Jogador A × Jogador B</strong></div></section>",
+      "css": ".ds-dialog { width: min(460px, 100%); overflow: hidden; color: var(--ink, #17231d); background: var(--surface, #fff); border-radius: 20px; box-shadow: 0 26px 80px rgba(5,35,25,.28); font-family: Inter, system-ui, sans-serif; } .ds-dialog header { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 18px 20px; border-bottom: 1px solid var(--line, #dce4df); } .ds-dialog h2 { margin: 0; font-size: 19px; } .ds-dialog header button { width: 38px; height: 38px; background: transparent; border: 0; border-radius: 10px; font-size: 20px; cursor: pointer; } .ds-dialog header button:hover { background: var(--surface-strong, #e9efeb); } .ds-dialog header button:focus-visible { outline: 3px solid rgba(33,160,113,.28); outline-offset: 2px; } .ds-dialog > div { padding: 22px 20px; }"
+    }
+  ],
+  "narrative": {
+    "northStar": "Sala do Campeonato",
+    "overview": "A interface é o ambiente oficial da competição dentro da empresa: bem cuidada o suficiente para valorizar cada rodada, mas próxima e descontraída o suficiente para continuar parecendo parte da convivência entre colegas. O verde herdado da mesa de sinuca dá identidade; superfícies claras, informação precisa e controles familiares dão confiança. A área administrativa privilegia densidade controlada, previsibilidade e velocidade. A experiência pública pode ser mais expressiva, com ritmo editorial e movimento guiando a história da competição, desde que placares, tabelas e ações permaneçam imediatamente compreensíveis. O sistema rejeita aparência de site de apostas ou cassino, painel administrativo genérico e estética gamer carregada de neon.",
+    "keyCharacteristics": [
+      "Verde profundo como assinatura, não como decoração espalhada.",
+      "Hierarquia compacta e legível para dados competitivos.",
+      "Superfícies estruturadas por tom, borda discreta e espaçamento.",
+      "Movimento curto e intencional, com alternativa para movimento reduzido.",
+      "Voz sofisticada no acabamento e descontraída no texto."
+    ],
+    "rules": [
+      { "name": "The Green Discipline Rule", "body": "Verde saturado deve indicar identidade, ação ou estado; nunca preencher componentes sem função.", "section": "colors" },
+      { "name": "The Earned Gold Rule", "body": "Ouro só aparece quando há conquista, liderança ou atenção real. Nunca é um segundo primário decorativo.", "section": "colors" },
+      { "name": "The One-Family Rule", "body": "A interface usa uma única família sans-serif; hierarquia vem de escala e peso, nunca de fontes decorativas.", "section": "typography" },
+      { "name": "The Data Stays Calm Rule", "body": "Tabelas, placares e campos usam tamanhos fixos. Escala fluida pertence somente à apresentação pública e ao título da tela.", "section": "typography" },
+      { "name": "The Structural Depth Rule", "body": "Primeiro use tom e espaçamento; aplique sombra somente quando o elemento ocupa um plano interativo superior.", "section": "elevation" },
+      { "name": "The One Elevation Rule", "body": "Um componente não combina borda decorativa com sombra ampla. Escolha a estrutura dominante.", "section": "elevation" }
+    ],
+    "dos": [
+      "Do use Verde da Partida para ação ou estado e Verde do Salão para ancoragem institucional.",
+      "Do mantenha o administrador rápido: ações frequentes ficam próximas do dado que alteram.",
+      "Do preserve contraste WCAG AA, foco visível e leitura completa sem animação.",
+      "Do trate ranking, rodada e placar como informação principal, não como decoração dentro de cartões.",
+      "Do use movimento com easing de saída rápido e alternativa em prefers-reduced-motion.",
+      "Do limite cartões a 14px e diálogos a 20px de raio."
+    ],
+    "donts": [
+      "Don't faça a interface parecer um site de apostas ou cassino.",
+      "Don't transforme o produto em um painel administrativo genérico.",
+      "Don't use estética gamer carregada de neon.",
+      "Don't use efeitos gratuitos ou animações que prejudiquem a leitura ou atrasem tarefas.",
+      "Don't use texto em gradiente, glassmorphism decorativo, listras repetidas ou grids de fundo ornamentais.",
+      "Don't use bordas laterais grossas como acento; estados devem usar fundo, contraste, ícone ou borda completa.",
+      "Don't combine borda de 1px com sombra ampla no mesmo cartão.",
+      "Don't esconda conteúdo até uma animação executar; o estado padrão já deve estar completo."
+    ]
+  }
+}

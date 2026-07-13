@@ -1,0 +1,169 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#0c4a36">
+  <meta name="description" content="Gerenciador local de campeonato de sinuca com liga por pontos, todos contra todos e mata-mata opcional.">
+  <title>Sinuca da Firma</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body class="is-public" data-view="dashboard">
+  <div class="app-shell">
+    <aside class="sidebar" id="sidebar">
+      <div class="brand">
+        <div class="brand-mark" aria-hidden="true">8</div>
+        <div>
+          <strong id="brand-title">Sinuca da Firma</strong>
+          <span>Campeonato local</span>
+        </div>
+      </div>
+
+      <nav class="main-nav" aria-label="Navegação principal">
+        <button class="nav-item is-active" data-view="dashboard">
+          <span aria-hidden="true">▦</span> Visão geral
+        </button>
+        <button class="nav-item" data-view="players">
+          <span aria-hidden="true">♟</span> Jogadores
+        </button>
+        <button class="nav-item" data-view="league">
+          <span aria-hidden="true">↻</span> Liga por pontos
+        </button>
+        <button class="nav-item" data-view="draw">
+          <span aria-hidden="true">⤨</span> Mata-mata
+        </button>
+        <button class="nav-item" data-view="matches">
+          <span aria-hidden="true">◆</span> Jogos mata-mata
+        </button>
+        <button class="nav-item" data-view="ranking">
+          <span aria-hidden="true">★</span> Ranking mata-mata
+        </button>
+        <a class="nav-item nav-anchor" href="/bolao">
+          <span aria-hidden="true">◉</span> Bolão virtual
+        </a>
+        <button class="nav-item" data-view="settings">
+          <span aria-hidden="true">⚙</span> Configurações
+        </button>
+      </nav>
+
+      <div class="sidebar-footer">
+        <div class="storage-status" id="storage-status">
+          <span class="status-dot" id="storage-status-dot"></span>
+          <div>
+            <span id="storage-status-text">Conectando ao servidor</span>
+            <small id="storage-status-subtext">Banco compartilhado</small>
+          </div>
+        </div>
+      </div>
+    </aside>
+
+    <div class="main-area">
+      <header class="public-header" id="public-header">
+        <a class="public-brand" href="/" aria-label="Página inicial do campeonato">
+          <span class="public-brand-ball" aria-hidden="true">8</span>
+          <span><strong id="public-brand-title">Sinuca da Firma</strong><small>Campeonato interno</small></span>
+        </a>
+        <nav class="public-nav" aria-label="Navegação pública">
+          <button type="button" data-action="navigate" data-view="dashboard">Início</button>
+          <button type="button" data-action="navigate" data-view="league">Liga</button>
+          <button type="button" data-action="navigate" data-view="draw">Mata-mata</button>
+          <button type="button" data-action="navigate" data-view="ranking">Ranking</button>
+          <a href="/bolao">Bolão</a>
+        </nav>
+        <a class="public-admin-link" href="/login">Área administrativa <span aria-hidden="true">↗</span></a>
+      </header>
+      <header class="topbar">
+        <button class="icon-button menu-button" id="menu-button" aria-label="Abrir menu">☰</button>
+        <div class="topbar-title">
+          <h1 id="page-title">Visão geral</h1>
+          <p id="page-subtitle">Acompanhe o andamento do campeonato.</p>
+        </div>
+        <div class="topbar-actions">
+          <div class="auth-actions" id="auth-actions"></div>
+          <button class="button button-ghost" id="quick-export">Exportar</button>
+          <button class="button button-primary" id="quick-draw">Gerar liga</button>
+        </div>
+      </header>
+
+      <main class="content" id="app-content" tabindex="-1"></main>
+    </div>
+  </div>
+
+  <div class="drawer-backdrop" id="drawer-backdrop"></div>
+
+  <dialog class="modal" id="score-dialog">
+    <form id="score-form" novalidate>
+      <div class="modal-header">
+        <div>
+          <span class="eyebrow" id="score-round">Partida</span>
+          <h2 id="score-title">Registrar placar</h2>
+        </div>
+        <button class="icon-button" type="button" data-close-score-dialog aria-label="Fechar">×</button>
+      </div>
+      <div class="modal-body">
+        <input type="hidden" id="score-match-id">
+        <input type="hidden" id="score-match-kind" value="bracket">
+        <div class="scoreboard-editor">
+          <label class="score-player">
+            <span id="score-player-a">Jogador A</span>
+            <input id="score-a" type="number" min="0" step="1" inputmode="numeric">
+          </label>
+          <span class="score-separator">×</span>
+          <label class="score-player">
+            <span id="score-player-b">Jogador B</span>
+            <input id="score-b" type="number" min="0" step="1" inputmode="numeric">
+          </label>
+        </div>
+        <p class="form-help" id="score-help"></p>
+
+        <div class="balls-editor">
+          <div class="balls-editor-heading">
+            <strong>Bolas matadas</strong>
+            <span>Usado como critério de desempate na classificação.</span>
+          </div>
+          <div class="scoreboard-editor balls-scoreboard-editor">
+            <label class="score-player balls-player">
+              <span id="score-balls-player-a">Jogador A</span>
+              <input id="score-balls-a" type="number" min="0" step="1" inputmode="numeric">
+            </label>
+            <span class="score-separator">×</span>
+            <label class="score-player balls-player">
+              <span id="score-balls-player-b">Jogador B</span>
+              <input id="score-balls-b" type="number" min="0" step="1" inputmode="numeric">
+            </label>
+          </div>
+        </div>
+        <div class="form-error" id="score-error" role="alert"></div>
+      </div>
+      <div class="modal-footer">
+        <button class="button button-danger button-ghost" type="button" id="delete-score">Apagar placar</button>
+        <span class="modal-spacer"></span>
+        <button class="button button-ghost" type="button" data-close-score-dialog>Cancelar</button>
+        <button class="button button-primary" type="submit">Salvar resultado</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog class="modal modal-small" id="confirm-dialog">
+    <form method="dialog" id="confirm-form">
+      <div class="modal-header">
+        <h2 id="confirm-title">Confirmar ação</h2>
+        <button class="icon-button" type="button" data-close-confirm-dialog aria-label="Fechar">×</button>
+      </div>
+      <div class="modal-body">
+        <p id="confirm-message"></p>
+      </div>
+      <div class="modal-footer">
+        <span class="modal-spacer"></span>
+        <button class="button button-ghost" type="button" data-close-confirm-dialog>Cancelar</button>
+        <button class="button button-danger" value="confirm" id="confirm-action">Confirmar</button>
+      </div>
+    </form>
+  </dialog>
+
+  <input type="file" id="import-file" accept="application/json,.json" hidden>
+  <div class="toast-region" id="toast-region" aria-live="polite" aria-atomic="true"></div>
+
+  <script src="app.js"></script>
+</body>
+</html>

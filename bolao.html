@@ -1,0 +1,53 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#0c4a36">
+  <meta name="description" content="Bolão interno com fichas virtuais para as partidas do campeonato de sinuca.">
+  <title>Bolão virtual · Sinuca da Firma</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body class="pool-page">
+  <header class="pool-header">
+    <div class="pool-header-inner">
+      <a class="pool-brand" href="/">
+        <span class="brand-mark" aria-hidden="true">8</span>
+        <span><strong id="pool-title">Sinuca da Firma</strong><small>Bolão virtual</small></span>
+      </a>
+      <div class="pool-header-actions">
+        <span class="pool-live-status" id="pool-live-status"><span class="status-dot"></span> Conectando</span>
+        <a class="button button-ghost" href="/">Voltar ao campeonato</a>
+      </div>
+    </div>
+  </header>
+
+  <main class="pool-main" id="pool-content">
+    <section class="card pool-loading-card">
+      <div class="empty-state">
+        <div class="empty-state-icon">◉</div>
+        <h2>Carregando o bolão</h2>
+        <p>Consultando partidas e saldo de fichas.</p>
+      </div>
+    </section>
+  </main>
+
+  <dialog class="modal modal-small" id="pool-confirm-dialog">
+    <form method="dialog">
+      <div class="modal-header">
+        <h2 id="pool-confirm-title">Confirmar ação</h2>
+        <button class="icon-button" type="button" data-close-confirm aria-label="Fechar">×</button>
+      </div>
+      <div class="modal-body"><p id="pool-confirm-message"></p></div>
+      <div class="modal-footer">
+        <span class="modal-spacer"></span>
+        <button class="button button-ghost" type="button" data-close-confirm>Cancelar</button>
+        <button class="button button-danger" value="confirm" id="pool-confirm-action">Confirmar</button>
+      </div>
+    </form>
+  </dialog>
+
+  <div class="toast-region" id="pool-toast-region" aria-live="polite" aria-atomic="true"></div>
+  <script src="bolao.js"></script>
+</body>
+</html>

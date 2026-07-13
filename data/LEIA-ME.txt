@@ -1,0 +1,13 @@
+Esta pasta guarda os dados persistentes do campeonato e do bolão virtual.
+
+Ao iniciar o servidor, serão criados automaticamente:
+- campeonato.db: banco SQLite principal, com liga, mata-mata, usuários e apostas;
+- backup-latest.json: cópia legível do estado do campeonato;
+- arquivos auxiliares temporários do SQLite, quando necessários.
+
+Para preservar também os perfis e apostas do bolão, faça backup do arquivo
+campeonato.db inteiro. O backup JSON cobre o campeonato, mas não substitui uma
+cópia do banco.
+
+Ao atualizar o projeto, preserve esta pasta ou copie o campeonato.db antigo para cá.
+O login administrativo não apaga nem altera o banco existente.
