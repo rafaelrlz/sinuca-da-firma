@@ -6,7 +6,8 @@
   const APP_VERSION = 4;
   const SYNC_INTERVAL_MS = 4000;
   const MAX_PLAYERS = 32;
-  const BALLS_PER_PLAYER = 8;
+  const MAX_BALLS_PER_PLAYER = 8;
+  const OBJECT_BALLS_PER_PLAYER = 7;
   const BASE_MATCH_GAP = 120;
   const HIDDEN_VIEWS = new Set(["draw", "matches", "ranking"]);
 
@@ -872,12 +873,21 @@
         playerA.scoreAgainst += Number(result.scoreB) || 0;
         playerB.scoreFor += Number(result.scoreB) || 0;
         playerB.scoreAgainst += Number(result.scoreA) || 0;
-        const ballsA = Math.min(BALLS_PER_PLAYER, normalizeBallCount(result.ballsA));
-        const ballsB = Math.min(BALLS_PER_PLAYER, normalizeBallCount(result.ballsB));
+        const ballsA = Math.min(MAX_BALLS_PER_PLAYER, normalizeBallCount(result.ballsA));
+        const ballsB = Math.min(MAX_BALLS_PER_PLAYER, normalizeBallCount(result.ballsB));
+        const ballsLeftA = ballsLeftForResult(result, match.playerAId);
+        const ballsLeftB = ballsLeftForResult(result, match.playerBId);
         playerA.ballsMade += ballsA;
         playerB.ballsMade += ballsB;
-        playerA.ballsLeft += result.winnerId === match.playerAId ? 0 : Math.max(0, BALLS_PER_PLAYER - ballsA);
-        playerB.ballsLeft += result.winnerId === match.playerBId ? 0 : Math.max(0, BALLS_PER_PLAYER - ballsB);
+        playerA.ballsLeft += ballsLeftA;
+        playerB.ballsLeft += ballsLeftB;
+        if (result.winnerId === match.playerAId) {
+          playerA.ballBalance += ballsLeftB;
+          playerB.ballBalance -= ballsLeftB;
+        } else {
+          playerA.ballBalance -= ballsLeftA;
+          playerB.ballBalance += ballsLeftA;
+        }
 
         const winner = rows.get(result.winnerId);
         const loserId = result.winnerId === match.playerAId ? match.playerBId : match.playerAId;
@@ -893,7 +903,6 @@
 
     rows.forEach((row) => {
       row.differential = row.scoreFor - row.scoreAgainst;
-      row.ballBalance = row.ballsMade - row.ballsLeft;
       row.percentage = row.played ? Math.round((row.wins / row.played) * 100) : 0;
     });
 
@@ -2730,12 +2739,12 @@
     const ballsMade = playerId === result.playerAId
       ? normalizeBallCount(result.ballsA)
       : normalizeBallCount(result.ballsB);
-    return Math.max(0, BALLS_PER_PLAYER - Math.min(BALLS_PER_PLAYER, ballsMade));
+    return Math.max(0, OBJECT_BALLS_PER_PLAYER - Math.min(OBJECT_BALLS_PER_PLAYER, ballsMade));
   }
 
   function formatBallSummary(result) {
-    const ballsA = Math.min(BALLS_PER_PLAYER, normalizeBallCount(result.ballsA));
-    const ballsB = Math.min(BALLS_PER_PLAYER, normalizeBallCount(result.ballsB));
+    const ballsA = Math.min(MAX_BALLS_PER_PLAYER, normalizeBallCount(result.ballsA));
+    const ballsB = Math.min(MAX_BALLS_PER_PLAYER, normalizeBallCount(result.ballsB));
     const leftA = ballsLeftForResult(result, result.playerAId);
     const leftB = ballsLeftForResult(result, result.playerBId);
     return `Matadas: ${ballsA} × ${ballsB} · na mesa: ${leftA} × ${leftB}`;
@@ -2752,8 +2761,8 @@
       return "Informe números inteiros para as bolas matadas dos dois jogadores.";
     }
     if (ballsA < 0 || ballsB < 0) return "A quantidade de bolas matadas não pode ser negativa.";
-    if (ballsA > BALLS_PER_PLAYER || ballsB > BALLS_PER_PLAYER) {
-      return `Cada jogador pode matar no máximo ${BALLS_PER_PLAYER} bolas.`;
+    if (ballsA > MAX_BALLS_PER_PLAYER || ballsB > MAX_BALLS_PER_PLAYER) {
+      return `Cada jogador pode matar no máximo ${MAX_BALLS_PER_PLAYER} bolas.`;
     }
     return "";
   }

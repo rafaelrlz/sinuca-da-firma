@@ -21,7 +21,7 @@
     profile: null,
     leaderboard: [],
     myBets: [],
-    settings: { initialBalance: 1000, maxStake: 500, payoutMultiplier: 2 },
+    settings: { initialBalance: 10000, maxStake: 500, payoutMultiplier: 2 },
   };
   let adminAuthenticated = false;
   let syncInProgress = false;
@@ -277,7 +277,7 @@
           <h1>Aposte fichas virtuais nas disputas</h1>
           <p>Escolha o vencedor e reserve parte do seu saldo. Acerto aumenta suas fichas; erro mantém a pontuação atual. Não há dinheiro, pagamento ou saque.</p>
         </div>
-        <div class="pool-rules-chip"><strong>${formatNumber(betting.settings?.initialBalance || 1000)}</strong><span>fichas iniciais</span></div>
+        <div class="pool-rules-chip"><strong>${formatNumber(betting.settings?.initialBalance || 10000)}</strong><span>fichas iniciais</span></div>
       </section>
 
       ${profile ? renderProfile(profile) : renderAccessForms()}
@@ -465,7 +465,7 @@
       <section class="card pool-rules-card">
         <div class="card-header"><div><h2>Como funciona</h2></div></div>
         <ol class="pool-rule-list">
-          <li>Todo perfil começa com <strong>${formatNumber(betting.settings?.initialBalance || 1000)} fichas virtuais</strong>.</li>
+          <li>Todo perfil começa com <strong>${formatNumber(betting.settings?.initialBalance || 10000)} fichas virtuais</strong>.</li>
           <li>Escolha um vencedor e aposte até <strong>${formatNumber(betting.settings?.maxStake || 500)} fichas</strong> por disputa.</li>
           <li>Acertou: recebe <strong>2× a aposta</strong>, incluindo a devolução das fichas apostadas.</li>
           <li>Não acertou: as fichas reservadas voltam ao saldo, sem perda de pontos.</li>

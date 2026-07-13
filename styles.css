@@ -2687,7 +2687,17 @@ tbody tr:hover td {
   }
 
   .pool-side-column {
+    display: contents;
     position: static;
+  }
+
+  .pool-side-column .pool-leaderboard-card {
+    order: -1;
+  }
+
+  .pool-side-column .pool-rules-card,
+  .pool-side-column .pool-admin-card {
+    order: 1;
   }
 
   .pool-profile-stats {

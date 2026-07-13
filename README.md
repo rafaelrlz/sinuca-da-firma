@@ -45,11 +45,11 @@ Critérios de desempate:
 
 1. pontos;
 2. número de vitórias;
-3. saldo de bolas (matadas menos deixadas na mesa);
+3. saldo de bolas;
 4. total de bolas matadas;
 5. ordem alfabética.
 
-O valor da vitória pode ser alterado em **Configurações**. A derrota sempre vale 0 ponto, portanto a pontuação nunca diminui. Cada jogador possui 8 bolas (7 do seu grupo mais o castigo). Ao registrar a partida, informe quantas bolas cada um matou. Para o perdedor, o sistema calcula automaticamente as bolas deixadas na mesa (`8 - bolas matadas`). O saldo de bolas é `bolas matadas - bolas deixadas na mesa` e pode ficar negativo.
+O valor da vitória pode ser alterado em **Configurações**. A derrota sempre vale 0 ponto, portanto a pontuação nunca diminui. Cada jogador possui 7 bolas comuns mais o castigo. Ao registrar a partida, informe quantas bolas cada um matou, incluindo o castigo quando ele cair. O sistema considera somente as bolas comuns que o perdedor deixou na mesa: o vencedor recebe esse número como saldo positivo e o perdedor recebe o mesmo número como saldo negativo. O castigo não entra no saldo.
 
 ## Bolão com fichas virtuais
 
@@ -61,8 +61,10 @@ Qualquer pessoa da rede pode abrir `/bolao` e criar um perfil com:
 Cada perfil começa com:
 
 ```text
-1.000 fichas virtuais
+10.000 fichas virtuais
 ```
+
+Na primeira inicialização desta versão, cada perfil existente recebe um bônus único de 9.000 fichas. A migração é registrada no banco e não se repete em reinicializações ou novos deploys.
 
 Regras padrão:
 

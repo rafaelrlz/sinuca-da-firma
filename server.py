@@ -51,7 +51,8 @@ LOGIN_WINDOW_SECONDS = 5 * 60
 LOGIN_MAX_FAILURES = 5
 
 BET_TOKEN_HEADER = "X-Bettor-Token"
-BET_INITIAL_BALANCE = 1000
+BET_INITIAL_BALANCE = 10_000
+BET_EXISTING_BALANCE_BONUS = 9_000
 BET_MAX_STAKE = 500
 BET_MAX_USERS = 200
 BET_PIN_ITERATIONS = 120_000
@@ -130,6 +131,36 @@ def create_default_state() -> dict[str, object]:
     }
 
 
+def migrate_bettor_initial_balance(connection: object) -> bool:
+    """Concede uma única vez o bônus que eleva perfis antigos de 1.000 para 10.000."""
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS schema_migrations (
+            migration_id TEXT PRIMARY KEY,
+            applied_at TEXT NOT NULL
+        )
+        """
+    )
+    cursor = connection.execute(
+        """
+        INSERT INTO schema_migrations (migration_id, applied_at)
+        VALUES (?, ?)
+        ON CONFLICT (migration_id) DO NOTHING
+        """,
+        ("bettor_initial_balance_10000_v1", utc_now()),
+    )
+    if cursor.rowcount != 1:
+        return False
+    connection.execute(
+        """
+        UPDATE bettors
+        SET initial_balance = initial_balance + ?, updated_at = ?
+        """,
+        (BET_EXISTING_BALANCE_BONUS, utc_now()),
+    )
+    return True
+
+
 def initialize_database() -> None:
     if not IS_POSTGRES:
         DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -155,7 +186,7 @@ def initialize_database() -> None:
                 pin_salt TEXT NOT NULL,
                 pin_hash TEXT NOT NULL,
                 token_hash TEXT,
-                initial_balance INTEGER NOT NULL DEFAULT 1000,
+                initial_balance INTEGER NOT NULL DEFAULT 10000,
                 active INTEGER NOT NULL DEFAULT 1,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
@@ -204,6 +235,7 @@ def initialize_database() -> None:
         connection.execute(
             "CREATE INDEX IF NOT EXISTS idx_login_failures_client ON login_failures(client_key, attempted_at)"
         )
+        migrate_bettor_initial_balance(connection)
         existing = connection.execute(
             "SELECT 1 FROM app_state WHERE id = 1"
         ).fetchone()
