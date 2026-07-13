@@ -30,7 +30,7 @@ Defina as credenciais com `SINUCA_ADMIN_USER` e `SINUCA_ADMIN_PASSWORD`. Nunca p
 
 ## Liga por pontos
 
-Na aba **Liga por pontos**, o administrador gera automaticamente uma tabela em que cada jogador enfrenta todos os demais uma vez.
+Na aba **Liga por pontos**, o administrador gera e opera uma tabela em que cada jogador enfrenta todos os demais uma vez. A classificação completa fica na aba separada **Ranking da liga**, acessível pelo menu lateral e pelo botão **Ver ranking** da tela de partidas.
 
 Quando a liga já estiver em andamento, novos jogadores podem ser incluídos a qualquer momento. O sistema valida toda a tabela, preserva os confrontos, IDs, resultados, bolas e apostas existentes e cria somente os jogos que faltam entre o novo participante e o elenco atual. Esses duelos aproveitam espaços livres nas rodadas existentes e, quando necessário, são adicionados em novas rodadas retroativas.
 

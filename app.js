@@ -48,6 +48,10 @@
       title: "Liga por pontos",
       subtitle: "Todos se enfrentam e a classificação define o campeão.",
     },
+    "league-ranking": {
+      title: "Ranking da liga",
+      subtitle: "Classificação por pontos, vitórias e saldo de bolas.",
+    },
     draw: {
       title: "Mata-mata",
       subtitle: "Módulo eliminatório opcional, preservado no sistema.",
@@ -606,6 +610,7 @@
         dashboard: renderDashboard,
         players: renderPlayers,
         league: renderLeague,
+        "league-ranking": renderLeagueRanking,
         draw: renderDraw,
         matches: renderMatches,
         ranking: renderRanking,
@@ -1086,7 +1091,6 @@
     }
 
     const stats = getLeagueStats();
-    const standings = calculateLeagueStandings();
     const rounds = state.league.rounds || [];
     const selectedRound = ui.leagueRoundFilter === "all" ? null : Number(ui.leagueRoundFilter);
     const roundsToRender = selectedRound
@@ -1095,16 +1099,13 @@
 
     return `
       <div class="page-grid dashboard-grid workspace-page league-workspace">
-        ${renderWorkspaceHeader("Temporada em andamento", "Classificação, filtros e registro de cada rodada em um único espaço de operação.", `${stats.completed} de ${stats.total} partidas`, `<button class="button button-ghost" data-action="generate-league">Gerar novamente</button>`)}
+        ${renderWorkspaceHeader("Temporada em andamento", "Filtre as rodadas e registre cada resultado da liga.", `${stats.completed} de ${stats.total} partidas`, `<button class="button button-primary" data-action="navigate" data-view="league-ranking">Ver ranking</button>`)}
         <section class="card col-12 league-summary-card">
           <div class="card-header">
             <div>
               <span class="eyebrow">Todos contra todos · turno único</span>
               <h2>Liga por pontos</h2>
               <p>${state.players.length} jogadores · ${rounds.length} rodadas · ${stats.total} partidas.</p>
-            </div>
-            <div class="card-actions">
-              <button class="button button-ghost" data-action="generate-league">Gerar novamente</button>
             </div>
           </div>
         </section>
@@ -1113,18 +1114,6 @@
         ${renderStatCard("Pendentes", stats.pending, "resultados a registrar", "◷", "col-3")}
         ${renderStatCard("Rodadas", rounds.length, "todos contra todos", "↻", "col-3")}
         ${renderStatCard("Progresso", `${stats.progress}%`, "da temporada", "↗", "col-3", stats.progress)}
-
-        <section class="card col-12">
-          <div class="card-header">
-            <div>
-              <h2>Classificação</h2>
-              <p>${Number(state.settings.league.winPoints) || 0} pontos por vitória; derrota vale 0. Critérios: pontos, vitórias, saldo de bolas e bolas matadas.</p>
-            </div>
-          </div>
-          <div class="table-wrap mt-20">
-            ${renderLeagueStandingsTable(standings)}
-          </div>
-        </section>
 
         <section class="card col-12">
           <div class="card-header">
@@ -1153,6 +1142,44 @@
           </div>
           <div class="league-rounds">
             ${roundsToRender.map((round) => renderLeagueRound(round)).join("") || '<div class="empty-state"><p>Nenhuma rodada encontrada.</p></div>'}
+          </div>
+        </section>
+      </div>
+    `;
+  }
+
+  function renderLeagueRanking() {
+    if (!isAdmin()) return renderPublicLeague();
+    if (!state.league) {
+      return `
+        <div class="page-grid dashboard-grid workspace-page league-ranking-workspace">
+          ${renderWorkspaceHeader("Ranking da liga", "A classificação aparecerá depois que a tabela da liga for criada.", `${state.players.length} jogadores`, `<button class="button button-primary" data-action="navigate" data-view="league">Abrir liga por pontos</button>`)}
+          <section class="card col-12">
+            <div class="empty-state">
+              <div class="empty-state-icon">↕</div>
+              <h3>Ranking ainda não disponível</h3>
+              <p>Gere a liga para começar a acompanhar pontos, vitórias e saldo de bolas.</p>
+              <button class="button button-primary" data-action="navigate" data-view="league">Ir para a liga</button>
+            </div>
+          </section>
+        </div>
+      `;
+    }
+
+    const stats = getLeagueStats();
+    const standings = calculateLeagueStandings();
+    return `
+      <div class="page-grid dashboard-grid workspace-page league-ranking-workspace">
+        ${renderWorkspaceHeader("Ranking da liga", "Acompanhe a classificação completa e os critérios de desempate.", `${stats.completed} de ${stats.total} partidas concluídas`, `<button class="button button-ghost" data-action="navigate" data-view="league">Ver partidas</button>`)}
+        <section class="card col-12">
+          <div class="card-header">
+            <div>
+              <h2>Classificação</h2>
+              <p>${Number(state.settings.league.winPoints) || 0} pontos por vitória · desempate por vitórias, saldo de bolas e bolas matadas.</p>
+            </div>
+          </div>
+          <div class="table-wrap mt-20">
+            ${renderLeagueStandingsTable(standings)}
           </div>
         </section>
       </div>
@@ -1713,7 +1740,7 @@
     if (champion) {
       heroTitle = `${escapeHTML(champion.name)} é o campeão da liga!`;
       heroText = "Todas as partidas foram concluídas e a classificação final está disponível.";
-      heroButton = `<button class="button button-primary" data-action="navigate" data-view="league">Ver classificação final</button>`;
+      heroButton = `<button class="button button-primary" data-action="navigate" data-view="league-ranking">Ver classificação final</button>`;
     } else if (state.league) {
       heroTitle = nextMatch ? "Liga em andamento" : "Tabela da liga preparada";
       heroText = nextMatch
@@ -1752,7 +1779,7 @@
         <section class="card col-5">
           <div class="card-header">
             <div><h2>Classificação da liga</h2><p>Pontos, vitórias e saldo de bolas.</p></div>
-            <button class="button button-small button-ghost" data-action="navigate" data-view="league">Ver tudo</button>
+            <button class="button button-small button-ghost" data-action="navigate" data-view="league-ranking">Ver ranking</button>
           </div>
           <div class="card-body">${renderRankingPreview(standings.slice(0, 5))}</div>
         </section>
