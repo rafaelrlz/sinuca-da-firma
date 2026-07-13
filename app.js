@@ -6,7 +6,9 @@
   const APP_VERSION = 4;
   const SYNC_INTERVAL_MS = 4000;
   const MAX_PLAYERS = 32;
+  const BALLS_PER_PLAYER = 8;
   const BASE_MATCH_GAP = 120;
+  const HIDDEN_VIEWS = new Set(["draw", "matches", "ranking"]);
 
   const INITIAL_NAMES = [
     "Johnny",
@@ -428,8 +430,11 @@
     }
 
     const requestedView = window.location.hash.slice(1);
-    if (VIEW_META[requestedView] && (isAdmin() || ["league", "draw", "ranking"].includes(requestedView))) {
+    if (VIEW_META[requestedView] && !HIDDEN_VIEWS.has(requestedView) && (isAdmin() || requestedView === "league")) {
       ui.currentView = requestedView;
+    } else if (HIDDEN_VIEWS.has(requestedView)) {
+      window.history.replaceState(null, "", `${window.location.pathname}${window.location.search}#league`);
+      ui.currentView = "league";
     }
     updateBrand();
     render();
@@ -550,7 +555,8 @@
 
   function navigate(view) {
     if (!VIEW_META[view]) return;
-    if (!isAdmin() && !["dashboard", "league", "draw", "ranking"].includes(view)) {
+    if (HIDDEN_VIEWS.has(view)) view = "league";
+    if (!isAdmin() && !["dashboard", "league"].includes(view)) {
       view = "dashboard";
     }
     ui.currentView = view;
@@ -582,6 +588,7 @@
 
   function render() {
     try {
+      if (HIDDEN_VIEWS.has(ui.currentView)) ui.currentView = "league";
       document.body.dataset.view = ui.currentView;
       const viewMeta = VIEW_META[ui.currentView];
       dom.pageTitle.textContent = viewMeta.title;
@@ -691,6 +698,20 @@
     };
   }
 
+  function canExpandLeagueIncrementally() {
+    if (!state.league || !window.SinucaLeague?.planIncrementalExpansion) return false;
+    try {
+      window.SinucaLeague.planIncrementalExpansion({
+        league: state.league,
+        playerIds: state.players.map((player) => player.id),
+        newPlayerId: "player-expansion-preview",
+      });
+      return true;
+    } catch (_error) {
+      return false;
+    }
+  }
+
   async function generateLeague() {
     if (!requireAdmin()) return;
     if (state.players.length < 2) {
@@ -706,7 +727,7 @@
     if (state.league) {
       const confirmed = await askConfirm(
         "Gerar novamente a liga?",
-        "A ordem das rodadas será refeita e todos os placares da liga serão apagados. O módulo mata-mata não será alterado.",
+        "A ordem das rodadas será refeita e todos os placares da liga serão apagados.",
         "Gerar nova tabela",
       );
       if (!confirmed) return;
@@ -828,6 +849,8 @@
           scoreAgainst: 0,
           differential: 0,
           ballsMade: 0,
+          ballsLeft: 0,
+          ballBalance: 0,
           points: 0,
           percentage: 0,
           stage: state.league ? "Em disputa" : "Inscrito",
@@ -849,8 +872,12 @@
         playerA.scoreAgainst += Number(result.scoreB) || 0;
         playerB.scoreFor += Number(result.scoreB) || 0;
         playerB.scoreAgainst += Number(result.scoreA) || 0;
-        playerA.ballsMade += normalizeBallCount(result.ballsA);
-        playerB.ballsMade += normalizeBallCount(result.ballsB);
+        const ballsA = Math.min(BALLS_PER_PLAYER, normalizeBallCount(result.ballsA));
+        const ballsB = Math.min(BALLS_PER_PLAYER, normalizeBallCount(result.ballsB));
+        playerA.ballsMade += ballsA;
+        playerB.ballsMade += ballsB;
+        playerA.ballsLeft += result.winnerId === match.playerAId ? 0 : Math.max(0, BALLS_PER_PLAYER - ballsA);
+        playerB.ballsLeft += result.winnerId === match.playerBId ? 0 : Math.max(0, BALLS_PER_PLAYER - ballsB);
 
         const winner = rows.get(result.winnerId);
         const loserId = result.winnerId === match.playerAId ? match.playerBId : match.playerAId;
@@ -861,12 +888,12 @@
         }
         if (loser) {
           loser.losses += 1;
-          loser.points += Number(settings.lossPoints) || 0;
         }
       });
 
     rows.forEach((row) => {
       row.differential = row.scoreFor - row.scoreAgainst;
+      row.ballBalance = row.ballsMade - row.ballsLeft;
       row.percentage = row.played ? Math.round((row.wins / row.played) * 100) : 0;
     });
 
@@ -884,8 +911,7 @@
     return (
       b.points - a.points ||
       b.wins - a.wins ||
-      b.differential - a.differential ||
-      b.scoreFor - a.scoreFor ||
+      b.ballBalance - a.ballBalance ||
       b.ballsMade - a.ballsMade ||
       a.name.localeCompare(b.name, "pt-BR")
     );
@@ -929,10 +955,10 @@
     }
 
     return `<div class="public-view">
-      ${renderPublicViewHeader("Liga por pontos", "A corrida pela liderança.", "Cada rodada recalcula a disputa. Acompanhe pontos, saldo e todos os confrontos da temporada.", facts)}
+      ${renderPublicViewHeader("Liga por pontos", "A corrida pela liderança.", "Cada rodada recalcula a disputa. Acompanhe pontos, saldo de bolas e todos os confrontos da temporada.", facts)}
       <div class="public-view-content">
         <section class="public-view-section public-league-board">
-          <div class="public-block-title"><div><span class="public-overline">Tabela atual</span><h2>Classificação</h2></div><p>${Number(state.settings.league.winPoints) || 0} pontos por vitória · desempate por vitórias, saldo e bolas.</p></div>
+          <div class="public-block-title"><div><span class="public-overline">Tabela atual</span><h2>Classificação</h2></div><p>${Number(state.settings.league.winPoints) || 0} pontos por vitória · derrota mantém a pontuação · desempate pelo saldo de bolas.</p></div>
           ${renderPublicStandings(standings)}
         </section>
         <section class="public-view-section">
@@ -960,7 +986,7 @@
           <span>${result ? "Final" : match.inProgress ? "Em andamento" : "A jogar"}</span>
           <div><strong>${escapeHTML(playerName(match.playerAId))}</strong><b>${result ? result.scoreA : "—"}</b></div>
           <div><strong>${escapeHTML(playerName(match.playerBId))}</strong><b>${result ? result.scoreB : "—"}</b></div>
-          ${result ? `<small>Bolas ${normalizeBallCount(result.ballsA)} × ${normalizeBallCount(result.ballsB)}</small>` : `<small>${scoreRuleLabel("league")}</small>`}
+          ${result ? `<small>${formatBallSummary(result)}</small>` : `<small>${scoreRuleLabel("league")}</small>`}
         </article>`;
       }).join("")}</div>
     </details>`;
@@ -1032,26 +1058,18 @@
                 <p>Cada jogador enfrenta todos os outros uma vez. Com os ${state.players.length} participantes atuais, serão ${expectedMatches} partidas.</p>
                 <div class="hero-actions">
                   <button class="button button-primary" data-action="generate-league">Gerar tabela da liga</button>
-                  <button class="button button-ghost" data-action="navigate" data-view="draw">Abrir mata-mata</button>
                 </div>
               </div>
               <div class="trophy-orb" aria-hidden="true">●</div>
             </div>
           </section>
-          <section class="card col-7">
+          <section class="card col-12">
             <div class="card-header"><div><h2>Como funciona</h2><p>Temporada única e classificação contínua.</p></div></div>
             <div class="card-body rules-summary">
               <div><strong>1</strong><span>Todos jogam contra todos uma vez.</span></div>
               <div><strong>${Number(state.settings.league.winPoints) || 0}</strong><span>Pontos por vitória.</span></div>
               <div><strong>0</strong><span>Empates não são permitidos.</span></div>
-              <div><strong>↕</strong><span>Desempate por vitórias, saldo, placar marcado e bolas matadas.</span></div>
-            </div>
-          </section>
-          <section class="card col-5">
-            <div class="card-header"><div><h2>Mata-mata preservado</h2><p>O módulo eliminatório continua disponível.</p></div></div>
-            <div class="card-body">
-              <p class="text-muted">Você pode manter a liga como campeonato principal e criar uma chave separada quando decidirem fazer uma copa.</p>
-              <button class="button button-ghost" data-action="navigate" data-view="draw">Ver módulo mata-mata</button>
+              <div><strong>↕</strong><span>Desempate por vitórias, saldo de bolas, bolas matadas e nome.</span></div>
             </div>
           </section>
         </div>
@@ -1078,7 +1096,6 @@
             </div>
             <div class="card-actions">
               <button class="button button-ghost" data-action="generate-league">Gerar novamente</button>
-              <button class="button button-ghost" data-action="navigate" data-view="draw">Mata-mata</button>
             </div>
           </div>
         </section>
@@ -1092,7 +1109,7 @@
           <div class="card-header">
             <div>
               <h2>Classificação</h2>
-              <p>${Number(state.settings.league.winPoints) || 0} pontos por vitória. Critérios: pontos, vitórias, saldo, placar marcado e bolas matadas.</p>
+              <p>${Number(state.settings.league.winPoints) || 0} pontos por vitória; derrota vale 0. Critérios: pontos, vitórias, saldo de bolas e bolas matadas.</p>
             </div>
           </div>
           <div class="table-wrap mt-20">
@@ -1144,10 +1161,9 @@
             <th>J</th>
             <th>V</th>
             <th>D</th>
-            <th>Pró</th>
-            <th>Contra</th>
+            <th>Matadas</th>
+            <th>Na mesa</th>
             <th>Saldo</th>
-            <th>Bolas</th>
             <th>Aprov.</th>
             <th>Situação</th>
           </tr>
@@ -1161,10 +1177,9 @@
               <td>${row.played}</td>
               <td>${row.wins}</td>
               <td>${row.losses}</td>
-              <td>${row.scoreFor}</td>
-              <td>${row.scoreAgainst}</td>
-              <td>${row.differential > 0 ? "+" : ""}${row.differential}</td>
               <td><strong>${row.ballsMade}</strong></td>
+              <td>${row.ballsLeft}</td>
+              <td><strong>${row.ballBalance > 0 ? "+" : ""}${row.ballBalance}</strong></td>
               <td>${row.percentage}%</td>
               <td><span class="badge ${row.stage === "Campeão da liga" ? "badge-gold" : row.stage === "Líder" ? "badge-green" : ""}">${escapeHTML(row.stage)}</span></td>
             </tr>
@@ -1213,7 +1228,7 @@
           <strong class="left">${escapeHTML(playerName(match.playerAId))}</strong>
           <span class="match-result-summary">
             <span class="result-score">${result ? `${result.scoreA} × ${result.scoreB}` : "×"}</span>
-            ${result ? `<small>Bolas: ${normalizeBallCount(result.ballsA)} × ${normalizeBallCount(result.ballsB)}</small>` : ""}
+            ${result ? `<small>${formatBallSummary(result)}</small>` : ""}
           </span>
           <strong>${escapeHTML(playerName(match.playerBId))}</strong>
         </div>
@@ -1610,7 +1625,7 @@
           <section class="public-story reveal" aria-label="Jornada do campeonato">
             <div class="public-story-line" aria-hidden="true"><span></span><i>8</i></div>
             <div><span>01</span><strong>A tabela abre</strong><p>Todos se enfrentam. Cada partida começa uma nova possibilidade.</p></div>
-            <div><span>02</span><strong>A liderança muda</strong><p>Pontos, vitórias e saldo revelam quem chega mais forte.</p></div>
+            <div><span>02</span><strong>A liderança muda</strong><p>Pontos, vitórias e saldo de bolas revelam quem chega mais forte.</p></div>
             <div><span>03</span><strong>A última bola decide</strong><p>No fim, a história da temporada fica registrada aqui.</p></div>
           </section>
 
@@ -1637,8 +1652,9 @@
         <span class="avatar">${escapeHTML(getInitials(row.name))}</span>
         <span class="public-rank-player"><strong>${escapeHTML(row.name)}</strong><small>${escapeHTML(row.stage)}</small></span>
         <span><strong>${row.wins}</strong><small>vitórias</small></span>
-        <span><strong>${row.differential > 0 ? "+" : ""}${row.differential}</strong><small>saldo</small></span>
-        <span class="public-rank-balls"><strong>${row.ballsMade}</strong><small>bolas</small></span>
+        <span><strong>${row.ballsMade}</strong><small>matadas</small></span>
+        <span><strong>${row.ballsLeft}</strong><small>na mesa</small></span>
+        <span class="public-rank-balls"><strong>${row.ballBalance > 0 ? "+" : ""}${row.ballBalance}</strong><small>saldo</small></span>
         <span class="public-rank-points"><strong>${row.points}</strong><small>pontos</small></span>
       </li>`).join("")}</ol>`;
   }
@@ -1708,7 +1724,6 @@
               <p>${heroText}</p>
               <div class="hero-actions">
                 ${heroButton}
-                <button class="button button-ghost" data-action="navigate" data-view="draw">Módulo mata-mata</button>
               </div>
             </div>
             <div class="trophy-orb" aria-hidden="true">🏆</div>
@@ -1727,23 +1742,10 @@
 
         <section class="card col-5">
           <div class="card-header">
-            <div><h2>Classificação da liga</h2><p>Pontos, vitórias, saldo e bolas matadas.</p></div>
+            <div><h2>Classificação da liga</h2><p>Pontos, vitórias e saldo de bolas.</p></div>
             <button class="button button-small button-ghost" data-action="navigate" data-view="league">Ver tudo</button>
           </div>
           <div class="card-body">${renderRankingPreview(standings.slice(0, 5))}</div>
-        </section>
-
-        <section class="card col-12 knockout-module-card">
-          <div class="card-header">
-            <div><h2>Módulo mata-mata</h2><p>Continua disponível para uma copa separada.</p></div>
-            <button class="button button-small button-ghost" data-action="navigate" data-view="draw">Abrir mata-mata</button>
-          </div>
-          <div class="card-body">
-            <div class="module-status">
-              <span class="module-icon">⤨</span>
-              <div><strong>${state.tournament ? "Chave eliminatória criada" : "Nenhuma chave criada"}</strong><span>${state.tournament ? "Os resultados da liga e do mata-mata são independentes." : "Você pode criar a chave depois sem apagar a liga."}</span></div>
-            </div>
-          </div>
         </section>
 
         <section class="card col-12">
@@ -1821,7 +1823,7 @@
                 <span class="ranking-position pos-${index + 1}">${index + 1}</span>
                 <div>
                   <strong>${escapeHTML(row.name)}</strong>
-                  <span>${row.wins} vitória(s) · ${escapeHTML(row.stage)}</span>
+                  <span>${row.wins} vitória(s) · saldo ${row.ballBalance > 0 ? "+" : ""}${row.ballBalance} · ${escapeHTML(row.stage)}</span>
                 </div>
                 <strong>${row.points} pts</strong>
               </li>
@@ -1833,7 +1835,9 @@
   }
 
   function renderActivity() {
-    const items = [...state.activity];
+    const items = state.activity.filter(
+      (item) => item.type !== "draw" && !/mata-mata|chave eliminatória/i.test(`${item.text} ${item.detail || ""}`),
+    );
     items.sort((a, b) => new Date(b.at) - new Date(a.at));
 
     if (!items.length) {
@@ -1883,10 +1887,12 @@
     const filtered = state.players.filter((player) =>
       player.name.toLocaleLowerCase("pt-BR").includes(query),
     );
+    const incrementalExpansionAvailable = canExpandLeagueIncrementally();
+    const additionBlocked = Boolean(state.league) && !incrementalExpansionAvailable;
 
     return `
       <div class="page-grid dashboard-grid workspace-page players-workspace">
-        ${renderWorkspaceHeader("Elenco do campeonato", "Cadastre participantes e prepare a lista usada pela liga e pelo mata-mata.", `${state.players.length} de ${MAX_PLAYERS} vagas`, `<button class="button button-primary" data-action="generate-league" ${state.players.length < 2 ? "disabled" : ""}>Gerar liga</button>`)}
+        ${renderWorkspaceHeader("Elenco do campeonato", "Cadastre e acompanhe os participantes da liga.", `${state.players.length} de ${MAX_PLAYERS} vagas`, `<button class="button button-primary" data-action="generate-league" ${state.players.length < 2 ? "disabled" : ""}>Gerar liga</button>`)}
         <section class="card col-4">
           <div class="card-header">
             <div>
@@ -1897,9 +1903,9 @@
           <div class="card-body">
             <form id="add-player-form" class="field">
               <label for="new-player-name">Nome</label>
-              <input id="new-player-name" name="name" maxlength="60" autocomplete="off" placeholder="Ex.: Bruno Silva" required>
-              <span class="field-help">Máximo de ${MAX_PLAYERS} participantes.</span>
-              <button class="button button-primary mt-12" type="submit">Adicionar jogador</button>
+              <input id="new-player-name" name="name" maxlength="60" autocomplete="off" placeholder="Ex.: Danilo" ${additionBlocked ? "disabled" : ""} required>
+              <span class="field-help">${incrementalExpansionAvailable ? "O novo jogador enfrentará todos os participantes atuais. O sistema aproveita espaços livres e cria rodadas retroativas quando necessário." : additionBlocked ? "A tabela atual precisa ser revisada antes de receber outro jogador." : `Máximo de ${MAX_PLAYERS} participantes.`}</span>
+              <button class="button button-primary mt-12" type="submit" ${additionBlocked ? "disabled" : ""}>${state.league ? "Adicionar à liga" : "Adicionar jogador"}</button>
             </form>
           </div>
         </section>
@@ -1916,10 +1922,7 @@
               <div class="search-box">
                 <input class="search-input" id="player-search" value="${escapeHTML(ui.playerSearch)}" placeholder="Buscar jogador" aria-label="Buscar jogador">
               </div>
-              <div class="toolbar-group">
-                <button class="button button-primary" data-action="generate-league" ${state.players.length < 2 ? "disabled" : ""}>Gerar liga</button>
-                <button class="button button-ghost" data-action="generate-draw" ${state.players.length < 2 ? "disabled" : ""}>Sortear mata-mata</button>
-              </div>
+              <button class="button button-primary" data-action="generate-league" ${state.players.length < 2 ? "disabled" : ""}>Gerar liga</button>
             </div>
           </div>
           <div class="table-wrap">
@@ -1929,12 +1932,12 @@
 
         <section class="card col-12">
           <div class="card-body">
-            <div class="notice ${state.tournament || state.league ? "notice-warning" : ""}">
-              <span aria-hidden="true">${state.tournament || state.league ? "!" : "i"}</span>
+            <div class="notice ${state.league ? "notice-warning" : ""}">
+              <span aria-hidden="true">${state.league ? "!" : "i"}</span>
               <span>${
-                state.tournament || state.league
-                  ? "Alterar participantes apaga a tabela da liga e a chave mata-mata existentes, porque os confrontos deixam de ser válidos."
-                  : `Na liga, todos se enfrentam uma vez (${(state.players.length * (state.players.length - 1)) / 2} partidas com a lista atual). O mata-mata permanece como módulo separado.`
+                state.league
+                  ? "A liga está em andamento. Use o fluxo de inclusão segura para preservar confrontos e resultados existentes."
+                  : `Na liga, todos se enfrentam uma vez (${(state.players.length * (state.players.length - 1)) / 2} partidas com a lista atual).`
               }</span>
             </div>
           </div>
@@ -2170,7 +2173,7 @@
           </div>
           <span class="match-result-summary">
             <span class="versus">${result ? `${result.scoreA} × ${result.scoreB}` : "CONTRA"}</span>
-            ${result ? `<small>Bolas: ${normalizeBallCount(result.ballsA)} × ${normalizeBallCount(result.ballsB)}</small>` : ""}
+            ${result ? `<small>${formatBallSummary(result)}</small>` : ""}
           </span>
           <div class="compact-player">
             <strong>${escapeHTML(playerB)}</strong>
@@ -2294,7 +2297,7 @@
                   <strong class="left">${escapeHTML(playerName(match.playerAId, match.roundIndex === 0 ? "Folga" : "A definir"))}</strong>
                   <span class="match-result-summary">
                     <span class="result-score">${result ? `${result.scoreA} × ${result.scoreB}` : "×"}</span>
-                    ${result ? `<small>Bolas: ${normalizeBallCount(result.ballsA)} × ${normalizeBallCount(result.ballsB)}</small>` : ""}
+                    ${result ? `<small>${formatBallSummary(result)}</small>` : ""}
                   </span>
                   <strong>${escapeHTML(playerName(match.playerBId, match.roundIndex === 0 ? "Folga" : "A definir"))}</strong>
                 </div>
@@ -2543,15 +2546,14 @@
 
   function renderSettings() {
     const settings = state.settings;
-    const ranking = settings.ranking;
     return `
       <div class="page-grid dashboard-grid workspace-page settings-workspace">
-        ${renderWorkspaceHeader("Regras e persistência", "Controle o formato dos placares, pontuações e dados permanentes do campeonato.", "Configuração administrativa")}
+        ${renderWorkspaceHeader("Regras e persistência", "Controle a pontuação da liga e os dados permanentes do campeonato.", "Configuração administrativa")}
         <section class="card col-8">
           <div class="card-header">
             <div>
               <h2>Regras do campeonato</h2>
-              <p>As alterações valem para novos placares e para o ranking.</p>
+              <p>As alterações valem para a classificação da liga.</p>
             </div>
           </div>
           <div class="card-body">
@@ -2568,55 +2570,12 @@
               </section>
 
               <section class="settings-section">
-                <h3>Formato do placar</h3>
-                <p>Esta configuração vale apenas para o mata-mata. Na liga, todo duelo é uma partida única com placar 1 × 0.</p>
-                <div class="form-grid">
-                  <label class="field col-6">
-                    <span>Modo</span>
-                    <select name="scoreMode" id="settings-score-mode">
-                      <option value="frames" ${settings.scoreMode === "frames" ? "selected" : ""}>Frames / partidas vencidas</option>
-                      <option value="points" ${settings.scoreMode === "points" ? "selected" : ""}>Pontos livres</option>
-                    </select>
-                  </label>
-                  <label class="field col-6">
-                    <span>Frames para vencer</span>
-                    <input name="framesToWin" type="number" min="1" max="20" value="${Number(settings.framesToWin) || 2}" ${settings.scoreMode === "points" ? "disabled" : ""}>
-                  </label>
-                </div>
-                <div class="toggle-row">
-                  <div class="toggle-copy">
-                    <strong>Disputa de 3º lugar</strong>
-                    <span>Cria uma partida entre os perdedores das semifinais.</span>
-                  </div>
-                  <label class="switch">
-                    <input type="checkbox" name="thirdPlace" ${settings.thirdPlace ? "checked" : ""}>
-                    <span class="switch-track"></span>
-                  </label>
-                </div>
-              </section>
-
-              <section class="settings-section">
                 <h3>Liga por pontos</h3>
-                <p>Pontuação da classificação todos contra todos. As partidas precisam ter um vencedor.</p>
+                <p>A pontuação só aumenta: vitórias somam pontos e derrotas mantêm o total atual.</p>
                 <div class="form-grid">
-                  ${renderNumberField("Pontos por vitória", "league-winPoints", settings.league.winPoints, "col-6", true)}
-                  ${renderNumberField("Pontos por derrota", "league-lossPoints", settings.league.lossPoints, "col-6", true)}
+                  ${renderNumberField("Pontos por vitória", "league-winPoints", settings.league.winPoints, "col-12", true)}
                 </div>
-                <div class="notice mt-12"><span>↕</span><span>Desempates: pontos, vitórias, saldo de frames/pontos, frames/pontos marcados, bolas matadas e nome.</span></div>
-              </section>
-
-              <section class="settings-section">
-                <h3>Pontuação do ranking mata-mata</h3>
-                <p>Estes bônus são usados apenas no módulo eliminatório.</p>
-                <div class="form-grid">
-                  ${renderNumberField("Participação", "participation", ranking.participation, "col-4")}
-                  ${renderNumberField("Por vitória", "win", ranking.win, "col-4")}
-                  ${renderNumberField("Campeão", "champion", ranking.champion, "col-4")}
-                  ${renderNumberField("Vice-campeão", "runnerUp", ranking.runnerUp, "col-4")}
-                  ${renderNumberField("Semifinalista", "semifinal", ranking.semifinal, "col-4")}
-                  ${renderNumberField("Quartas de final", "quarterfinal", ranking.quarterfinal, "col-4")}
-                  ${renderNumberField("Oitavas de final", "roundOf16", ranking.roundOf16, "col-4")}
-                </div>
+                <div class="notice mt-12"><span>↕</span><span>Derrota: 0 ponto. Desempates: pontos, vitórias, saldo de bolas, bolas matadas e nome.</span></div>
               </section>
 
               <div class="card-actions mt-20">
@@ -2654,7 +2613,7 @@
           <div class="card-header">
             <div>
               <h2>Referências usadas no projeto</h2>
-              <p>Fontes para liga, chave eliminatória, regras e bolão.</p>
+              <p>Fontes para liga, regras e bolão.</p>
             </div>
           </div>
           <div class="card-body reference-list">
@@ -2665,10 +2624,6 @@
             <a class="reference-item" href="https://www.fifa.com/en/tournaments/mens/worldcup/canadamexicousa2026/articles/groups-how-teams-qualify-tie-breakers" target="_blank" rel="noreferrer">
               <strong>FIFA · Pontuação e classificação em grupos</strong>
               <span>Referência para o modelo de três pontos por vitória e tabela classificatória.</span>
-            </a>
-            <a class="reference-item" href="https://www.fifa.com/en/tournaments/mens/worldcup/canadamexicousa2026/articles/knockout-stage-match-schedule-bracket" target="_blank" rel="noreferrer">
-              <strong>FIFA · Chave da fase eliminatória</strong>
-              <span>Referência visual para o módulo mata-mata mantido no sistema.</span>
             </a>
             <a class="reference-item" href="https://www.wpbsa.com/rules/" target="_blank" rel="noreferrer">
               <strong>WPBSA · Regras oficiais de snooker</strong>
@@ -2770,6 +2725,22 @@
     return Number.isInteger(number) && number >= 0 ? number : 0;
   }
 
+  function ballsLeftForResult(result, playerId) {
+    if (!result || result.winnerId === playerId) return 0;
+    const ballsMade = playerId === result.playerAId
+      ? normalizeBallCount(result.ballsA)
+      : normalizeBallCount(result.ballsB);
+    return Math.max(0, BALLS_PER_PLAYER - Math.min(BALLS_PER_PLAYER, ballsMade));
+  }
+
+  function formatBallSummary(result) {
+    const ballsA = Math.min(BALLS_PER_PLAYER, normalizeBallCount(result.ballsA));
+    const ballsB = Math.min(BALLS_PER_PLAYER, normalizeBallCount(result.ballsB));
+    const leftA = ballsLeftForResult(result, result.playerAId);
+    const leftB = ballsLeftForResult(result, result.playerBId);
+    return `Matadas: ${ballsA} × ${ballsB} · na mesa: ${leftA} × ${leftB}`;
+  }
+
   function normalizeResultBallCounts(result) {
     if (!result || typeof result !== "object") return;
     result.ballsA = normalizeBallCount(result.ballsA);
@@ -2781,6 +2752,9 @@
       return "Informe números inteiros para as bolas matadas dos dois jogadores.";
     }
     if (ballsA < 0 || ballsB < 0) return "A quantidade de bolas matadas não pode ser negativa.";
+    if (ballsA > BALLS_PER_PLAYER || ballsB > BALLS_PER_PLAYER) {
+      return `Cada jogador pode matar no máximo ${BALLS_PER_PLAYER} bolas.`;
+    }
     return "";
   }
 
@@ -2870,7 +2844,7 @@
     logActivity(
       "score",
       `${playerName(winnerId)} venceu`,
-      `${match.roundName} · ${scoreA} × ${scoreB} · bolas ${ballsA} × ${ballsB}`,
+      `${match.roundName} · ${scoreA} × ${scoreB} · ${formatBallSummary(result).toLocaleLowerCase("pt-BR")}`,
     );
     saveState();
     dom.scoreDialog.close();
@@ -2954,14 +2928,11 @@
   }
 
   async function prepareRosterChange(message) {
-    if (!state.tournament && !state.league) return true;
-    const affected = [state.league ? "a liga" : null, state.tournament ? "o mata-mata" : null]
-      .filter(Boolean)
-      .join(" e ");
+    if (!state.league) return true;
     return askConfirm(
       "Alterar participantes?",
-      `${message} A tabela de ${affected} e seus placares serão apagados para evitar confrontos inconsistentes.`,
-      "Alterar e apagar campeonatos",
+      `${message} A tabela da liga e seus placares serão apagados para evitar confrontos inconsistentes.`,
+      "Alterar e apagar a liga",
     );
   }
 
@@ -2981,19 +2952,61 @@
       showToast("Já existe um jogador com esse nome.", "error");
       return;
     }
-    const allowed = await prepareRosterChange("Um novo jogador será incluído.");
-    if (!allowed) return;
-
-    state.players.push({
+    const player = {
       id: createId("player"),
       name,
       createdAt: new Date().toISOString(),
-    });
-    if (state.tournament) state.tournament = null;
-    if (state.league) state.league = null;
-    logActivity("player", `${name} foi adicionado`, "Lista de jogadores atualizada");
+    };
+
+    let expansionPlan = null;
+    if (state.league) {
+      try {
+        if (!window.SinucaLeague?.planIncrementalExpansion) throw new Error("Planejador da liga indisponível.");
+        expansionPlan = window.SinucaLeague.planIncrementalExpansion({
+          league: state.league,
+          playerIds: state.players.map((item) => item.id),
+          newPlayerId: player.id,
+        });
+      } catch (error) {
+        console.error("Inclusão incremental bloqueada", error);
+        showToast("A tabela atual precisa ser revisada antes dessa inclusão. Nenhum dado foi alterado.", "error");
+        return;
+      }
+
+      const fittedCount = expansionPlan.additions.length;
+      const newRoundCount = expansionPlan.newRounds.length;
+      const placementSummary = newRoundCount
+        ? `${fittedCount} em rodadas existentes e ${newRoundCount} em novas rodadas retroativas`
+        : `${fittedCount} em rodadas existentes`;
+      const allowed = await askConfirm(
+        `Adicionar ${name} sem refazer a liga?`,
+        `Serão criados ${expansionPlan.manifest.totalAdditions} novos duelos: ${placementSummary}. Os ${expansionPlan.previousMatchIds.length} confrontos atuais, resultados, bolas e apostas serão preservados.`,
+        "Adicionar jogos retroativos",
+      );
+      if (!allowed) return;
+    }
+
+    state.players.push(player);
+    if (expansionPlan) {
+      expansionPlan.additions.forEach(({ roundIndex, match }) => {
+        const round = state.league.rounds[roundIndex];
+        round.matches.push(match);
+        round.byePlayerId = null;
+      });
+      state.league.rounds.push(...expansionPlan.newRounds);
+      state.league.playerIds = [...state.players.map((item) => item.id)];
+      state.league.expandedAt = new Date().toISOString();
+      normalizeLeagueResults();
+      logActivity(
+        "player",
+        `${name} entrou na liga`,
+        `${expansionPlan.manifest.totalAdditions} jogos retroativos adicionados; tabela anterior preservada`,
+      );
+    } else {
+      logActivity("player", `${name} foi adicionado`, "Lista de jogadores atualizada");
+    }
     saveState();
-    showToast("Jogador adicionado.");
+    showToast(expansionPlan ? `${name} entrou em ${expansionPlan.manifest.totalAdditions} novos duelos.` : "Jogador adicionado.");
     render();
     document.querySelector("#new-player-name")?.focus();
   }
@@ -3013,14 +3026,9 @@
       showToast("Já existe um jogador com esse nome.", "error");
       return;
     }
-    const allowed = await prepareRosterChange("O nome de um participante será alterado.");
-    if (!allowed) return;
-
     const oldName = player.name;
     player.name = newName;
-    if (state.tournament) state.tournament = null;
-    if (state.league) state.league = null;
-    logActivity("player", `${oldName} agora é ${newName}`, "Cadastro editado");
+    logActivity("player", `${oldName} agora é ${newName}`, "Nome atualizado sem alterar confrontos");
     saveState();
     showToast("Nome atualizado.");
     render();
@@ -3046,33 +3054,12 @@
     if (!requireAdmin()) return;
     const formData = new FormData(form);
     state.settings.title = String(formData.get("title") || "Sinuca da Firma").trim();
-    state.settings.scoreMode = formData.get("scoreMode") === "points" ? "points" : "frames";
-    state.settings.framesToWin = clampNumber(formData.get("framesToWin"), 1, 20, 2);
-    state.settings.thirdPlace = formData.get("thirdPlace") === "on";
     state.settings.league.winPoints = clampNumber(formData.get("league-winPoints"), 0, 999, 3);
-    state.settings.league.lossPoints = clampNumber(formData.get("league-lossPoints"), 0, 999, 0);
-
-    const rankingKeys = [
-      "participation",
-      "win",
-      "champion",
-      "runnerUp",
-      "semifinal",
-      "quarterfinal",
-      "roundOf16",
-    ];
-    rankingKeys.forEach((key) => {
-      state.settings.ranking[key] = clampNumber(
-        formData.get(`ranking-${key}`),
-        0,
-        999,
-        0,
-      );
-    });
+    state.settings.league.lossPoints = 0;
 
     normalizeLeagueResults();
     normalizeTournamentResults();
-    logActivity("settings", "Configurações atualizadas", scoreRuleLabel());
+    logActivity("settings", "Configurações atualizadas", `${state.settings.league.winPoints} pontos por vitória`);
     saveState();
     showToast("Configurações salvas.");
     render();

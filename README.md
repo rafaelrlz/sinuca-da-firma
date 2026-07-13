@@ -1,8 +1,8 @@
-# Campeonato de Sinuca — liga, mata-mata e bolão virtual
+# Campeonato de Sinuca — liga e bolão virtual
 
 Para publicar um campeonato que já possui confrontos, resultados e apostas, siga [MIGRACAO-VERCEL-NEON.md](MIGRACAO-VERCEL-NEON.md). Não gere uma nova liga durante a migração.
 
-Sistema local para organizar o campeonato de sinuca da empresa em uma rede interna. A versão principal agora é uma **liga por pontos, todos contra todos**, mas o módulo **mata-mata** continua disponível para uso futuro.
+Sistema para organizar o campeonato de sinuca da empresa como uma **liga por pontos, todos contra todos**.
 
 Também foi incluído um **bolão com fichas virtuais**, sem dinheiro, pagamento ou saque.
 
@@ -26,24 +26,13 @@ Login administrativo:
 http://IP-DO-SERVIDOR:3000/login
 ```
 
-Credenciais iniciais:
-
-```text
-Usuário: admin
-Senha: 11002233
-```
+Defina as credenciais com `SINUCA_ADMIN_USER` e `SINUCA_ADMIN_PASSWORD`. Nunca publique a senha administrativa no repositório.
 
 ## Liga por pontos
 
 Na aba **Liga por pontos**, o administrador gera automaticamente uma tabela em que cada jogador enfrenta todos os demais uma vez.
 
-Com os 10 participantes atuais, o sistema cria:
-
-- 9 rodadas;
-- 5 partidas por rodada;
-- 45 partidas no total.
-
-Quando o número de jogadores for ímpar, cada rodada terá uma folga distribuída automaticamente.
+Quando a liga já estiver em andamento, novos jogadores podem ser incluídos a qualquer momento. O sistema valida toda a tabela, preserva os confrontos, IDs, resultados, bolas e apostas existentes e cria somente os jogos que faltam entre o novo participante e o elenco atual. Esses duelos aproveitam espaços livres nas rodadas existentes e, quando necessário, são adicionados em novas rodadas retroativas.
 
 Pontuação padrão:
 
@@ -56,18 +45,11 @@ Critérios de desempate:
 
 1. pontos;
 2. número de vitórias;
-3. saldo de frames ou pontos;
-4. frames ou pontos marcados;
-5. total de bolas matadas;
-6. ordem alfabética.
+3. saldo de bolas (matadas menos deixadas na mesa);
+4. total de bolas matadas;
+5. ordem alfabética.
 
-Os valores de vitória e derrota podem ser alterados em **Configurações**. Ao registrar cada partida, também devem ser informadas as bolas matadas por cada jogador; esse total é acumulado na classificação.
-
-## Mata-mata preservado
-
-As abas **Mata-mata**, **Jogos mata-mata** e **Ranking mata-mata** continuam funcionando de forma independente.
-
-O administrador pode manter apenas a liga, apenas o mata-mata ou os dois módulos simultaneamente. Gerar novamente a liga não apaga a chave eliminatória, e refazer o mata-mata não apaga a liga.
+O valor da vitória pode ser alterado em **Configurações**. A derrota sempre vale 0 ponto, portanto a pontuação nunca diminui. Cada jogador possui 8 bolas (7 do seu grupo mais o castigo). Ao registrar a partida, informe quantas bolas cada um matou. Para o perdedor, o sistema calcula automaticamente as bolas deixadas na mesa (`8 - bolas matadas`). O saldo de bolas é `bolas matadas - bolas deixadas na mesa` e pode ficar negativo.
 
 ## Bolão com fichas virtuais
 
@@ -88,12 +70,12 @@ Regras padrão:
 - aposta máxima por partida: 500 fichas;
 - o usuário escolhe o vencedor;
 - acerto paga 2× a aposta, incluindo a devolução das fichas apostadas;
-- erro perde as fichas;
+- erro devolve as fichas reservadas e mantém a pontuação;
 - uma aposta aberta pode ser alterada ou cancelada;
 - a aposta é encerrada quando o administrador registra o placar;
 - se o confronto for recriado com outros jogadores, a aposta é anulada e as fichas são devolvidas.
 
-O ranking do bolão usa o saldo apurado das apostas encerradas. Fichas reservadas em apostas abertas aparecem separadamente.
+O ranking do bolão usa o saldo apurado das apostas encerradas. Ele apenas sobe com acertos; erros não retiram pontos. Fichas reservadas em apostas abertas aparecem separadamente.
 
 ### Administração do bolão
 
@@ -103,7 +85,7 @@ Quando o administrador estiver logado e abrir `/bolao`, aparecerá o botão:
 Zerar bolão e perfis
 ```
 
-Essa ação apaga somente os perfis e apostas. Liga, mata-mata, jogadores e placares não são alterados.
+Essa ação apaga somente os perfis e apostas. Liga, jogadores e placares não são alterados.
 
 > O bolão é exclusivamente recreativo e usa pontos virtuais. O sistema não possui depósitos, pagamentos, saque, prêmio em dinheiro ou integração financeira.
 
@@ -113,8 +95,7 @@ Sem login, qualquer pessoa pode:
 
 - visualizar a classificação da liga;
 - consultar rodadas e placares;
-- acompanhar o mata-mata;
-- consultar os rankings;
+- consultar a classificação;
 - participar do bolão virtual;
 - exportar uma cópia JSON do campeonato.
 
@@ -122,7 +103,6 @@ Somente o administrador pode:
 
 - cadastrar, editar e excluir jogadores;
 - gerar ou refazer a liga;
-- gerar ou refazer o mata-mata;
 - registrar, editar e apagar placares;
 - alterar regras e pontuação;
 - importar backups;
@@ -179,7 +159,7 @@ O banco armazena:
 - jogadores;
 - configurações;
 - tabela e placares da liga;
-- chave e placares do mata-mata;
+- dados legados de formatos anteriores, preservados para compatibilidade e não exibidos na interface;
 - perfis do bolão;
 - PINs protegidos por hash;
 - fichas e apostas.
@@ -327,7 +307,7 @@ campeonato-sinuca-local-v5/
 - Round-robin: cada participante enfrenta todos os outros, com classificação por resultados acumulados.
 - World Snooker Tour — Championship League: exemplo de competição de sinuca com grupos e partidas em formato round-robin.
 - Sportspoule: exemplo de bolão em que participantes fazem previsões e acompanham uma classificação.
-- FIFA: referência para tabelas por pontos e apresentação de chave eliminatória.
+- FIFA: referência para tabelas e classificação por pontos.
 - WPBSA: terminologia de partidas divididas em frames.
 
 ## Encerramento correto

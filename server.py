@@ -60,6 +60,7 @@ STATIC_FILES = {
     "/": "index.html",
     "/index.html": "index.html",
     "/styles.css": "styles.css",
+    "/league-schedule.js": "league-schedule.js",
     "/app.js": "app.js",
     "/login": "login.html",
     "/login/": "login.html",
@@ -555,7 +556,7 @@ def bet_status(row: object, matches: dict[tuple[str, str], dict[str, object]]) -
         return "pending", 0
     if winner_id == row["predicted_winner_id"]:
         return "won", int(row["stake"]) * 2
-    return "lost", 0
+    return "lost", int(row["stake"])
 
 
 def betting_snapshot(token: str | None) -> dict[str, object]:
@@ -593,7 +594,6 @@ def betting_snapshot(token: str | None) -> dict[str, object]:
                 profit += stake
                 wins += 1
             elif status == "lost":
-                profit -= stake
                 losses += 1
             elif status == "pending":
                 pending_stake += stake
@@ -660,7 +660,7 @@ def place_wager(token: str | None, body: dict[str, object]) -> dict[str, object]
         stake = int(body.get("stake") or 0)
     except (TypeError, ValueError) as error:
         raise ValueError("A quantidade de fichas é inválida.") from error
-    if match_kind not in {"league", "bracket", "third"} or not match_id:
+    if match_kind != "league" or not match_id:
         raise ValueError("Partida inválida.")
     if not (1 <= stake <= BET_MAX_STAKE):
         raise ValueError(f"A aposta deve ser de 1 a {BET_MAX_STAKE} fichas.")

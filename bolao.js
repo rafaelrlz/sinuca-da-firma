@@ -268,7 +268,6 @@
   function render() {
     const pendingMatches = collectMatches().filter((match) => !match.result);
     const leagueMatches = pendingMatches.filter((match) => match.kind === "league");
-    const knockoutMatches = pendingMatches.filter((match) => match.kind !== "league");
     const profile = betting.profile;
 
     dom.content.innerHTML = `
@@ -276,7 +275,7 @@
         <div>
           <span class="eyebrow">Bolão interno</span>
           <h1>Aposte fichas virtuais nas disputas</h1>
-          <p>Escolha o vencedor e arrisque parte do seu saldo. Acerto rende o dobro da aposta; erro perde as fichas. Não há dinheiro, pagamento ou saque.</p>
+          <p>Escolha o vencedor e reserve parte do seu saldo. Acerto aumenta suas fichas; erro mantém a pontuação atual. Não há dinheiro, pagamento ou saque.</p>
         </div>
         <div class="pool-rules-chip"><strong>${formatNumber(betting.settings?.initialBalance || 1000)}</strong><span>fichas iniciais</span></div>
       </section>
@@ -286,7 +285,6 @@
       <div class="pool-layout">
         <section class="pool-main-column">
           ${renderBettingSection("Liga por pontos", "Todos contra todos", leagueMatches, "↻")}
-          ${renderBettingSection("Mata-mata", "Módulo eliminatório opcional", knockoutMatches, "◇")}
           ${profile ? renderMyBets() : ""}
         </section>
         <aside class="pool-side-column">
@@ -411,7 +409,7 @@
 
   function renderMyBets() {
     const matches = currentMatchesMap();
-    const bets = betting.myBets || [];
+    const bets = (betting.myBets || []).filter((bet) => bet.matchKind === "league");
     return `
       <section class="card pool-history-card">
         <div class="card-header"><div><h2>Minhas apostas</h2><p>As fichas são apuradas automaticamente quando o administrador salva o placar.</p></div></div>
@@ -426,7 +424,7 @@
     let statusMeta = {
       pending: ["Aberta", "badge-gold", `-${formatNumber(bet.stake)} fichas reservadas`],
       won: ["Ganhou", "badge-green", `+${formatNumber(bet.stake)} de lucro`],
-      lost: ["Perdeu", "badge-red", `-${formatNumber(bet.stake)} fichas`],
+      lost: ["Não acertou", "", "saldo mantido"],
       void: ["Anulada", "", "fichas devolvidas"],
     }[bet.status] || [bet.status, "", ""];
     if (bet.status === "pending" && match?.inProgress) {
@@ -454,7 +452,7 @@
               <div class="pool-leader-row ${betting.profile?.id === row.id ? "is-me" : ""}">
                 <span class="ranking-position pos-${index + 1}">${index + 1}</span>
                 <span class="avatar">${escapeHTML(initials(row.name))}</span>
-                <div><strong>${escapeHTML(row.name)}</strong><small>${row.wins} acerto(s) · ${row.accuracy}%</small></div>
+                <div><strong>${escapeHTML(row.name)}</strong><small>${row.wins} acerto(s) · ${row.accuracy}%${betting.profile?.id === row.id ? " · Você" : ""}</small></div>
                 <div class="pool-leader-balance"><strong>${formatNumber(row.settledBalance)}</strong><small>${Number(row.profit) >= 0 ? "+" : ""}${formatNumber(row.profit)}</small></div>
               </div>`).join("")}</div>`
           : '<div class="empty-state compact"><p>Ninguém entrou no bolão ainda.</p></div>'}
@@ -470,7 +468,7 @@
           <li>Todo perfil começa com <strong>${formatNumber(betting.settings?.initialBalance || 1000)} fichas virtuais</strong>.</li>
           <li>Escolha um vencedor e aposte até <strong>${formatNumber(betting.settings?.maxStake || 500)} fichas</strong> por disputa.</li>
           <li>Acertou: recebe <strong>2× a aposta</strong>, incluindo a devolução das fichas apostadas.</li>
-          <li>Errou: perde as fichas. Se o confronto for refeito, a aposta é anulada.</li>
+          <li>Não acertou: as fichas reservadas voltam ao saldo, sem perda de pontos.</li>
           <li>A aposta fecha quando o placar é registrado pelo administrador.</li>
         </ol>
         <div class="notice notice-warning"><span>!</span><span>Este módulo é recreativo e usa somente pontos virtuais. Não registra dinheiro, pagamentos ou prêmios.</span></div>

@@ -10,7 +10,7 @@ web
 
 ## Users
 
-O administrador é o usuário principal. Ele organiza jogadores, rodadas, partidas, resultados, regras, rankings, mata-mata e bolão em um único fluxo de trabalho. Os colegas da empresa são o público secundário: acessam a experiência pública para acompanhar o campeonato, consultar resultados e classificação e participar do bolão, sem permissões administrativas.
+O administrador é o usuário principal. Ele organiza jogadores, rodadas, partidas, resultados, regras, classificação e bolão em um único fluxo de trabalho. Os colegas da empresa são o público secundário: acessam a experiência pública para acompanhar o campeonato, consultar resultados e classificação e participar do bolão, sem permissões administrativas.
 
 ## Product Purpose
 

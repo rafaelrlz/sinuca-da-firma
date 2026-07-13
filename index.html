@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <meta name="theme-color" content="#0c4a36">
-  <meta name="description" content="Gerenciador local de campeonato de sinuca com liga por pontos, todos contra todos e mata-mata opcional.">
+  <meta name="description" content="Campeonato de sinuca em liga por pontos, com rodadas, classificação e bolão virtual.">
   <title>Sinuca da Firma</title>
   <link rel="stylesheet" href="styles.css">
 </head>
@@ -28,15 +28,6 @@
         </button>
         <button class="nav-item" data-view="league">
           <span aria-hidden="true">↻</span> Liga por pontos
-        </button>
-        <button class="nav-item" data-view="draw">
-          <span aria-hidden="true">⤨</span> Mata-mata
-        </button>
-        <button class="nav-item" data-view="matches">
-          <span aria-hidden="true">◆</span> Jogos mata-mata
-        </button>
-        <button class="nav-item" data-view="ranking">
-          <span aria-hidden="true">★</span> Ranking mata-mata
         </button>
         <a class="nav-item nav-anchor" href="/bolao">
           <span aria-hidden="true">◉</span> Bolão virtual
@@ -66,8 +57,6 @@
         <nav class="public-nav" aria-label="Navegação pública">
           <button type="button" data-action="navigate" data-view="dashboard">Início</button>
           <button type="button" data-action="navigate" data-view="league">Liga</button>
-          <button type="button" data-action="navigate" data-view="draw">Mata-mata</button>
-          <button type="button" data-action="navigate" data-view="ranking">Ranking</button>
           <a href="/bolao">Bolão</a>
         </nav>
         <a class="public-admin-link" href="/login">Área administrativa <span aria-hidden="true">↗</span></a>
@@ -118,18 +107,18 @@
 
         <div class="balls-editor">
           <div class="balls-editor-heading">
-            <strong>Bolas matadas</strong>
-            <span>Usado como critério de desempate na classificação.</span>
+            <strong>Bolas da partida</strong>
+            <span>Informe quantas cada jogador matou, até 8. Para o perdedor, as faltantes viram bolas na mesa.</span>
           </div>
           <div class="scoreboard-editor balls-scoreboard-editor">
             <label class="score-player balls-player">
               <span id="score-balls-player-a">Jogador A</span>
-              <input id="score-balls-a" type="number" min="0" step="1" inputmode="numeric">
+              <input id="score-balls-a" type="number" min="0" max="8" step="1" inputmode="numeric">
             </label>
             <span class="score-separator">×</span>
             <label class="score-player balls-player">
               <span id="score-balls-player-b">Jogador B</span>
-              <input id="score-balls-b" type="number" min="0" step="1" inputmode="numeric">
+              <input id="score-balls-b" type="number" min="0" max="8" step="1" inputmode="numeric">
             </label>
           </div>
         </div>
@@ -164,6 +153,7 @@
   <input type="file" id="import-file" accept="application/json,.json" hidden>
   <div class="toast-region" id="toast-region" aria-live="polite" aria-atomic="true"></div>
 
+  <script src="league-schedule.js"></script>
   <script src="app.js"></script>
 </body>
 </html>
