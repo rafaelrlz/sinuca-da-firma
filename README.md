@@ -101,6 +101,8 @@ Sem login, qualquer pessoa pode:
 - participar do bolão virtual;
 - exportar uma cópia JSON do campeonato.
 
+No cabeçalho público, o item **Ranking** abre a liga já posicionado suavemente na classificação.
+
 Somente o administrador pode:
 
 - cadastrar, editar e excluir jogadores;

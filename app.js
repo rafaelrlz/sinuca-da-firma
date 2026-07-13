@@ -558,7 +558,7 @@
     window.setTimeout(() => toast.remove(), 3300);
   }
 
-  function navigate(view) {
+  function navigate(view, options = {}) {
     if (!VIEW_META[view]) return;
     if (HIDDEN_VIEWS.has(view)) view = "league";
     if (!isAdmin() && !["dashboard", "league"].includes(view)) {
@@ -573,6 +573,9 @@
     document.querySelectorAll(".public-nav [data-view]").forEach((button) => {
       button.classList.toggle("is-active", button.dataset.view === view);
     });
+    document.querySelectorAll('.public-nav [data-action="navigate-public-ranking"]').forEach((button) => {
+      button.classList.remove("is-active");
+    });
     const meta = VIEW_META[view];
     dom.pageTitle.textContent = meta.title;
     dom.pageSubtitle.textContent = meta.subtitle;
@@ -580,7 +583,27 @@
     closeMenu();
     render();
     dom.content.focus({ preventScroll: true });
-    window.scrollTo({ top: 0, behavior: "smooth" });
+    if (options.scrollToTop !== false) {
+      window.scrollTo({ top: 0, behavior: "smooth" });
+    }
+  }
+
+  function navigateToPublicLeagueRanking() {
+    navigate("league", { scrollToTop: false });
+    window.requestAnimationFrame(() => {
+      window.requestAnimationFrame(() => {
+        const ranking = document.querySelector("#public-league-ranking");
+        const reducedMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+        if (!ranking) {
+          window.scrollTo({ top: 0, behavior: reducedMotion ? "auto" : "smooth" });
+          return;
+        }
+        document.querySelectorAll(".public-nav [data-view]").forEach((button) => button.classList.remove("is-active"));
+        document.querySelectorAll('.public-nav [data-action="navigate-public-ranking"]').forEach((button) => button.classList.add("is-active"));
+        ranking.scrollIntoView({ behavior: reducedMotion ? "auto" : "smooth", block: "start" });
+        ranking.focus({ preventScroll: true });
+      });
+    });
   }
 
   function openMenu() {
@@ -600,6 +623,9 @@
       dom.pageSubtitle.textContent = viewMeta.subtitle;
       document.querySelectorAll(".nav-item, .public-nav [data-view]").forEach((button) => {
         button.classList.toggle("is-active", button.dataset.view === ui.currentView);
+      });
+      document.querySelectorAll('.public-nav [data-action="navigate-public-ranking"]').forEach((button) => {
+        button.classList.remove("is-active");
       });
       normalizeLeagueResults();
       normalizeTournamentResults();
@@ -971,7 +997,7 @@
     return `<div class="public-view">
       ${renderPublicViewHeader("Liga por pontos", "A corrida pela liderança.", "Cada rodada recalcula a disputa. Acompanhe pontos, saldo de bolas e todos os confrontos da temporada.", facts)}
       <div class="public-view-content">
-        <section class="public-view-section public-league-board">
+        <section class="public-view-section public-league-board" id="public-league-ranking" tabindex="-1">
           <div class="public-block-title"><div><span class="public-overline">Tabela atual</span><h2>Classificação</h2></div><p>${Number(state.settings.league.winPoints) || 0} pontos por vitória · derrota mantém a pontuação · desempate pelo saldo de bolas.</p></div>
           ${renderPublicStandings(standings)}
         </section>
@@ -3177,6 +3203,9 @@
     switch (action) {
       case "navigate":
         navigate(button.dataset.view);
+        break;
+      case "navigate-public-ranking":
+        navigateToPublicLeagueRanking();
         break;
       case "generate-league":
         await generateLeague();

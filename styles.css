@@ -4242,6 +4242,11 @@ body.is-public:not([data-view="dashboard"]) .content {
   grid-template-columns: 48px 46px minmax(180px, 1fr) 72px 72px 72px 82px 112px;
 }
 
+#public-league-ranking {
+  scroll-margin-top: 104px;
+  outline: none;
+}
+
 .public-round-list {
   border-top: 1px solid #b8c6be;
 }
