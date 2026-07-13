@@ -7,7 +7,7 @@
   const SYNC_INTERVAL_MS = 4000;
   const MAX_PLAYERS = 32;
   const MAX_BALLS_PER_PLAYER = 8;
-  const OBJECT_BALLS_PER_PLAYER = 7;
+  const BALANCE_BALLS_PER_PLAYER = 8;
   const BASE_MATCH_GAP = 120;
   const HIDDEN_VIEWS = new Set(["draw", "matches", "ranking"]);
 
@@ -2739,7 +2739,7 @@
     const ballsMade = playerId === result.playerAId
       ? normalizeBallCount(result.ballsA)
       : normalizeBallCount(result.ballsB);
-    return Math.max(0, OBJECT_BALLS_PER_PLAYER - Math.min(OBJECT_BALLS_PER_PLAYER, ballsMade));
+    return Math.max(0, BALANCE_BALLS_PER_PLAYER - Math.min(BALANCE_BALLS_PER_PLAYER, ballsMade));
   }
 
   function formatBallSummary(result) {

@@ -49,7 +49,7 @@ Critérios de desempate:
 4. total de bolas matadas;
 5. ordem alfabética.
 
-O valor da vitória pode ser alterado em **Configurações**. A derrota sempre vale 0 ponto, portanto a pontuação nunca diminui. Cada jogador possui 7 bolas comuns mais o castigo. Ao registrar a partida, informe quantas bolas cada um matou, incluindo o castigo quando ele cair. O sistema considera somente as bolas comuns que o perdedor deixou na mesa: o vencedor recebe esse número como saldo positivo e o perdedor recebe o mesmo número como saldo negativo. O castigo não entra no saldo.
+O valor da vitória pode ser alterado em **Configurações**. A derrota sempre vale 0 ponto, portanto a pontuação nunca diminui. Cada jogador possui 7 bolas comuns mais o castigo. Ao registrar a partida, informe quantas bolas cada um matou. O saldo da partida é a quantidade que o perdedor deixou na mesa, incluindo o castigo (`8 - bolas matadas pelo perdedor`): o vencedor recebe esse número como saldo positivo e o perdedor recebe o mesmo número como saldo negativo.
 
 ## Bolão com fichas virtuais
 
