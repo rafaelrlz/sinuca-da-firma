@@ -26,7 +26,7 @@ Login administrativo:
 http://IP-DO-SERVIDOR:3000/login
 ```
 
-Defina as credenciais com `SINUCA_ADMIN_USER` e `SINUCA_ADMIN_PASSWORD`. Nunca publique a senha administrativa no repositório.
+Defina as credenciais com `SINUCA_ADMIN_USER` e `SINUCA_ADMIN_PASSWORD`. Para outras contas, use pares numerados como `SINUCA_ADMIN_USER_2` e `SINUCA_ADMIN_PASSWORD_2`. Nunca publique senhas administrativas no repositório.
 
 ## Liga por pontos
 
@@ -210,9 +210,11 @@ Importe este diretório/repositório na Vercel e cadastre estas variáveis em **
 DATABASE_URL=connection string do Neon
 SINUCA_ADMIN_USER=seu usuário administrativo
 SINUCA_ADMIN_PASSWORD=uma senha longa e exclusiva
+SINUCA_ADMIN_USER_2=segundo usuário administrativo
+SINUCA_ADMIN_PASSWORD_2=outra senha longa e exclusiva
 ```
 
-O arquivo `vercel.json` já configura a função Python, as rotas da API e os cabeçalhos de segurança. Na Vercel, o login fica bloqueado se `SINUCA_ADMIN_PASSWORD` não estiver configurada, evitando publicar a senha local padrão por engano.
+Repita a numeração para outras contas (`_3`, `_4` e assim por diante). Cada usuário precisa ter seu par de usuário e senha com o mesmo número. O arquivo `vercel.json` já configura a função Python, as rotas da API e os cabeçalhos de segurança. Na Vercel, somente contas com senha configurada por variável de ambiente são habilitadas, evitando publicar a senha local padrão por engano.
 
 ### 3. Migrar os dados locais, se desejar
 

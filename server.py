@@ -53,6 +53,31 @@ SESSION_DURATION = timedelta(hours=12)
 LOGIN_WINDOW_SECONDS = 5 * 60
 LOGIN_MAX_FAILURES = 5
 
+
+def configured_admin_accounts() -> list[tuple[str, str | None]]:
+    """Carrega a conta principal e pares numerados definidos no ambiente."""
+    accounts: list[tuple[str, str | None]] = []
+    if ADMIN_PASSWORD_OVERRIDE:
+        accounts.append((ADMIN_USERNAME, ADMIN_PASSWORD_OVERRIDE))
+    elif not os.environ.get("VERCEL"):
+        accounts.append((ADMIN_USERNAME, None))
+
+    prefix = "SINUCA_ADMIN_USER_"
+    suffixes = sorted(
+        int(key[len(prefix):])
+        for key in os.environ
+        if key.startswith(prefix) and key[len(prefix):].isdigit()
+    )
+    for suffix in suffixes:
+        username = os.environ.get(f"{prefix}{suffix}", "")
+        password = os.environ.get(f"SINUCA_ADMIN_PASSWORD_{suffix}", "")
+        if username and password:
+            accounts.append((username, password))
+    return accounts
+
+
+ADMIN_ACCOUNTS = configured_admin_accounts()
+
 BET_TOKEN_HEADER = "X-Bettor-Token"
 BET_INITIAL_BALANCE = 10_000
 BET_EXISTING_BALANCE_BONUS = 9_000
@@ -946,20 +971,23 @@ def reset_betting_pool() -> None:
 
 
 def verify_admin_credentials(username: str, password: str) -> bool:
-    if os.environ.get("VERCEL") and ADMIN_PASSWORD_OVERRIDE is None:
-        return False
-    username_matches = hmac.compare_digest(username, ADMIN_USERNAME)
-    if ADMIN_PASSWORD_OVERRIDE is None:
-        password_hash = hashlib.pbkdf2_hmac(
-            "sha256",
-            password.encode("utf-8"),
-            DEFAULT_PASSWORD_SALT,
-            PASSWORD_ITERATIONS,
-        )
-        password_matches = hmac.compare_digest(password_hash, DEFAULT_PASSWORD_HASH)
-    else:
-        password_matches = hmac.compare_digest(password, ADMIN_PASSWORD_OVERRIDE)
-    return username_matches and password_matches
+    authenticated = False
+    default_password_hash: bytes | None = None
+    for configured_username, configured_password in ADMIN_ACCOUNTS:
+        username_matches = hmac.compare_digest(username, configured_username)
+        if configured_password is None:
+            if default_password_hash is None:
+                default_password_hash = hashlib.pbkdf2_hmac(
+                    "sha256",
+                    password.encode("utf-8"),
+                    DEFAULT_PASSWORD_SALT,
+                    PASSWORD_ITERATIONS,
+                )
+            password_matches = hmac.compare_digest(default_password_hash, DEFAULT_PASSWORD_HASH)
+        else:
+            password_matches = hmac.compare_digest(password, configured_password)
+        authenticated = authenticated or (username_matches and password_matches)
+    return authenticated
 
 
 def create_session() -> tuple[str, datetime]:
@@ -1364,7 +1392,7 @@ class TournamentHandler(SimpleHTTPRequestHandler):
         )
         self.send_json(
             HTTPStatus.OK,
-            {"ok": True, "authenticated": True, "username": ADMIN_USERNAME},
+            {"ok": True, "authenticated": True, "username": username},
             extra_headers={"Set-Cookie": cookie},
         )
 
