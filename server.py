@@ -11,6 +11,8 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 import hashlib
 import hmac
+import base64
+import binascii
 import json
 import mimetypes
 import os
@@ -32,6 +34,7 @@ from database import (
 HOST = "0.0.0.0"
 PORT = int(os.environ.get("SINUCA_PORT", "3000"))
 MAX_BODY_BYTES = 2 * 1024 * 1024
+MAX_NEWS_IMAGE_BYTES = 900 * 1024
 PROJECT_DIR = Path(__file__).resolve().parent
 DATA_DIR = PROJECT_DIR / "data"
 BACKUP_PATH = DATA_DIR / "backup-latest.json"
@@ -229,6 +232,28 @@ def initialize_database() -> None:
             )
             """
         )
+        image_type = "BYTEA" if IS_POSTGRES else "BLOB"
+        connection.execute(
+            f"""
+            CREATE TABLE IF NOT EXISTS news_articles (
+                id TEXT PRIMARY KEY,
+                title TEXT NOT NULL,
+                summary TEXT NOT NULL,
+                body TEXT NOT NULL,
+                category TEXT NOT NULL,
+                author TEXT NOT NULL,
+                published_at TEXT NOT NULL,
+                status TEXT NOT NULL,
+                featured INTEGER NOT NULL DEFAULT 0,
+                image_data {image_type},
+                image_type TEXT,
+                image_alt TEXT NOT NULL DEFAULT '',
+                video_url TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
         connection.execute(
             "CREATE INDEX IF NOT EXISTS idx_bets_bettor ON bets(bettor_id)"
         )
@@ -353,6 +378,142 @@ def save_state(state: dict[str, object]) -> dict[str, object]:
             write_backup(state, revision, updated_at)
 
     return {"ok": True, "revision": revision, "updatedAt": updated_at}
+
+
+def news_record(row: object) -> dict[str, object]:
+    article_id = str(row["id"])
+    return {
+        "id": article_id,
+        "title": row["title"],
+        "summary": row["summary"],
+        "body": row["body"],
+        "category": row["category"],
+        "author": row["author"],
+        "publishedAt": row["published_at"],
+        "status": row["status"],
+        "featured": bool(row["featured"]),
+        "imageUrl": f"/api/news/image?id={article_id}" if row["image_type"] else "",
+        "imageAlt": row["image_alt"],
+        "videoUrl": row["video_url"],
+        "createdAt": row["created_at"],
+        "updatedAt": row["updated_at"],
+    }
+
+
+def list_news(include_drafts: bool = False) -> list[dict[str, object]]:
+    query = """
+        SELECT id, title, summary, body, category, author, published_at,
+               status, featured, image_type, image_alt, video_url, created_at, updated_at
+        FROM news_articles
+    """
+    parameters: tuple[object, ...] = ()
+    if not include_drafts:
+        query += " WHERE status = ? AND published_at <= ?"
+        parameters = ("published", utc_now())
+    query += " ORDER BY featured DESC, published_at DESC, created_at DESC"
+    with connect_database() as connection:
+        rows = connection.execute(query, parameters).fetchall()
+    return [news_record(row) for row in rows]
+
+
+def decode_news_image(value: object) -> tuple[bytes | None, str | None]:
+    if value in (None, ""):
+        return None, None
+    raw_value = str(value)
+    if not raw_value.startswith("data:image/") or ";base64," not in raw_value:
+        raise ValueError("A imagem enviada é inválida.")
+    header, encoded = raw_value.split(",", 1)
+    content_type = header[5:].split(";", 1)[0].lower()
+    if content_type not in {"image/jpeg", "image/png", "image/webp"}:
+        raise ValueError("Use uma imagem JPG, PNG ou WebP.")
+    try:
+        image = base64.b64decode(encoded, validate=True)
+    except (binascii.Error, ValueError) as error:
+        raise ValueError("A imagem enviada está corrompida.") from error
+    if len(image) > MAX_NEWS_IMAGE_BYTES:
+        raise ValueError("A imagem ultrapassa o limite de 900 KB.")
+    return image, content_type
+
+
+def clean_news_text(value: object, field: str, minimum: int, maximum: int) -> str:
+    text = str(value or "").strip()
+    if not (minimum <= len(text) <= maximum):
+        raise ValueError(f"{field} deve ter entre {minimum} e {maximum} caracteres.")
+    return text
+
+
+def save_news_article(payload: dict[str, object]) -> dict[str, object]:
+    article_id = str(payload.get("id") or f"news-{uuid.uuid4()}")
+    title = clean_news_text(payload.get("title"), "O título", 4, 140)
+    summary = clean_news_text(payload.get("summary"), "O resumo", 10, 320)
+    body = clean_news_text(payload.get("body"), "O texto", 20, 20_000)
+    category = clean_news_text(payload.get("category") or "Campeonato", "A categoria", 2, 40)
+    author = clean_news_text(payload.get("author") or "Organização", "O autor", 2, 80)
+    status = str(payload.get("status") or "draft")
+    if status not in {"draft", "published"}:
+        raise ValueError("Status de publicação inválido.")
+    published_at = str(payload.get("publishedAt") or utc_now())
+    try:
+        published_date = datetime.fromisoformat(published_at.replace("Z", "+00:00"))
+    except ValueError as error:
+        raise ValueError("A data de publicação é inválida.") from error
+    if published_date.tzinfo is None:
+        published_date = published_date.replace(tzinfo=timezone.utc)
+    published_at = published_date.astimezone(timezone.utc).isoformat(timespec="seconds")
+    video_url = str(payload.get("videoUrl") or "").strip()
+    if video_url and not video_url.startswith(("https://www.youtube.com/", "https://youtu.be/", "https://vimeo.com/")):
+        raise ValueError("Use um link válido do YouTube ou Vimeo.")
+    image_alt = str(payload.get("imageAlt") or "").strip()[:180]
+    image_data, image_type = decode_news_image(payload.get("imageData"))
+    now = utc_now()
+
+    with connect_database() as connection:
+        if payload.get("featured"):
+            connection.execute("UPDATE news_articles SET featured = 0")
+        current = connection.execute(
+            "SELECT image_data, image_type, created_at FROM news_articles WHERE id = ?",
+            (article_id,),
+        ).fetchone()
+        if current is not None and image_data is None:
+            image_data, image_type = current["image_data"], current["image_type"]
+        created_at = current["created_at"] if current is not None else now
+        connection.execute(
+            """
+            INSERT INTO news_articles (
+                id, title, summary, body, category, author, published_at, status,
+                featured, image_data, image_type, image_alt, video_url, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                title = excluded.title, summary = excluded.summary, body = excluded.body,
+                category = excluded.category, author = excluded.author,
+                published_at = excluded.published_at, status = excluded.status,
+                featured = excluded.featured, image_data = excluded.image_data,
+                image_type = excluded.image_type, image_alt = excluded.image_alt,
+                video_url = excluded.video_url, updated_at = excluded.updated_at
+            """,
+            (
+                article_id, title, summary, body, category, author, published_at, status,
+                1 if payload.get("featured") else 0, image_data, image_type, image_alt,
+                video_url, created_at, now,
+            ),
+        )
+        connection.commit()
+        row = connection.execute(
+            """
+            SELECT id, title, summary, body, category, author, published_at,
+                   status, featured, image_type, image_alt, video_url, created_at, updated_at
+            FROM news_articles WHERE id = ?
+            """,
+            (article_id,),
+        ).fetchone()
+    return news_record(row)
+
+
+def delete_news_article(article_id: str) -> bool:
+    with connect_database() as connection:
+        cursor = connection.execute("DELETE FROM news_articles WHERE id = ?", (article_id,))
+        connection.commit()
+    return cursor.rowcount == 1
 
 
 
@@ -887,7 +1048,8 @@ class TournamentHandler(SimpleHTTPRequestHandler):
         self.send_header(
             "Content-Security-Policy",
             "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; "
-            "img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; "
+            "img-src 'self' data:; connect-src 'self'; "
+            "frame-src https://www.youtube-nocookie.com https://player.vimeo.com; frame-ancestors 'none'; "
             "base-uri 'none'; form-action 'self'",
         )
         self.send_header("Cache-Control", "no-store")
@@ -922,6 +1084,21 @@ class TournamentHandler(SimpleHTTPRequestHandler):
 
     def do_GET(self) -> None:  # noqa: N802
         path = self.request_path()
+        if path == "/api/news":
+            try:
+                self.send_json(HTTPStatus.OK, {"articles": list_news(self.is_authenticated())})
+            except Exception as error:  # pragma: no cover
+                self.send_json(
+                    HTTPStatus.INTERNAL_SERVER_ERROR,
+                    {"error": "Não foi possível carregar as notícias.", "detail": str(error)},
+                )
+            return
+
+        if path == "/api/news/image":
+            article_id = parse_qs(urlparse(self.path).query).get("id", [""])[0]
+            self.send_news_image(article_id)
+            return
+
         if path == "/api/state":
             try:
                 self.send_json(HTTPStatus.OK, read_state())
@@ -1011,6 +1188,20 @@ class TournamentHandler(SimpleHTTPRequestHandler):
 
     def do_POST(self) -> None:  # noqa: N802
         path = self.request_path()
+        if path == "/api/news":
+            if not self.require_authentication():
+                return
+            try:
+                article = save_news_article(self.read_json_body())
+                self.send_json(HTTPStatus.OK, {"ok": True, "article": article})
+            except ValueError as error:
+                self.send_json(HTTPStatus.BAD_REQUEST, {"error": str(error)})
+            except Exception as error:  # pragma: no cover
+                self.send_json(
+                    HTTPStatus.INTERNAL_SERVER_ERROR,
+                    {"error": "Não foi possível salvar a notícia.", "detail": str(error)},
+                )
+            return
         if path == "/api/bettors/register":
             self.handle_bettor_register()
             return
@@ -1039,6 +1230,47 @@ class TournamentHandler(SimpleHTTPRequestHandler):
             self.do_PUT()
             return
         self.send_error(HTTPStatus.NOT_FOUND)
+
+    def do_DELETE(self) -> None:  # noqa: N802
+        path = self.request_path()
+        if path != "/api/news":
+            self.send_error(HTTPStatus.NOT_FOUND)
+            return
+        if not self.require_authentication():
+            return
+        article_id = parse_qs(urlparse(self.path).query).get("id", [""])[0]
+        if not article_id:
+            self.send_json(HTTPStatus.BAD_REQUEST, {"error": "Notícia não informada."})
+            return
+        if not delete_news_article(article_id):
+            self.send_json(HTTPStatus.NOT_FOUND, {"error": "Notícia não encontrada."})
+            return
+        self.send_json(HTTPStatus.OK, {"ok": True})
+
+    def send_news_image(self, article_id: str) -> None:
+        if not article_id:
+            self.send_error(HTTPStatus.NOT_FOUND)
+            return
+        with connect_database() as connection:
+            row = connection.execute(
+                "SELECT image_data, image_type, status, published_at FROM news_articles WHERE id = ?",
+                (article_id,),
+            ).fetchone()
+        if row is None or row["image_data"] is None:
+            self.send_error(HTTPStatus.NOT_FOUND)
+            return
+        if not self.is_authenticated() and (
+            row["status"] != "published" or str(row["published_at"]) > utc_now()
+        ):
+            self.send_error(HTTPStatus.NOT_FOUND)
+            return
+        content = bytes(row["image_data"])
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", row["image_type"] or "application/octet-stream")
+        self.send_header("Content-Length", str(len(content)))
+        self.send_header("Cache-Control", "public, max-age=3600")
+        self.end_headers()
+        self.wfile.write(content)
 
     def bettor_token(self) -> str | None:
         value = self.headers.get(BET_TOKEN_HEADER)

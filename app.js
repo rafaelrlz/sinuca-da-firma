@@ -9,6 +9,7 @@
   const MAX_BALLS_PER_PLAYER = 8;
   const BALANCE_BALLS_PER_PLAYER = 8;
   const BASE_MATCH_GAP = 120;
+  const MAX_NEWS_IMAGE_BYTES = 900 * 1024;
   const HIDDEN_VIEWS = new Set(["draw", "matches", "ranking"]);
 
   const INITIAL_NAMES = [
@@ -33,6 +34,8 @@
     "import-data",
     "reset-data",
     "toggle-match-live",
+    "edit-news",
+    "delete-news",
   ]);
 
   const VIEW_META = {
@@ -51,6 +54,10 @@
     "league-ranking": {
       title: "Ranking da liga",
       subtitle: "Classificação por pontos, vitórias e saldo de bolas.",
+    },
+    news: {
+      title: "Notícias",
+      subtitle: "Histórias, resultados e bastidores do campeonato.",
     },
     draw: {
       title: "Mata-mata",
@@ -116,10 +123,14 @@
     leagueRoundFilter: "all",
     leagueMatchFilter: "all",
     playerSearch: "",
+    editingNewsId: null,
+    selectedNewsId: null,
     confirmResolver: null,
   };
 
   let state = createDefaultState();
+  let newsItems = [];
+  let newsLoading = true;
   let auth = { authenticated: false, username: null };
   let serverRevision = 0;
   let pendingSaves = 0;
@@ -321,7 +332,7 @@
       control.setAttribute("aria-disabled", "true");
     });
 
-    dom.content.querySelectorAll("#add-player-form input, #add-player-form button, #settings-form input, #settings-form select, #settings-form button").forEach((control) => {
+    dom.content.querySelectorAll("#add-player-form input, #add-player-form button, #settings-form input, #settings-form select, #settings-form button, #news-form input, #news-form textarea, #news-form select, #news-form button").forEach((control) => {
       control.disabled = true;
       control.classList.add("admin-locked");
     });
@@ -401,6 +412,14 @@
     return response.json();
   }
 
+  async function readNewsFromServer() {
+    const response = await fetch("/api/news", { cache: "no-store" });
+    if (!response.ok) throw new Error(`Falha ao carregar notícias: HTTP ${response.status}`);
+    const payload = await response.json();
+    newsItems = Array.isArray(payload.articles) ? payload.articles : [];
+    newsLoading = false;
+  }
+
   async function initializeApp() {
     const cachedState = loadCachedState();
     setStorageStatus("saving", "Conectando ao banco do campeonato");
@@ -434,8 +453,19 @@
       notifySyncError("Servidor indisponível; os dados ainda não estão compartilhados.");
     }
 
-    const requestedView = window.location.hash.slice(1);
-    if (VIEW_META[requestedView] && !HIDDEN_VIEWS.has(requestedView) && (isAdmin() || requestedView === "league")) {
+    try {
+      await readNewsFromServer();
+    } catch (error) {
+      console.warn("Não foi possível carregar as notícias.", error);
+      newsLoading = false;
+    }
+
+    const requestedParts = window.location.hash.slice(1).split("/");
+    const requestedView = requestedParts[0];
+    if (requestedView === "news" && requestedParts[1]) {
+      ui.selectedNewsId = decodeURIComponent(requestedParts.slice(1).join("/"));
+    }
+    if (VIEW_META[requestedView] && !HIDDEN_VIEWS.has(requestedView) && (isAdmin() || ["league", "news"].includes(requestedView))) {
       ui.currentView = requestedView;
     } else if (HIDDEN_VIEWS.has(requestedView)) {
       window.history.replaceState(null, "", `${window.location.pathname}${window.location.search}#league`);
@@ -469,6 +499,7 @@
         render();
         showToast("Dados atualizados por outro usuário.");
       }
+      if (ui.currentView === "news") await readNewsFromServer();
     } catch (error) {
       console.warn("Sincronização temporariamente indisponível.", error);
       setStorageStatus("offline", "Tentando reconectar automaticamente");
@@ -561,7 +592,7 @@
   function navigate(view, options = {}) {
     if (!VIEW_META[view]) return;
     if (HIDDEN_VIEWS.has(view)) view = "league";
-    if (!isAdmin() && !["dashboard", "league"].includes(view)) {
+    if (!isAdmin() && !["dashboard", "league", "news"].includes(view)) {
       view = "dashboard";
     }
     ui.currentView = view;
@@ -637,6 +668,7 @@
         players: renderPlayers,
         league: renderLeague,
         "league-ranking": renderLeagueRanking,
+        news: renderNews,
         draw: renderDraw,
         matches: renderMatches,
         ranking: renderRanking,
@@ -2606,6 +2638,185 @@
     `;
   }
 
+  function formatNewsDate(value, long = false) {
+    const date = new Date(value);
+    if (Number.isNaN(date.getTime())) return "Data não informada";
+    return new Intl.DateTimeFormat("pt-BR", long
+      ? { day: "numeric", month: "long", year: "numeric" }
+      : { day: "2-digit", month: "short", year: "numeric" }).format(date);
+  }
+
+  function newsDateInputValue(value) {
+    const date = value ? new Date(value) : new Date();
+    if (Number.isNaN(date.getTime())) return "";
+    const local = new Date(date.getTime() - date.getTimezoneOffset() * 60000);
+    return local.toISOString().slice(0, 16);
+  }
+
+  function renderNewsImage(article, className = "") {
+    if (!article.imageUrl) {
+      return `<div class="news-image-placeholder ${className}" aria-hidden="true"><span>8</span><small>Sinuca da Firma</small></div>`;
+    }
+    const separator = article.imageUrl.includes("?") ? "&" : "?";
+    return `<img class="${className}" src="${escapeHTML(article.imageUrl)}${separator}v=${encodeURIComponent(article.updatedAt || "1")}" alt="${escapeHTML(article.imageAlt || article.title)}" loading="lazy">`;
+  }
+
+  function newsVideoEmbed(value) {
+    if (!value) return "";
+    try {
+      const url = new URL(value);
+      let embed = "";
+      if (url.hostname === "youtu.be") {
+        embed = `https://www.youtube-nocookie.com/embed/${encodeURIComponent(url.pathname.slice(1))}`;
+      } else if (url.hostname.endsWith("youtube.com")) {
+        const id = url.searchParams.get("v") || url.pathname.split("/").filter(Boolean).pop();
+        if (id) embed = `https://www.youtube-nocookie.com/embed/${encodeURIComponent(id)}`;
+      } else if (url.hostname.endsWith("vimeo.com")) {
+        const id = url.pathname.split("/").filter(Boolean).pop();
+        if (id && /^\d+$/.test(id)) embed = `https://player.vimeo.com/video/${id}`;
+      }
+      if (!embed) return "";
+      return `<div class="news-video"><iframe src="${embed}" title="Vídeo da notícia" loading="lazy" allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share" allowfullscreen></iframe></div>`;
+    } catch (error) {
+      return "";
+    }
+  }
+
+  function renderNewsMeta(article) {
+    return `
+      <div class="news-meta">
+        <span class="news-category">${escapeHTML(article.category)}</span>
+        <span>Por ${escapeHTML(article.author)}</span>
+        <time datetime="${escapeHTML(article.publishedAt)}">${formatNewsDate(article.publishedAt)}</time>
+      </div>
+    `;
+  }
+
+  function renderNews() {
+    if (isAdmin()) return renderNewsAdmin();
+    if (ui.selectedNewsId) {
+      const selected = newsItems.find((article) => article.id === ui.selectedNewsId);
+      if (selected) return renderNewsArticle(selected);
+      ui.selectedNewsId = null;
+    }
+    return renderNewsPublic();
+  }
+
+  function renderNewsPublic() {
+    if (newsLoading) {
+      return `<div class="public-view"><section class="news-loading" aria-label="Carregando notícias"><span></span><span></span><span></span></section></div>`;
+    }
+    if (!newsItems.length) {
+      return `
+        <div class="public-view news-public">
+          ${renderPublicViewHeader("Notícias", "O campeonato também acontece fora da mesa.", "Resultados, bastidores e histórias da competição serão publicados aqui.", [])}
+          <section class="public-view-empty"><span class="public-brand-ball" aria-hidden="true">8</span><div><h2>A redação está preparando a primeira matéria.</h2><p>Volte em breve para acompanhar as novidades da Sinuca da Firma.</p></div><button class="button button-primary" data-action="navigate" data-view="league">Ver a liga</button></section>
+        </div>
+      `;
+    }
+    const featured = newsItems.find((article) => article.featured) || newsItems[0];
+    const remaining = newsItems.filter((article) => article.id !== featured.id);
+    return `
+      <div class="public-view news-public">
+        <section class="news-masthead">
+          <div class="news-masthead-inner">
+            <div class="news-masthead-copy">
+              ${renderNewsMeta(featured)}
+              <h1>${escapeHTML(featured.title)}</h1>
+              <p>${escapeHTML(featured.summary)}</p>
+              <button class="button public-button-light" data-action="open-news" data-news-id="${escapeHTML(featured.id)}">Ler matéria <span aria-hidden="true">→</span></button>
+            </div>
+            <button class="news-featured-media" data-action="open-news" data-news-id="${escapeHTML(featured.id)}" aria-label="Abrir: ${escapeHTML(featured.title)}">
+              ${renderNewsImage(featured)}
+            </button>
+          </div>
+        </section>
+        <section class="news-index">
+          <div class="news-index-heading"><div><h2>Últimas notícias</h2><p>Informação oficial para ninguém perder uma tacada.</p></div><span>${newsItems.length} ${newsItems.length === 1 ? "publicação" : "publicações"}</span></div>
+          ${remaining.length ? `<div class="news-grid">${remaining.map((article) => `
+            <article class="news-card">
+              <button class="news-card-media" data-action="open-news" data-news-id="${escapeHTML(article.id)}" aria-label="Abrir: ${escapeHTML(article.title)}">${renderNewsImage(article)}</button>
+              <div class="news-card-copy">
+                ${renderNewsMeta(article)}
+                <h3><button data-action="open-news" data-news-id="${escapeHTML(article.id)}">${escapeHTML(article.title)}</button></h3>
+                <p>${escapeHTML(article.summary)}</p>
+                <button class="news-read-link" data-action="open-news" data-news-id="${escapeHTML(article.id)}">Continuar lendo <span aria-hidden="true">→</span></button>
+              </div>
+            </article>`).join("")}</div>` : `<p class="news-only-featured">Esta é a primeira notícia da temporada. As próximas entram aqui.</p>`}
+        </section>
+      </div>
+    `;
+  }
+
+  function renderNewsArticle(article) {
+    const related = newsItems.filter((item) => item.id !== article.id).slice(0, 3);
+    const paragraphs = String(article.body).split(/\n{2,}/).map((paragraph) => `<p>${escapeHTML(paragraph).replace(/\n/g, "<br>")}</p>`).join("");
+    return `
+      <article class="public-view news-article">
+        <header class="news-article-header">
+          <div class="news-article-heading">
+            <button class="public-view-back" data-action="close-news">← Todas as notícias</button>
+            ${renderNewsMeta(article)}
+            <h1>${escapeHTML(article.title)}</h1>
+            <p>${escapeHTML(article.summary)}</p>
+          </div>
+        </header>
+        <div class="news-article-layout">
+          <div class="news-article-main">
+            <figure class="news-article-cover">${renderNewsImage(article)}${article.imageAlt ? `<figcaption>${escapeHTML(article.imageAlt)}</figcaption>` : ""}</figure>
+            <div class="news-article-body">${paragraphs}</div>
+            ${newsVideoEmbed(article.videoUrl)}
+          </div>
+          <aside class="news-article-aside">
+            <span>Publicado por</span><strong>${escapeHTML(article.author)}</strong><time datetime="${escapeHTML(article.publishedAt)}">${formatNewsDate(article.publishedAt, true)}</time>
+            <button class="button button-ghost" data-action="share-news">Compartilhar notícia</button>
+          </aside>
+        </div>
+        ${related.length ? `<section class="news-related"><div class="news-index-heading"><div><h2>Continue acompanhando</h2></div></div><div class="news-grid">${related.map((item) => `<article class="news-card"><button class="news-card-media" data-action="open-news" data-news-id="${escapeHTML(item.id)}">${renderNewsImage(item)}</button><div class="news-card-copy">${renderNewsMeta(item)}<h3><button data-action="open-news" data-news-id="${escapeHTML(item.id)}">${escapeHTML(item.title)}</button></h3></div></article>`).join("")}</div></section>` : ""}
+      </article>
+    `;
+  }
+
+  function renderNewsAdmin() {
+    const editing = newsItems.find((article) => article.id === ui.editingNewsId) || null;
+    return `
+      <div class="workspace-page news-workspace">
+        ${renderWorkspaceHeader("Central de notícias", "Publique resultados, histórias e bastidores sem mexer no código do site.", `${newsItems.length} ${newsItems.length === 1 ? "matéria cadastrada" : "matérias cadastradas"}`)}
+        <div class="news-admin-layout">
+          <section class="card news-editor-card">
+            <div class="card-header"><div><h2>${editing ? "Editar notícia" : "Nova notícia"}</h2><p>Campos com * são obrigatórios.</p></div>${editing ? `<button class="button button-small button-ghost" data-action="cancel-news-edit">Cancelar edição</button>` : ""}</div>
+            <div class="card-body">
+              <form id="news-form" class="form-grid">
+                <input type="hidden" name="id" value="${escapeHTML(editing?.id || "")}">
+                <label class="field col-8"><span>Título *</span><input name="title" maxlength="140" required value="${escapeHTML(editing?.title || "")}" placeholder="Ex.: Rodada decisiva muda a liderança"></label>
+                <label class="field col-4"><span>Categoria *</span><input name="category" maxlength="40" required value="${escapeHTML(editing?.category || "Campeonato")}" placeholder="Campeonato"></label>
+                <label class="field col-12"><span>Resumo *</span><textarea name="summary" maxlength="320" required placeholder="Uma chamada curta que explica por que vale a leitura.">${escapeHTML(editing?.summary || "")}</textarea><small class="field-help">Aparece na capa e na lista de notícias.</small></label>
+                <label class="field col-12"><span>Texto da notícia *</span><textarea class="news-body-input" name="body" maxlength="20000" required placeholder="Conte o que aconteceu. Separe os parágrafos com uma linha em branco.">${escapeHTML(editing?.body || "")}</textarea></label>
+                <label class="field col-6"><span>Autor *</span><input name="author" maxlength="80" required value="${escapeHTML(editing?.author || "Organização")}"></label>
+                <label class="field col-6"><span>Data de publicação *</span><input name="publishedAt" type="datetime-local" required value="${newsDateInputValue(editing?.publishedAt)}"></label>
+                <label class="field col-6"><span>Imagem de capa</span><input name="image" type="file" accept="image/jpeg,image/png,image/webp"><small class="field-help">JPG, PNG ou WebP. A imagem é otimizada antes do envio.</small></label>
+                <label class="field col-6"><span>Descrição da imagem</span><input name="imageAlt" maxlength="180" value="${escapeHTML(editing?.imageAlt || "")}" placeholder="Descreva a cena para acessibilidade"></label>
+                ${editing?.imageUrl ? `<div class="news-admin-cover col-12">${renderNewsImage(editing)}<span>Capa atual — escolha outro arquivo apenas para substituir.</span></div>` : ""}
+                <label class="field col-12"><span>Vídeo (opcional)</span><input name="videoUrl" type="url" value="${escapeHTML(editing?.videoUrl || "")}" placeholder="https://www.youtube.com/watch?v=..."><small class="field-help">Cole um link público do YouTube ou Vimeo.</small></label>
+                <label class="field col-6"><span>Status</span><select name="status"><option value="published" ${editing?.status !== "draft" ? "selected" : ""}>Publicada</option><option value="draft" ${editing?.status === "draft" ? "selected" : ""}>Rascunho</option></select></label>
+                <label class="news-check col-6"><input name="featured" type="checkbox" ${editing?.featured ? "checked" : ""}><span><strong>Destacar na capa</strong><small>A matéria ganha a posição principal.</small></span></label>
+                <div class="news-form-actions col-12"><span id="news-form-status" role="status"></span><button class="button button-primary" type="submit">${editing ? "Salvar alterações" : "Publicar notícia"}</button></div>
+              </form>
+            </div>
+          </section>
+          <section class="card news-library-card">
+            <div class="card-header"><div><h2>Publicações</h2><p>Edite ou remova o que já foi cadastrado.</p></div></div>
+            <div class="news-admin-list">${newsItems.length ? newsItems.map((article) => `
+              <article class="news-admin-item">
+                <div class="news-admin-thumb">${renderNewsImage(article)}</div>
+                <div><div class="news-admin-item-meta"><span class="badge ${article.status === "published" ? "badge-green" : ""}">${article.status === "published" ? "Publicada" : "Rascunho"}</span>${article.featured ? '<span class="badge badge-gold">Destaque</span>' : ""}</div><h3>${escapeHTML(article.title)}</h3><p>${formatNewsDate(article.publishedAt)} · ${escapeHTML(article.category)}</p><div class="news-admin-actions"><button class="button button-small button-ghost" data-action="edit-news" data-news-id="${escapeHTML(article.id)}">Editar</button><button class="button button-small button-danger button-ghost" data-action="delete-news" data-news-id="${escapeHTML(article.id)}">Excluir</button></div></div>
+              </article>`).join("") : `<div class="empty-state"><div class="empty-state-icon">▤</div><h3>Nenhuma notícia ainda</h3><p>Use o formulário ao lado para publicar a primeira matéria.</p></div>`}</div>
+          </section>
+        </div>
+      </div>
+    `;
+  }
+
   function renderSettings() {
     const settings = state.settings;
     return `
@@ -3195,6 +3406,135 @@
     navigate("dashboard");
   }
 
+  function dataUrlByteSize(dataUrl) {
+    const encoded = String(dataUrl).split(",")[1] || "";
+    return Math.ceil(encoded.length * 0.75);
+  }
+
+  function canvasDataUrl(canvas, quality) {
+    return canvas.toDataURL("image/webp", quality);
+  }
+
+  function readFileAsDataUrl(file) {
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.addEventListener("load", () => resolve(String(reader.result || "")));
+      reader.addEventListener("error", () => reject(new Error("Não foi possível ler a imagem escolhida.")));
+      reader.readAsDataURL(file);
+    });
+  }
+
+  async function optimizeNewsImage(file) {
+    if (!file) return "";
+    if (!file.type.startsWith("image/")) throw new Error("Escolha um arquivo de imagem válido.");
+    const source = await readFileAsDataUrl(file);
+    const image = new Image();
+    await new Promise((resolve, reject) => {
+      image.onload = resolve;
+      image.onerror = () => reject(new Error("Não foi possível abrir a imagem escolhida."));
+      image.src = source;
+    });
+    const scale = Math.min(1, 1600 / image.naturalWidth, 1000 / image.naturalHeight);
+    const canvas = document.createElement("canvas");
+    canvas.width = Math.max(1, Math.round(image.naturalWidth * scale));
+    canvas.height = Math.max(1, Math.round(image.naturalHeight * scale));
+    const context = canvas.getContext("2d");
+    context.drawImage(image, 0, 0, canvas.width, canvas.height);
+    let quality = 0.84;
+    let result = canvasDataUrl(canvas, quality);
+    while (dataUrlByteSize(result) > MAX_NEWS_IMAGE_BYTES && quality > 0.5) {
+      quality -= 0.08;
+      result = canvasDataUrl(canvas, quality);
+    }
+    if (dataUrlByteSize(result) > MAX_NEWS_IMAGE_BYTES) {
+      throw new Error("A imagem ainda ficou muito grande. Escolha uma foto menor.");
+    }
+    return result;
+  }
+
+  async function saveNews(form) {
+    if (!requireAdmin()) return;
+    const button = form.querySelector('button[type="submit"]');
+    const status = form.querySelector("#news-form-status");
+    const formData = new FormData(form);
+    button.disabled = true;
+    status.textContent = "Preparando publicação...";
+    try {
+      const imageFile = formData.get("image");
+      const imageData = imageFile instanceof File && imageFile.size ? await optimizeNewsImage(imageFile) : "";
+      const date = new Date(String(formData.get("publishedAt") || ""));
+      if (Number.isNaN(date.getTime())) throw new Error("Informe uma data de publicação válida.");
+      const payload = {
+        id: String(formData.get("id") || "") || undefined,
+        title: String(formData.get("title") || "").trim(),
+        summary: String(formData.get("summary") || "").trim(),
+        body: String(formData.get("body") || "").trim(),
+        category: String(formData.get("category") || "").trim(),
+        author: String(formData.get("author") || "").trim(),
+        publishedAt: date.toISOString(),
+        status: String(formData.get("status") || "draft"),
+        featured: formData.get("featured") === "on",
+        imageAlt: String(formData.get("imageAlt") || "").trim(),
+        videoUrl: String(formData.get("videoUrl") || "").trim(),
+        imageData,
+      };
+      status.textContent = "Salvando no banco...";
+      const response = await fetch("/api/news", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+      const result = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(result.error || "Não foi possível salvar a notícia.");
+      await readNewsFromServer();
+      ui.editingNewsId = null;
+      logActivity("news", payload.id ? "Notícia atualizada" : "Notícia publicada", payload.title);
+      showToast(payload.status === "draft" ? "Rascunho salvo." : "Notícia publicada no site.");
+      render();
+    } catch (error) {
+      console.error("Erro ao salvar notícia.", error);
+      status.textContent = error.message;
+      showToast(error.message, "error");
+      button.disabled = false;
+    }
+  }
+
+  async function deleteNews(articleId) {
+    if (!requireAdmin()) return;
+    const article = newsItems.find((item) => item.id === articleId);
+    if (!article) return;
+    const confirmed = await askConfirm(
+      "Excluir esta notícia?",
+      `“${article.title}” será removida do site e não poderá ser recuperada.`,
+      "Excluir notícia",
+    );
+    if (!confirmed) return;
+    const response = await fetch(`/api/news?id=${encodeURIComponent(articleId)}`, { method: "DELETE" });
+    const result = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      showToast(result.error || "Não foi possível excluir a notícia.", "error");
+      return;
+    }
+    await readNewsFromServer();
+    if (ui.editingNewsId === articleId) ui.editingNewsId = null;
+    showToast("Notícia excluída.");
+    render();
+  }
+
+  async function shareNews() {
+    const article = newsItems.find((item) => item.id === ui.selectedNewsId);
+    const shareData = { title: article?.title || "Sinuca da Firma", text: article?.summary || "", url: window.location.href };
+    try {
+      if (navigator.share) await navigator.share(shareData);
+      else {
+        await navigator.clipboard.writeText(window.location.href);
+        showToast("Link da notícia copiado.");
+      }
+    } catch (error) {
+      if (error.name !== "AbortError") showToast("Não foi possível compartilhar agora.", "error");
+    }
+  }
+
   async function handleAction(button) {
     const action = button.dataset.action;
     if (!action) return;
@@ -3237,6 +3577,31 @@
       case "reset-data":
         await resetData();
         break;
+      case "open-news":
+        ui.selectedNewsId = button.dataset.newsId;
+        window.history.replaceState(null, "", `${window.location.pathname}${window.location.search}#news/${encodeURIComponent(ui.selectedNewsId)}`);
+        render();
+        window.scrollTo({ top: 0, behavior: window.matchMedia("(prefers-reduced-motion: reduce)").matches ? "auto" : "smooth" });
+        break;
+      case "close-news":
+        ui.selectedNewsId = null;
+        navigate("news");
+        break;
+      case "share-news":
+        await shareNews();
+        break;
+      case "edit-news":
+        ui.editingNewsId = button.dataset.newsId;
+        render();
+        window.scrollTo({ top: 0, behavior: "smooth" });
+        break;
+      case "cancel-news-edit":
+        ui.editingNewsId = null;
+        render();
+        break;
+      case "delete-news":
+        await deleteNews(button.dataset.newsId);
+        break;
       default:
         break;
     }
@@ -3263,6 +3628,10 @@
     if (event.target.matches("#settings-form")) {
       event.preventDefault();
       if (requireAdmin()) saveSettings(event.target);
+    }
+    if (event.target.matches("#news-form")) {
+      event.preventDefault();
+      if (requireAdmin()) saveNews(event.target);
     }
   });
 

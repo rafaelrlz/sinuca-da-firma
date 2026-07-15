@@ -51,6 +51,19 @@ Critérios de desempate:
 
 O valor da vitória pode ser alterado em **Configurações**. A derrota sempre vale 0 ponto, portanto a pontuação nunca diminui. Cada jogador possui 7 bolas comuns mais o castigo. Ao registrar a partida, informe quantas bolas cada um matou. O saldo da partida é a quantidade que o perdedor deixou na mesa, incluindo o castigo (`8 - bolas matadas pelo perdedor`): o vencedor recebe esse número como saldo positivo e o perdedor recebe o mesmo número como saldo negativo.
 
+## Notícias
+
+A aba pública **Notícias** reúne resultados, histórias e bastidores do campeonato. Cada matéria pode ter título, categoria, resumo, texto completo, autor, data, imagem de capa e vídeo do YouTube ou Vimeo.
+
+No painel administrativo, abra **Notícias** para:
+
+- publicar uma matéria ou mantê-la como rascunho;
+- enviar e otimizar uma imagem de capa;
+- destacar uma matéria na abertura da página;
+- editar ou excluir publicações existentes.
+
+As imagens ficam em uma tabela própria do banco, separadas do estado geral do campeonato. O navegador reduz imagens grandes antes do envio; o arquivo final aceita até 900 KB.
+
 ## Bolão com fichas virtuais
 
 Qualquer pessoa da rede pode abrir `/bolao` e criar um perfil com:
@@ -99,6 +112,7 @@ Sem login, qualquer pessoa pode:
 - consultar rodadas e placares;
 - consultar a classificação;
 - participar do bolão virtual;
+- ler as notícias publicadas;
 - exportar uma cópia JSON do campeonato.
 
 No cabeçalho público, o item **Ranking** abre a liga já posicionado suavemente na classificação.
@@ -111,7 +125,8 @@ Somente o administrador pode:
 - alterar regras e pontuação;
 - importar backups;
 - restaurar os dados iniciais;
-- zerar os perfis e apostas do bolão.
+- zerar os perfis e apostas do bolão;
+- criar, editar e excluir notícias.
 
 A proteção está no servidor, e não apenas nos botões da tela.
 
