@@ -35,6 +35,7 @@ HOST = "0.0.0.0"
 PORT = int(os.environ.get("SINUCA_PORT", "3000"))
 MAX_BODY_BYTES = 2 * 1024 * 1024
 MAX_NEWS_IMAGE_BYTES = 900 * 1024
+NEWS_VISITOR_HEADER = "X-News-Visitor"
 PROJECT_DIR = Path(__file__).resolve().parent
 DATA_DIR = PROJECT_DIR / "data"
 BACKUP_PATH = DATA_DIR / "backup-latest.json"
@@ -280,10 +281,43 @@ def initialize_database() -> None:
             """
         )
         connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS news_comments (
+                id TEXT PRIMARY KEY,
+                article_id TEXT NOT NULL,
+                visitor_id TEXT NOT NULL,
+                author TEXT NOT NULL,
+                body TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS news_ratings (
+                article_id TEXT NOT NULL,
+                visitor_id TEXT NOT NULL,
+                score INTEGER NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (article_id, visitor_id)
+            )
+            """
+        )
+        connection.execute(
             "CREATE INDEX IF NOT EXISTS idx_bets_bettor ON bets(bettor_id)"
         )
         connection.execute(
             "CREATE INDEX IF NOT EXISTS idx_login_failures_client ON login_failures(client_key, attempted_at)"
+        )
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_news_comments_article ON news_comments(article_id, created_at)"
+        )
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_news_comments_visitor ON news_comments(visitor_id, created_at)"
+        )
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_news_ratings_article ON news_ratings(article_id)"
         )
         migrate_bettor_initial_balance(connection)
         existing = connection.execute(
@@ -407,6 +441,13 @@ def save_state(state: dict[str, object]) -> dict[str, object]:
 
 def news_record(row: object) -> dict[str, object]:
     article_id = str(row["id"])
+    try:
+        comment_count = int(row["comment_count"] or 0)
+        rating_count = int(row["rating_count"] or 0)
+        rating_average = float(row["rating_average"] or 0)
+    except (IndexError, KeyError):
+        comment_count = rating_count = 0
+        rating_average = 0.0
     return {
         "id": article_id,
         "title": row["title"],
@@ -422,14 +463,21 @@ def news_record(row: object) -> dict[str, object]:
         "videoUrl": row["video_url"],
         "createdAt": row["created_at"],
         "updatedAt": row["updated_at"],
+        "commentCount": comment_count,
+        "ratingCount": rating_count,
+        "ratingAverage": round(rating_average, 1),
     }
 
 
 def list_news(include_drafts: bool = False) -> list[dict[str, object]]:
     query = """
-        SELECT id, title, summary, body, category, author, published_at,
-               status, featured, image_type, image_alt, video_url, created_at, updated_at
-        FROM news_articles
+        SELECT n.id, n.title, n.summary, n.body, n.category, n.author, n.published_at,
+               n.status, n.featured, n.image_type, n.image_alt, n.video_url,
+               n.created_at, n.updated_at,
+               (SELECT COUNT(*) FROM news_comments c WHERE c.article_id = n.id) AS comment_count,
+               (SELECT COUNT(*) FROM news_ratings r WHERE r.article_id = n.id) AS rating_count,
+               (SELECT AVG(r.score) FROM news_ratings r WHERE r.article_id = n.id) AS rating_average
+        FROM news_articles n
     """
     parameters: tuple[object, ...] = ()
     if not include_drafts:
@@ -536,7 +584,129 @@ def save_news_article(payload: dict[str, object]) -> dict[str, object]:
 
 def delete_news_article(article_id: str) -> bool:
     with connect_database() as connection:
+        connection.execute("DELETE FROM news_comments WHERE article_id = ?", (article_id,))
+        connection.execute("DELETE FROM news_ratings WHERE article_id = ?", (article_id,))
         cursor = connection.execute("DELETE FROM news_articles WHERE id = ?", (article_id,))
+        connection.commit()
+    return cursor.rowcount == 1
+
+
+def validate_news_visitor(value: object) -> str:
+    visitor = str(value or "").strip()
+    if not (16 <= len(visitor) <= 100) or any(
+        not (character.isalnum() or character in "-_.") for character in visitor
+    ):
+        raise ValueError("Identificação do visitante inválida. Atualize a página e tente novamente.")
+    return visitor
+
+
+def news_article_exists(article_id: str, include_hidden: bool = False) -> bool:
+    query = "SELECT status, published_at FROM news_articles WHERE id = ?"
+    with connect_database() as connection:
+        row = connection.execute(query, (article_id,)).fetchone()
+    if row is None:
+        return False
+    return include_hidden or (row["status"] == "published" and str(row["published_at"]) <= utc_now())
+
+
+def news_engagement(article_id: str, visitor_value: object, include_hidden: bool = False) -> dict[str, object]:
+    visitor_id = validate_news_visitor(visitor_value)
+    if not news_article_exists(article_id, include_hidden):
+        raise LookupError("Notícia não encontrada.")
+    with connect_database() as connection:
+        comments = connection.execute(
+            """
+            SELECT id, author, body, created_at
+            FROM news_comments WHERE article_id = ?
+            ORDER BY created_at DESC
+            """,
+            (article_id,),
+        ).fetchall()
+        summary = connection.execute(
+            "SELECT COUNT(*) AS rating_count, AVG(score) AS rating_average FROM news_ratings WHERE article_id = ?",
+            (article_id,),
+        ).fetchone()
+        own_rating = connection.execute(
+            "SELECT score FROM news_ratings WHERE article_id = ? AND visitor_id = ?",
+            (article_id, visitor_id),
+        ).fetchone()
+    return {
+        "comments": [
+            {
+                "id": row["id"],
+                "author": row["author"],
+                "body": row["body"],
+                "createdAt": row["created_at"],
+            }
+            for row in comments
+        ],
+        "rating": {
+            "count": int(summary["rating_count"] or 0),
+            "average": round(float(summary["rating_average"] or 0), 1),
+            "userScore": int(own_rating["score"]) if own_rating else 0,
+        },
+    }
+
+
+def save_news_comment(article_id: object, visitor_value: object, payload: dict[str, object]) -> dict[str, object]:
+    article_key = str(article_id or "").strip()
+    visitor_id = validate_news_visitor(visitor_value)
+    if not news_article_exists(article_key):
+        raise LookupError("Notícia não encontrada.")
+    if str(payload.get("website") or "").strip():
+        raise ValueError("Não foi possível enviar o comentário.")
+    author = " ".join(str(payload.get("author") or "").strip().split()) or "Anônimo"
+    if len(author) > 50 or any(ord(character) < 32 for character in author):
+        raise ValueError("O nome deve ter no máximo 50 caracteres.")
+    body = str(payload.get("body") or "").strip()
+    if not (2 <= len(body) <= 500):
+        raise ValueError("O comentário deve ter entre 2 e 500 caracteres.")
+    cutoff = (datetime.now(timezone.utc) - timedelta(minutes=10)).isoformat(timespec="seconds")
+    now = datetime.now(timezone.utc).isoformat(timespec="microseconds")
+    with DB_LOCK, connect_database() as connection:
+        recent = connection.execute(
+            "SELECT COUNT(*) AS total FROM news_comments WHERE visitor_id = ? AND created_at >= ?",
+            (visitor_id, cutoff),
+        ).fetchone()
+        if int(recent["total"] or 0) >= 3:
+            raise ValueError("Você enviou vários comentários. Aguarde alguns minutos para continuar.")
+        connection.execute(
+            "INSERT INTO news_comments (id, article_id, visitor_id, author, body, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+            (f"comment-{uuid.uuid4()}", article_key, visitor_id, author, body, now),
+        )
+        connection.commit()
+    return news_engagement(article_key, visitor_id)
+
+
+def save_news_rating(article_id: object, visitor_value: object, score_value: object) -> dict[str, object]:
+    article_key = str(article_id or "").strip()
+    visitor_id = validate_news_visitor(visitor_value)
+    if not news_article_exists(article_key):
+        raise LookupError("Notícia não encontrada.")
+    try:
+        score = int(score_value)
+    except (TypeError, ValueError) as error:
+        raise ValueError("Escolha uma nota de 1 a 5.") from error
+    if not 1 <= score <= 5:
+        raise ValueError("Escolha uma nota de 1 a 5.")
+    now = datetime.now(timezone.utc).isoformat(timespec="microseconds")
+    with DB_LOCK, connect_database() as connection:
+        connection.execute(
+            """
+            INSERT INTO news_ratings (article_id, visitor_id, score, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(article_id, visitor_id) DO UPDATE SET
+                score = excluded.score, updated_at = excluded.updated_at
+            """,
+            (article_key, visitor_id, score, now, now),
+        )
+        connection.commit()
+    return news_engagement(article_key, visitor_id)
+
+
+def delete_news_comment(comment_id: str) -> bool:
+    with connect_database() as connection:
+        cursor = connection.execute("DELETE FROM news_comments WHERE id = ?", (comment_id,))
         connection.commit()
     return cursor.rowcount == 1
 
@@ -1127,6 +1297,21 @@ class TournamentHandler(SimpleHTTPRequestHandler):
             self.send_news_image(article_id)
             return
 
+        if path == "/api/news/engagement":
+            article_id = parse_qs(urlparse(self.path).query).get("id", [""])[0]
+            try:
+                payload = news_engagement(
+                    article_id,
+                    self.headers.get(NEWS_VISITOR_HEADER),
+                    self.is_authenticated(),
+                )
+                self.send_json(HTTPStatus.OK, payload)
+            except ValueError as error:
+                self.send_json(HTTPStatus.BAD_REQUEST, {"error": str(error)})
+            except LookupError as error:
+                self.send_json(HTTPStatus.NOT_FOUND, {"error": str(error)})
+            return
+
         if path == "/api/state":
             try:
                 self.send_json(HTTPStatus.OK, read_state())
@@ -1230,6 +1415,44 @@ class TournamentHandler(SimpleHTTPRequestHandler):
                     {"error": "Não foi possível salvar a notícia.", "detail": str(error)},
                 )
             return
+        if path == "/api/news/comments":
+            try:
+                body = self.read_json_body()
+                payload = save_news_comment(
+                    body.get("articleId"),
+                    self.headers.get(NEWS_VISITOR_HEADER),
+                    body,
+                )
+                self.send_json(HTTPStatus.CREATED, payload)
+            except ValueError as error:
+                self.send_json(HTTPStatus.BAD_REQUEST, {"error": str(error)})
+            except LookupError as error:
+                self.send_json(HTTPStatus.NOT_FOUND, {"error": str(error)})
+            except Exception as error:  # pragma: no cover
+                self.send_json(
+                    HTTPStatus.INTERNAL_SERVER_ERROR,
+                    {"error": "Não foi possível enviar o comentário.", "detail": str(error)},
+                )
+            return
+        if path == "/api/news/ratings":
+            try:
+                body = self.read_json_body()
+                payload = save_news_rating(
+                    body.get("articleId"),
+                    self.headers.get(NEWS_VISITOR_HEADER),
+                    body.get("score"),
+                )
+                self.send_json(HTTPStatus.OK, payload)
+            except ValueError as error:
+                self.send_json(HTTPStatus.BAD_REQUEST, {"error": str(error)})
+            except LookupError as error:
+                self.send_json(HTTPStatus.NOT_FOUND, {"error": str(error)})
+            except Exception as error:  # pragma: no cover
+                self.send_json(
+                    HTTPStatus.INTERNAL_SERVER_ERROR,
+                    {"error": "Não foi possível salvar a avaliação.", "detail": str(error)},
+                )
+            return
         if path == "/api/bettors/register":
             self.handle_bettor_register()
             return
@@ -1261,16 +1484,20 @@ class TournamentHandler(SimpleHTTPRequestHandler):
 
     def do_DELETE(self) -> None:  # noqa: N802
         path = self.request_path()
-        if path != "/api/news":
+        if path not in {"/api/news", "/api/news/comments"}:
             self.send_error(HTTPStatus.NOT_FOUND)
             return
         if not self.require_authentication():
             return
-        article_id = parse_qs(urlparse(self.path).query).get("id", [""])[0]
-        if not article_id:
-            self.send_json(HTTPStatus.BAD_REQUEST, {"error": "Notícia não informada."})
+        item_id = parse_qs(urlparse(self.path).query).get("id", [""])[0]
+        if not item_id:
+            self.send_json(HTTPStatus.BAD_REQUEST, {"error": "Item não informado."})
             return
-        if not delete_news_article(article_id):
+        if path == "/api/news/comments":
+            if not delete_news_comment(item_id):
+                self.send_json(HTTPStatus.NOT_FOUND, {"error": "Comentário não encontrado."})
+                return
+        elif not delete_news_article(item_id):
             self.send_json(HTTPStatus.NOT_FOUND, {"error": "Notícia não encontrada."})
             return
         self.send_json(HTTPStatus.OK, {"ok": True})

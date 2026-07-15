@@ -55,12 +55,15 @@ O valor da vitória pode ser alterado em **Configurações**. A derrota sempre v
 
 A aba pública **Notícias** reúne resultados, histórias e bastidores do campeonato. Cada matéria pode ter título, categoria, resumo, texto completo, autor, data, imagem de capa e vídeo do YouTube ou Vimeo.
 
+Leitores podem avaliar cada matéria de 1 a 5 estrelas e publicar comentários com nome ou como **Anônimo**. Cada navegador mantém uma única avaliação por notícia, que pode ser alterada posteriormente. O envio de comentários possui limite de frequência para reduzir spam.
+
 No painel administrativo, abra **Notícias** para:
 
 - publicar uma matéria ou mantê-la como rascunho;
 - enviar e otimizar uma imagem de capa;
 - destacar uma matéria na abertura da página;
 - editar ou excluir publicações existentes.
+- acompanhar a nota média e moderar comentários publicados.
 
 As imagens ficam em uma tabela própria do banco, separadas do estado geral do campeonato. O navegador reduz imagens grandes antes do envio; o arquivo final aceita até 900 KB.
 

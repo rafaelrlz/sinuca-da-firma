@@ -3,6 +3,7 @@
 
   const STORAGE_KEY = "sinuca-da-firma-v3-cache";
   const LEGACY_STORAGE_KEY = "sinuca-da-firma-v1";
+  const NEWS_VISITOR_STORAGE_KEY = "sinuca-news-visitor-v1";
   const APP_VERSION = 4;
   const SYNC_INTERVAL_MS = 4000;
   const MAX_PLAYERS = 32;
@@ -36,6 +37,7 @@
     "toggle-match-live",
     "edit-news",
     "delete-news",
+    "delete-news-comment",
   ]);
 
   const VIEW_META = {
@@ -125,12 +127,14 @@
     playerSearch: "",
     editingNewsId: null,
     selectedNewsId: null,
+    moderatingNewsId: null,
     confirmResolver: null,
   };
 
   let state = createDefaultState();
   let newsItems = [];
   let newsLoading = true;
+  let newsEngagement = {};
   let auth = { authenticated: false, username: null };
   let serverRevision = 0;
   let pendingSaves = 0;
@@ -420,6 +424,31 @@
     newsLoading = false;
   }
 
+  function newsVisitorId() {
+    let visitor = localStorage.getItem(NEWS_VISITOR_STORAGE_KEY);
+    if (visitor && /^[a-zA-Z0-9._-]{16,100}$/.test(visitor)) return visitor;
+    visitor = `visitor-${createId("news").replace(/[^a-zA-Z0-9-]/g, "")}`;
+    localStorage.setItem(NEWS_VISITOR_STORAGE_KEY, visitor);
+    return visitor;
+  }
+
+  async function readNewsEngagement(articleId) {
+    if (!articleId) return null;
+    const response = await fetch(`/api/news/engagement?id=${encodeURIComponent(articleId)}`, {
+      cache: "no-store",
+      headers: { "X-News-Visitor": newsVisitorId() },
+    });
+    const payload = await response.json().catch(() => ({}));
+    if (response.status === 404 && newsItems.some((article) => article.id === articleId)) {
+      const empty = { comments: [], rating: { count: 0, average: 0, userScore: 0 } };
+      newsEngagement[articleId] = empty;
+      return empty;
+    }
+    if (!response.ok) throw new Error(payload.error || "Não foi possível carregar os comentários.");
+    newsEngagement[articleId] = payload;
+    return payload;
+  }
+
   async function initializeApp() {
     const cachedState = loadCachedState();
     setStorageStatus("saving", "Conectando ao banco do campeonato");
@@ -464,6 +493,11 @@
     const requestedView = requestedParts[0];
     if (requestedView === "news" && requestedParts[1]) {
       ui.selectedNewsId = decodeURIComponent(requestedParts.slice(1).join("/"));
+      try {
+        await readNewsEngagement(ui.selectedNewsId);
+      } catch (error) {
+        console.warn("Não foi possível carregar a conversa da notícia.", error);
+      }
     }
     if (VIEW_META[requestedView] && !HIDDEN_VIEWS.has(requestedView) && (isAdmin() || ["league", "news"].includes(requestedView))) {
       ui.currentView = requestedView;
@@ -2692,6 +2726,17 @@
     `;
   }
 
+  function renderNewsSignals(article) {
+    const ratingCount = Number(article.ratingCount) || 0;
+    const commentCount = Number(article.commentCount) || 0;
+    return `
+      <div class="news-signals" aria-label="Interações da notícia">
+        <span><b aria-hidden="true">★</b> ${ratingCount ? `${Number(article.ratingAverage).toFixed(1)} (${ratingCount})` : "Sem avaliações"}</span>
+        <span><b aria-hidden="true">◌</b> ${commentCount} ${commentCount === 1 ? "comentário" : "comentários"}</span>
+      </div>
+    `;
+  }
+
   function renderNews() {
     if (isAdmin()) return renderNewsAdmin();
     if (ui.selectedNewsId) {
@@ -2715,13 +2760,14 @@
       `;
     }
     const featured = newsItems.find((article) => article.featured) || newsItems[0];
-    const remaining = newsItems.filter((article) => article.id !== featured.id);
+    const latest = newsItems;
     return `
       <div class="public-view news-public">
         <section class="news-masthead">
           <div class="news-masthead-inner">
             <div class="news-masthead-copy">
               ${renderNewsMeta(featured)}
+              ${renderNewsSignals(featured)}
               <h1>${escapeHTML(featured.title)}</h1>
               <p>${escapeHTML(featured.summary)}</p>
               <button class="button public-button-light" data-action="open-news" data-news-id="${escapeHTML(featured.id)}">Ler matéria <span aria-hidden="true">→</span></button>
@@ -2733,24 +2779,74 @@
         </section>
         <section class="news-index">
           <div class="news-index-heading"><div><h2>Últimas notícias</h2><p>Informação oficial para ninguém perder uma tacada.</p></div><span>${newsItems.length} ${newsItems.length === 1 ? "publicação" : "publicações"}</span></div>
-          ${remaining.length ? `<div class="news-grid">${remaining.map((article) => `
+          <div class="news-grid news-latest-grid">${latest.map((article) => `
             <article class="news-card">
               <button class="news-card-media" data-action="open-news" data-news-id="${escapeHTML(article.id)}" aria-label="Abrir: ${escapeHTML(article.title)}">${renderNewsImage(article)}</button>
               <div class="news-card-copy">
-                ${renderNewsMeta(article)}
+                <div class="news-card-kicker"><span class="news-category">${escapeHTML(article.category)}</span><time datetime="${escapeHTML(article.publishedAt)}">${formatNewsDate(article.publishedAt)}</time></div>
                 <h3><button data-action="open-news" data-news-id="${escapeHTML(article.id)}">${escapeHTML(article.title)}</button></h3>
-                <p>${escapeHTML(article.summary)}</p>
+                ${renderNewsSignals(article)}
                 <button class="news-read-link" data-action="open-news" data-news-id="${escapeHTML(article.id)}">Continuar lendo <span aria-hidden="true">→</span></button>
               </div>
-            </article>`).join("")}</div>` : `<p class="news-only-featured">Esta é a primeira notícia da temporada. As próximas entram aqui.</p>`}
+            </article>`).join("")}</div>
         </section>
       </div>
     `;
   }
 
+  function renderRatingStars(articleId, engagement) {
+    const rating = engagement?.rating || { count: 0, average: 0, userScore: 0 };
+    return `
+      <div class="news-rating-panel">
+        <div>
+          <span class="news-rating-label">Avalie esta notícia</span>
+          <strong>${rating.count ? Number(rating.average).toFixed(1) : "—"}</strong>
+          <small>${rating.count} ${rating.count === 1 ? "avaliação" : "avaliações"}</small>
+        </div>
+        <div class="news-stars" role="group" aria-label="Avaliação de 1 a 5 estrelas">
+          ${[1, 2, 3, 4, 5].map((score) => `<button type="button" class="news-star ${score <= rating.userScore ? "is-selected" : ""}" data-action="rate-news" data-news-id="${escapeHTML(articleId)}" data-score="${score}" aria-label="Dar nota ${score} de 5" aria-pressed="${score === rating.userScore}">★</button>`).join("")}
+        </div>
+        <p>${rating.userScore ? `Sua nota atual é ${rating.userScore}. Você pode alterá-la.` : "Sua avaliação é anônima e pode ser alterada depois."}</p>
+      </div>
+    `;
+  }
+
+  function renderNewsComments(article) {
+    const engagement = newsEngagement[article.id];
+    if (!engagement) {
+      return `<section class="news-conversation"><div class="news-conversation-heading"><h2>Comentários</h2><button class="button button-ghost" data-action="reload-news-engagement" data-news-id="${escapeHTML(article.id)}">Carregar conversa</button></div></section>`;
+    }
+    const comments = Array.isArray(engagement.comments) ? engagement.comments : [];
+    return `
+      <section class="news-conversation" id="news-comments">
+        ${renderRatingStars(article.id, engagement)}
+        <div class="news-conversation-heading"><div><h2>Conversa da rodada</h2><p>${comments.length ? `${comments.length} ${comments.length === 1 ? "comentário publicado" : "comentários publicados"}` : "Seja o primeiro a comentar."}</p></div></div>
+        <form id="news-comment-form" class="news-comment-form">
+          <input type="hidden" name="articleId" value="${escapeHTML(article.id)}">
+          <label class="field"><span>Seu nome <small>(opcional)</small></span><input name="author" maxlength="50" autocomplete="name" placeholder="Deixe vazio para comentar como Anônimo"></label>
+          <label class="field"><span>Comentário</span><textarea name="body" minlength="2" maxlength="500" required placeholder="O que você achou da partida ou da notícia?"></textarea></label>
+          <label class="news-honeypot" aria-hidden="true">Site<input name="website" tabindex="-1" autocomplete="off"></label>
+          <div class="news-comment-actions"><span id="news-comment-status" role="status"></span><button class="button button-primary" type="submit">Publicar comentário</button></div>
+        </form>
+        <div class="news-comment-list">
+          ${comments.length ? comments.map((comment) => `
+            <article class="news-comment">
+              <div class="news-comment-avatar" aria-hidden="true">${escapeHTML(getInitials(comment.author || "Anônimo"))}</div>
+              <div><div class="news-comment-meta"><strong>${escapeHTML(comment.author || "Anônimo")}</strong><time datetime="${escapeHTML(comment.createdAt)}">${formatRelativeTime(comment.createdAt)}</time></div><p>${escapeHTML(comment.body).replace(/\n/g, "<br>")}</p></div>
+            </article>`).join("") : `<div class="news-comments-empty"><span aria-hidden="true">◌</span><p>A conversa ainda está silenciosa. Deixe a primeira opinião.</p></div>`}
+        </div>
+      </section>
+    `;
+  }
+
   function renderNewsArticle(article) {
     const related = newsItems.filter((item) => item.id !== article.id).slice(0, 3);
-    const paragraphs = String(article.body).split(/\n{2,}/).map((paragraph) => `<p>${escapeHTML(paragraph).replace(/\n/g, "<br>")}</p>`).join("");
+    const paragraphs = String(article.body)
+      .split(/\n{2,}/)
+      .map((paragraph) => paragraph.replace(/\s*\n\s*/g, " ").replace(/\s+/g, " ").trim())
+      .filter(Boolean)
+      .map((paragraph) => `<p>${escapeHTML(paragraph)}</p>`)
+      .join("");
     return `
       <article class="public-view news-article">
         <header class="news-article-header">
@@ -2766,6 +2862,7 @@
             <figure class="news-article-cover">${renderNewsImage(article)}${article.imageAlt ? `<figcaption>${escapeHTML(article.imageAlt)}</figcaption>` : ""}</figure>
             <div class="news-article-body">${paragraphs}</div>
             ${newsVideoEmbed(article.videoUrl)}
+            ${renderNewsComments(article)}
           </div>
           <aside class="news-article-aside">
             <span>Publicado por</span><strong>${escapeHTML(article.author)}</strong><time datetime="${escapeHTML(article.publishedAt)}">${formatNewsDate(article.publishedAt, true)}</time>
@@ -2773,6 +2870,27 @@
           </aside>
         </div>
         ${related.length ? `<section class="news-related"><div class="news-index-heading"><div><h2>Continue acompanhando</h2></div></div><div class="news-grid">${related.map((item) => `<article class="news-card"><button class="news-card-media" data-action="open-news" data-news-id="${escapeHTML(item.id)}">${renderNewsImage(item)}</button><div class="news-card-copy">${renderNewsMeta(item)}<h3><button data-action="open-news" data-news-id="${escapeHTML(item.id)}">${escapeHTML(item.title)}</button></h3></div></article>`).join("")}</div></section>` : ""}
+      </article>
+    `;
+  }
+
+  function renderNewsAdminItem(article) {
+    const moderating = ui.moderatingNewsId === article.id;
+    const engagement = newsEngagement[article.id];
+    const comments = engagement?.comments || [];
+    return `
+      <article class="news-admin-item ${moderating ? "is-moderating" : ""}">
+        <div class="news-admin-thumb">${renderNewsImage(article)}</div>
+        <div>
+          <div class="news-admin-item-meta"><span class="badge ${article.status === "published" ? "badge-green" : ""}">${article.status === "published" ? "Publicada" : "Rascunho"}</span>${article.featured ? '<span class="badge badge-gold">Destaque</span>' : ""}</div>
+          <h3>${escapeHTML(article.title)}</h3>
+          <p>${formatNewsDate(article.publishedAt)} · ${escapeHTML(article.category)} · ★ ${Number(article.ratingAverage || 0).toFixed(1)} · ${Number(article.commentCount) || 0} comentário(s)</p>
+          <div class="news-admin-actions"><button class="button button-small button-ghost" data-action="edit-news" data-news-id="${escapeHTML(article.id)}">Editar</button><button class="button button-small button-ghost" data-action="moderate-news" data-news-id="${escapeHTML(article.id)}">${moderating ? "Fechar comentários" : "Comentários"}</button><button class="button button-small button-danger button-ghost" data-action="delete-news" data-news-id="${escapeHTML(article.id)}">Excluir</button></div>
+        </div>
+        ${moderating ? `<div class="news-admin-comments">
+          <strong>Moderação</strong>
+          ${engagement ? (comments.length ? comments.map((comment) => `<div class="news-admin-comment"><div><b>${escapeHTML(comment.author)}</b><span>${escapeHTML(comment.body)}</span></div><button class="button button-small button-danger button-ghost" data-action="delete-news-comment" data-comment-id="${escapeHTML(comment.id)}" data-news-id="${escapeHTML(article.id)}">Excluir</button></div>`).join("") : "<p>Nenhum comentário nesta notícia.</p>") : "<p>Carregando comentários...</p>"}
+        </div>` : ""}
       </article>
     `;
   }
@@ -2806,11 +2924,7 @@
           </section>
           <section class="card news-library-card">
             <div class="card-header"><div><h2>Publicações</h2><p>Edite ou remova o que já foi cadastrado.</p></div></div>
-            <div class="news-admin-list">${newsItems.length ? newsItems.map((article) => `
-              <article class="news-admin-item">
-                <div class="news-admin-thumb">${renderNewsImage(article)}</div>
-                <div><div class="news-admin-item-meta"><span class="badge ${article.status === "published" ? "badge-green" : ""}">${article.status === "published" ? "Publicada" : "Rascunho"}</span>${article.featured ? '<span class="badge badge-gold">Destaque</span>' : ""}</div><h3>${escapeHTML(article.title)}</h3><p>${formatNewsDate(article.publishedAt)} · ${escapeHTML(article.category)}</p><div class="news-admin-actions"><button class="button button-small button-ghost" data-action="edit-news" data-news-id="${escapeHTML(article.id)}">Editar</button><button class="button button-small button-danger button-ghost" data-action="delete-news" data-news-id="${escapeHTML(article.id)}">Excluir</button></div></div>
-              </article>`).join("") : `<div class="empty-state"><div class="empty-state-icon">▤</div><h3>Nenhuma notícia ainda</h3><p>Use o formulário ao lado para publicar a primeira matéria.</p></div>`}</div>
+            <div class="news-admin-list">${newsItems.length ? newsItems.map(renderNewsAdminItem).join("") : `<div class="empty-state"><div class="empty-state-icon">▤</div><h3>Nenhuma notícia ainda</h3><p>Use o formulário ao lado para publicar a primeira matéria.</p></div>`}</div>
           </section>
         </div>
       </div>
@@ -3535,6 +3649,104 @@
     }
   }
 
+  function applyNewsEngagement(articleId, payload) {
+    newsEngagement[articleId] = payload;
+    const article = newsItems.find((item) => item.id === articleId);
+    if (!article) return;
+    article.commentCount = Array.isArray(payload.comments) ? payload.comments.length : 0;
+    article.ratingCount = Number(payload.rating?.count) || 0;
+    article.ratingAverage = Number(payload.rating?.average) || 0;
+  }
+
+  async function loadAndShowNewsEngagement(articleId) {
+    try {
+      const payload = await readNewsEngagement(articleId);
+      applyNewsEngagement(articleId, payload);
+      render();
+    } catch (error) {
+      console.error("Erro ao carregar comentários.", error);
+      showToast(error.message, "error");
+    }
+  }
+
+  async function submitNewsComment(form) {
+    const formData = new FormData(form);
+    const articleId = String(formData.get("articleId") || "");
+    const button = form.querySelector('button[type="submit"]');
+    const status = form.querySelector("#news-comment-status");
+    button.disabled = true;
+    status.textContent = "Publicando...";
+    try {
+      const response = await fetch("/api/news/comments", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "X-News-Visitor": newsVisitorId() },
+        body: JSON.stringify({
+          articleId,
+          author: String(formData.get("author") || "").trim(),
+          body: String(formData.get("body") || "").trim(),
+          website: String(formData.get("website") || ""),
+        }),
+      });
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(payload.error || "Não foi possível publicar o comentário.");
+      applyNewsEngagement(articleId, payload);
+      showToast("Comentário publicado.");
+      render();
+      document.querySelector("#news-comments")?.scrollIntoView({ behavior: "smooth", block: "start" });
+    } catch (error) {
+      status.textContent = error.message;
+      showToast(error.message, "error");
+      button.disabled = false;
+    }
+  }
+
+  async function rateNews(articleId, score) {
+    try {
+      const response = await fetch("/api/news/ratings", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "X-News-Visitor": newsVisitorId() },
+        body: JSON.stringify({ articleId, score }),
+      });
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(payload.error || "Não foi possível salvar sua avaliação.");
+      applyNewsEngagement(articleId, payload);
+      showToast(`Avaliação de ${score} estrela${score === 1 ? "" : "s"} salva.`);
+      render();
+    } catch (error) {
+      showToast(error.message, "error");
+    }
+  }
+
+  async function toggleNewsModeration(articleId) {
+    if (ui.moderatingNewsId === articleId) {
+      ui.moderatingNewsId = null;
+      render();
+      return;
+    }
+    ui.moderatingNewsId = articleId;
+    render();
+    await loadAndShowNewsEngagement(articleId);
+  }
+
+  async function deleteNewsComment(commentId, articleId) {
+    if (!requireAdmin()) return;
+    const confirmed = await askConfirm(
+      "Excluir este comentário?",
+      "O comentário será removido definitivamente da notícia.",
+      "Excluir comentário",
+    );
+    if (!confirmed) return;
+    const response = await fetch(`/api/news/comments?id=${encodeURIComponent(commentId)}`, { method: "DELETE" });
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      showToast(payload.error || "Não foi possível excluir o comentário.", "error");
+      return;
+    }
+    await Promise.all([readNewsFromServer(), readNewsEngagement(articleId)]);
+    showToast("Comentário excluído.");
+    render();
+  }
+
   async function handleAction(button) {
     const action = button.dataset.action;
     if (!action) return;
@@ -3581,6 +3793,7 @@
         ui.selectedNewsId = button.dataset.newsId;
         window.history.replaceState(null, "", `${window.location.pathname}${window.location.search}#news/${encodeURIComponent(ui.selectedNewsId)}`);
         render();
+        if (!newsEngagement[ui.selectedNewsId]) await loadAndShowNewsEngagement(ui.selectedNewsId);
         window.scrollTo({ top: 0, behavior: window.matchMedia("(prefers-reduced-motion: reduce)").matches ? "auto" : "smooth" });
         break;
       case "close-news":
@@ -3601,6 +3814,18 @@
         break;
       case "delete-news":
         await deleteNews(button.dataset.newsId);
+        break;
+      case "reload-news-engagement":
+        await loadAndShowNewsEngagement(button.dataset.newsId);
+        break;
+      case "rate-news":
+        await rateNews(button.dataset.newsId, Number(button.dataset.score));
+        break;
+      case "moderate-news":
+        await toggleNewsModeration(button.dataset.newsId);
+        break;
+      case "delete-news-comment":
+        await deleteNewsComment(button.dataset.commentId, button.dataset.newsId);
         break;
       default:
         break;
@@ -3632,6 +3857,10 @@
     if (event.target.matches("#news-form")) {
       event.preventDefault();
       if (requireAdmin()) saveNews(event.target);
+    }
+    if (event.target.matches("#news-comment-form")) {
+      event.preventDefault();
+      submitNewsComment(event.target);
     }
   });
 
