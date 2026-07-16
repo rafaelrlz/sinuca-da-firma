@@ -90,6 +90,208 @@
     }).format(date);
   }
 
+  function cleanText(value, fallback = "") {
+    if (value === null || value === undefined) return fallback;
+    const text = String(value).trim();
+    return text || fallback;
+  }
+
+  function normalizeKey(value) {
+    return cleanText(value)
+      .normalize("NFD")
+      .replace(/[\u0300-\u036f]/g, "")
+      .toLowerCase()
+      .replace(/[\s_]+/g, "-");
+  }
+
+  function normalizeDateTime(value) {
+    const text = cleanText(value);
+    if (!text) return "";
+    const date = new Date(text);
+    return Number.isNaN(date.getTime()) ? "" : text;
+  }
+
+  function combineLegacyDateTime(entry) {
+    const date = cleanText(entry.date || entry.scheduledDate || entry.dia);
+    if (!date) return "";
+    const time = cleanText(entry.time || entry.scheduledTime || entry.horario, "00:00");
+    const offset = cleanText(entry.offset || entry.timezoneOffset || entry.utcOffset);
+    return normalizeDateTime(`${date}T${time.length === 5 ? `${time}:00` : time}${offset}`);
+  }
+
+  function normalizeProgrammingStatus(value, fallback = "unscheduled") {
+    const aliases = {
+      unscheduled: "unscheduled",
+      pending: "unscheduled",
+      pendente: "unscheduled",
+      "nao-agendado": "unscheduled",
+      scheduled: "scheduled",
+      agendado: "scheduled",
+      confirmado: "scheduled",
+      postponed: "postponed",
+      adiado: "postponed",
+      remarcado: "postponed",
+      cancelled: "cancelled",
+      canceled: "cancelled",
+      cancelado: "cancelled",
+    };
+    return aliases[normalizeKey(value)] || fallback;
+  }
+
+  function normalizeProgrammingEntry(value) {
+    const entry = typeof value === "string"
+      ? { scheduledAt: value }
+      : value && typeof value === "object" && !Array.isArray(value)
+        ? value
+        : {};
+    const scheduledAt = normalizeDateTime(
+      entry.scheduledAt ||
+      entry.dateTime ||
+      entry.startsAt ||
+      entry.start ||
+      entry.datetime ||
+      combineLegacyDateTime(entry),
+    );
+    const inferredStatus = scheduledAt ? "scheduled" : "unscheduled";
+    let status = normalizeProgrammingStatus(
+      entry.status || entry.state || entry.situacao,
+      inferredStatus,
+    );
+    if (status === "scheduled" && !scheduledAt) status = "unscheduled";
+    return {
+      scheduledAt,
+      location: cleanText(entry.location || entry.venue || entry.local),
+      status,
+      publicNote: cleanText(
+        entry.publicNote ||
+        entry.publicObservation ||
+        entry.observacaoPublica ||
+        entry.note ||
+        entry.observation ||
+        entry.observacao,
+      ),
+    };
+  }
+
+  function rawProgrammingEntries(rawProgramming) {
+    const raw = rawProgramming && typeof rawProgramming === "object" && !Array.isArray(rawProgramming)
+      ? rawProgramming
+      : {};
+    const source = raw.matches || raw.schedule || raw.scheduledMatches;
+    if (Array.isArray(source)) {
+      return source
+        .filter((entry) => entry && cleanText(entry.matchId || entry.id))
+        .map((entry) => [String(entry.matchId || entry.id), entry]);
+    }
+    if (source && typeof source === "object") return Object.entries(source);
+    const reserved = new Set([
+      "nextMatchId",
+      "next_match_id",
+      "nextMatch",
+      "featuredMatchIds",
+      "featuredMatches",
+      "highlights",
+    ]);
+    return Object.entries(raw).filter(([key]) => !reserved.has(key));
+  }
+
+  function normalizedProgramming() {
+    const league = appState?.league || {};
+    const raw = league.programming && typeof league.programming === "object"
+      ? league.programming
+      : {};
+    const leagueMatches = collectMatches().filter((match) => match.kind === "league");
+    const matchesById = new Map(leagueMatches.map((match) => [String(match.id), match]));
+    const pendingMatch = (id) => {
+      const match = matchesById.get(String(id || ""));
+      return match && !match.result ? match : null;
+    };
+    const matches = {};
+
+    rawProgrammingEntries(raw).forEach(([matchId, entry]) => {
+      const id = cleanText(matchId);
+      if (!pendingMatch(id)) return;
+      matches[id] = normalizeProgrammingEntry(entry);
+    });
+
+    const nextCandidate = cleanText(
+      raw.nextMatchId ||
+      raw.next_match_id ||
+      raw.nextMatch?.id ||
+      (typeof raw.nextMatch === "string" ? raw.nextMatch : "") ||
+      league.nextMatchId,
+    );
+    const nextMatchId = pendingMatch(nextCandidate) && matches[nextCandidate]?.status !== "cancelled"
+      ? nextCandidate
+      : null;
+
+    const featuredSource = raw.featuredMatchIds ||
+      raw.featuredMatches ||
+      raw.highlights ||
+      league.featuredMatchIds ||
+      [];
+    const featuredValues = Array.isArray(featuredSource)
+      ? featuredSource
+      : Object.keys(
+        featuredSource && typeof featuredSource === "object" ? featuredSource : {},
+      ).filter((id) => featuredSource[id]);
+    const featuredMatchIds = [];
+    featuredValues.forEach((value) => {
+      const id = cleanText(value?.id || value?.matchId || value);
+      if (
+        featuredMatchIds.length < 3 &&
+        !featuredMatchIds.includes(id) &&
+        pendingMatch(id) &&
+        matches[id]?.status !== "cancelled"
+      ) {
+        featuredMatchIds.push(id);
+      }
+    });
+
+    return { nextMatchId, featuredMatchIds, matches };
+  }
+
+  function programmingEntry(matchId, programming = normalizedProgramming()) {
+    return programming.matches[matchId] || normalizeProgrammingEntry({});
+  }
+
+  function orderedLeagueMatches(matches) {
+    const programming = normalizedProgramming();
+    const featuredOrder = new Map(
+      programming.featuredMatchIds.map((matchId, index) => [matchId, index]),
+    );
+    const rank = (match, entry) => {
+      if (match.inProgress) return 0;
+      if (programming.nextMatchId === match.id) return 1;
+      if (entry.status === "scheduled" && entry.scheduledAt) return 2;
+      if (featuredOrder.has(match.id)) return 3;
+      return 4;
+    };
+    const dateValue = (entry) => {
+      if (!entry.scheduledAt) return Number.MAX_SAFE_INTEGER;
+      const value = new Date(entry.scheduledAt).getTime();
+      return Number.isNaN(value) ? Number.MAX_SAFE_INTEGER : value;
+    };
+
+    return [...matches]
+      .filter((match) => !match.result)
+      .sort((matchA, matchB) => {
+        const entryA = programmingEntry(matchA.id, programming);
+        const entryB = programmingEntry(matchB.id, programming);
+        const rankDifference = rank(matchA, entryA) - rank(matchB, entryB);
+        if (rankDifference) return rankDifference;
+        if (rank(matchA, entryA) === 2) {
+          const dateDifference = dateValue(entryA) - dateValue(entryB);
+          if (dateDifference) return dateDifference;
+        }
+        if (rank(matchA, entryA) === 3) {
+          const featuredDifference = featuredOrder.get(matchA.id) - featuredOrder.get(matchB.id);
+          if (featuredDifference) return featuredDifference;
+        }
+        return (matchA.orderIndex || 0) - (matchB.orderIndex || 0);
+      });
+  }
+
   function showToast(message, kind = "success") {
     const toast = document.createElement("div");
     toast.className = `toast${kind === "error" ? " is-error" : ""}`;
@@ -115,9 +317,11 @@
 
   function validResult(result, playerAId, playerBId) {
     if (!result || typeof result !== "object") return null;
-    if (result.playerAId !== playerAId || result.playerBId !== playerBId) return null;
+    const resultPlayerAId = result.playerAId || playerAId;
+    const resultPlayerBId = result.playerBId || playerBId;
+    if (resultPlayerAId !== playerAId || resultPlayerBId !== playerBId) return null;
     if (![playerAId, playerBId].includes(result.winnerId)) return null;
-    return result;
+    return { ...result, playerAId, playerBId };
   }
 
   function collectMatches() {
@@ -128,20 +332,24 @@
     if (league?.rounds) {
       const results = league.results || {};
       const inProgress = league.inProgress || {};
-      league.rounds.forEach((round) => {
+      let orderIndex = 0;
+      league.rounds.forEach((round, roundIndex) => {
         (round.matches || []).forEach((match) => {
           if (!match?.id || !match.playerAId || !match.playerBId) return;
           const result = validResult(results[match.id], match.playerAId, match.playerBId);
           matches.push({
             kind: "league",
             id: match.id,
-            roundName: `Liga · Rodada ${round.number}`,
+            roundName: `Liga · Rodada ${round.number || roundIndex + 1}`,
+            roundNumber: Number(round.number) || roundIndex + 1,
+            orderIndex,
             playerAId: match.playerAId,
             playerBId: match.playerBId,
             result,
             winnerId: result?.winnerId || null,
             inProgress: Boolean(inProgress[match.id]) && !result,
           });
+          orderIndex += 1;
         });
       });
     }
@@ -272,7 +480,9 @@
 
   function render() {
     const pendingMatches = collectMatches().filter((match) => !match.result);
-    const leagueMatches = pendingMatches.filter((match) => match.kind === "league");
+    const leagueMatches = orderedLeagueMatches(
+      pendingMatches.filter((match) => match.kind === "league"),
+    );
     const profile = betting.profile;
 
     dom.content.innerHTML = `
@@ -357,33 +567,54 @@
   function renderBettingSection(title, subtitle, matches, icon) {
     const liveCount = matches.filter((match) => match.inProgress).length;
     const openCount = matches.length - liveCount;
+    const programming = normalizedProgramming();
+    const nextMatch = programming.nextMatchId
+      ? matches.find((match) => match.id === programming.nextMatchId)
+      : null;
     return `
       <section class="card pool-matches-card">
         <div class="card-header">
-          <div><h2>${escapeHTML(title)}</h2><p>${escapeHTML(subtitle)} · ${openCount} aposta(s) aberta(s)${liveCount ? ` · ${liveCount} em andamento` : ""}.</p></div>
+          <div>
+            <h2>${escapeHTML(title)}</h2>
+            <p>${escapeHTML(subtitle)} · ${openCount} aposta(s) aberta(s)${liveCount ? ` · ${liveCount} em andamento` : ""}.</p>
+            <a class="button button-small button-ghost" href="/#schedule">Consultar agenda oficial</a>
+          </div>
           <span class="pool-section-icon" aria-hidden="true">${icon}</span>
         </div>
+        ${nextMatch ? `<p class="notice" role="status"><span aria-hidden="true">◷</span><span><strong>Próximo jogo oficial:</strong> ${escapeHTML(playerName(nextMatch.playerAId))} × ${escapeHTML(playerName(nextMatch.playerBId))}. A organização escolheu este confronto sem fechar as apostas das demais partidas.</span></p>` : ""}
         <div class="pool-match-list">
           ${matches.length
-            ? matches.map(renderBetCard).join("")
+            ? matches.map((match) => renderBetCard(match, programming)).join("")
             : `<div class="empty-state compact"><div class="empty-state-icon">✓</div><h3>Nenhuma disputa aberta</h3><p>Novas opções aparecem quando os confrontos forem definidos.</p></div>`}
         </div>
       </section>
     `;
   }
 
-  function renderBetCard(match) {
+  function renderBetCard(match, currentProgramming = null) {
     const existing = myBetsMap().get(matchKey(match.kind, match.id));
     const selected = existing?.predictedWinnerId || "";
     const stake = existing?.stake || Math.min(DEFAULT_STAKE, betting.profile?.availableBalance || DEFAULT_STAKE);
     const isLive = match.kind === "league" && match.inProgress;
+    const programming = match.kind === "league"
+      ? currentProgramming || normalizedProgramming()
+      : null;
+    const entry = programming ? programmingEntry(match.id, programming) : normalizeProgrammingEntry({});
+    const isNext = programming?.nextMatchId === match.id;
+    const isFeatured = programming?.featuredMatchIds.includes(match.id);
     const disabled = !betting.profile || isLive;
     const formId = `bet-${match.kind}-${match.id}`.replace(/[^a-zA-Z0-9_-]/g, "-");
+    const badges = [];
+    if (isLive) badges.push('<span class="badge badge-live"><i aria-hidden="true"></i>Em andamento</span>');
+    if (isNext) badges.push('<span class="badge badge-gold">Próximo jogo oficial</span>');
+    if (isFeatured) badges.push('<span class="badge badge-green">Em destaque</span>');
+    if (existing) badges.push('<span class="badge badge-gold">Sua aposta está aberta</span>');
+    else if (!isLive) badges.push('<span class="badge badge-green">Aberta</span>');
     return `
-      <form class="pool-match-card${isLive ? " is-live" : ""}" data-bet-form data-kind="${escapeHTML(match.kind)}" data-match-id="${escapeHTML(match.id)}">
+      <form class="pool-match-card${isLive ? " is-live" : ""}${isNext ? " is-next" : ""}${isFeatured ? " is-featured" : ""}" data-bet-form data-kind="${escapeHTML(match.kind)}" data-match-id="${escapeHTML(match.id)}"${isNext ? ` aria-label="${escapeHTML(`Aposta em ${playerName(match.playerAId)} contra ${playerName(match.playerBId)} — próximo jogo oficial`)}"` : ""}>
         <div class="pool-match-meta">
           <span>${escapeHTML(match.roundName)}</span>
-          ${isLive ? '<span class="badge badge-live"><i aria-hidden="true"></i>Em andamento</span>' : existing ? '<span class="badge badge-gold">Sua aposta está aberta</span>' : '<span class="badge badge-green">Aberta</span>'}
+          <span>${badges.join(" ")}</span>
         </div>
         <div class="pool-pick-grid">
           ${renderPickOption(formId, match.playerAId, selected, disabled)}
@@ -394,10 +625,45 @@
           <label class="pool-stake-field"><span>Fichas</span><input name="stake" type="number" min="1" max="${Number(betting.settings?.maxStake) || 500}" step="1" value="${stake}" ${disabled ? "disabled" : ""} required></label>
           <button class="button button-primary" type="submit" ${disabled ? "disabled" : ""}>${existing ? "Atualizar aposta" : "Apostar"}</button>
           ${existing ? `<button class="button button-small button-ghost" type="button" data-pool-action="cancel-bet" data-kind="${escapeHTML(match.kind)}" data-match-id="${escapeHTML(match.id)}" ${isLive ? "disabled" : ""}>Cancelar</button>` : ""}
+          ${match.kind === "league" ? `<a class="button button-small button-ghost" href="/#match/${encodeURIComponent(match.id)}">Ver confronto</a>` : ""}
         </div>
+        ${renderProgrammingContext(match, entry, { isNext, isFeatured })}
         ${isLive ? `<p class="pool-live-notice"><span aria-hidden="true">●</span><span>A partida já começou. ${existing ? "Seu palpite foi preservado, mas não pode mais ser alterado ou cancelado." : "Novos palpites estão bloqueados até o resultado."}</span></p>` : disabled ? '<p class="pool-login-hint">Crie ou acesse seu perfil acima para apostar.</p>' : ""}
       </form>
     `;
+  }
+
+  function renderProgrammingContext(match, entry, { isNext = false, isFeatured = false } = {}) {
+    if (match.kind !== "league") return "";
+    const hasProgramming = Boolean(
+      entry.scheduledAt ||
+      entry.location ||
+      entry.publicNote ||
+      entry.status !== "unscheduled" ||
+      isNext ||
+      isFeatured,
+    );
+    if (!hasProgramming) return "";
+
+    const dateMarkup = entry.scheduledAt
+      ? `<time datetime="${escapeHTML(entry.scheduledAt)}">${escapeHTML(formatDateTime(entry.scheduledAt))}</time>`
+      : "data a definir";
+    const location = entry.location ? escapeHTML(entry.location) : "local a definir";
+    const note = entry.publicNote ? ` · <span>${escapeHTML(entry.publicNote)}</span>` : "";
+
+    if (entry.status === "postponed") {
+      return `<p class="notice notice-warning" role="status"><span aria-hidden="true">!</span><span><strong>Partida adiada.</strong> ${dateMarkup} · ${location}${note}</span></p>`;
+    }
+    if (entry.status === "cancelled") {
+      return `<p class="notice notice-danger" role="status"><span aria-hidden="true">!</span><span><strong>Partida cancelada na agenda.</strong> ${dateMarkup} · ${location}${note}</span></p>`;
+    }
+
+    const label = entry.status === "scheduled"
+      ? "Agenda oficial"
+      : isNext
+        ? "Próximo oficial"
+        : "Programação";
+    return `<p class="pool-login-hint"><strong>${label}:</strong> ${dateMarkup} · ${location}${note}</p>`;
   }
 
   function renderPickOption(formId, playerId, selected, disabled) {
