@@ -9,7 +9,9 @@ import sqlite3
 
 
 PROJECT_DIR = Path(__file__).resolve().parent
-DATABASE_PATH = PROJECT_DIR / "data" / "campeonato.db"
+DATABASE_PATH = Path(
+    os.environ.get("SINUCA_DATABASE_PATH") or PROJECT_DIR / "data" / "campeonato.db"
+).expanduser().resolve()
 DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
 IS_POSTGRES = DATABASE_URL.startswith(("postgres://", "postgresql://"))
 IS_VERCEL = bool(os.environ.get("VERCEL"))
@@ -36,6 +38,7 @@ class DatabaseConnection:
             DATABASE_PATH.parent.mkdir(parents=True, exist_ok=True)
             self.raw = sqlite3.connect(DATABASE_PATH, timeout=10)
             self.raw.row_factory = sqlite3.Row
+            self.raw.execute("PRAGMA foreign_keys=ON")
             self.raw.execute("PRAGMA journal_mode=WAL")
             self.raw.execute("PRAGMA synchronous=FULL")
             self.raw.execute("PRAGMA busy_timeout=10000")
