@@ -558,6 +558,10 @@ def initialize_database() -> None:
     bet_id_definition = "BIGSERIAL PRIMARY KEY" if IS_POSTGRES else "INTEGER PRIMARY KEY AUTOINCREMENT"
     failure_id_definition = "BIGSERIAL PRIMARY KEY" if IS_POSTGRES else "INTEGER PRIMARY KEY AUTOINCREMENT"
     with connect_database() as connection:
+        if IS_POSTGRES:
+            connection.execute(
+                "SELECT pg_advisory_xact_lock(hashtext('sinuca_database_migrations'))"
+            )
         connection.execute(
             """
             CREATE TABLE IF NOT EXISTS app_state (
@@ -3549,12 +3553,15 @@ def grant_achievements(connection: object, season_id: str | None = None) -> int:
     bettors = connection.execute("SELECT id FROM bettors WHERE active = 1").fetchall()
     for bettor in bettors:
         bettor_id = str(bettor["id"])
+        query = "SELECT * FROM bets WHERE bettor_id = ?"
+        parameters: tuple[object, ...] = (bettor_id,)
+        if season_id is not None:
+            query += " AND season_id = ?"
+            parameters += (season_id,)
+        query += " ORDER BY COALESCE(settled_at, updated_at), id"
         bets = connection.execute(
-            """
-            SELECT * FROM bets WHERE bettor_id = ? AND (? IS NULL OR season_id = ?)
-            ORDER BY COALESCE(settled_at, updated_at), id
-            """,
-            (bettor_id, season_id, season_id),
+            query,
+            parameters,
         ).fetchall()
         candidates: list[tuple[str, str, dict[str, object]]] = []
         if bets:
