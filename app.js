@@ -8,6 +8,7 @@
   const SYNC_INTERVAL_MS = 4000;
   const LIVE_SYNC_INTERVAL_MS = 12000;
   const LIVE_BACKGROUND_SYNC_INTERVAL_MS = 45000;
+  const INITIAL_SERVER_RETRY_DELAYS_MS = [0, 700, 1600];
   const MAX_PLAYERS = 32;
   const MAX_BALLS_PER_PLAYER = 8;
   const BALANCE_BALLS_PER_PLAYER = 8;
@@ -602,12 +603,22 @@
       });
   }
 
-  async function readStateFromServer() {
-    const response = await fetch("/api/state", { cache: "no-store" });
-    if (!response.ok) {
-      throw new Error(`Falha ao carregar: HTTP ${response.status}`);
+  async function readStateFromServer({ retryInitialConnection = false } = {}) {
+    const retryDelays = retryInitialConnection ? INITIAL_SERVER_RETRY_DELAYS_MS : [0];
+    let lastError = null;
+    for (const delay of retryDelays) {
+      if (delay) await new Promise((resolve) => window.setTimeout(resolve, delay));
+      try {
+        const response = await fetch("/api/state", { cache: "no-store" });
+        if (!response.ok) {
+          throw new Error(`Falha ao carregar: HTTP ${response.status}`);
+        }
+        return await response.json();
+      } catch (error) {
+        lastError = error;
+      }
     }
-    return response.json();
+    throw lastError || new Error("Falha ao carregar o estado do campeonato.");
   }
 
   async function readNewsFromServer() {
@@ -801,7 +812,18 @@
     updateConnectionBanner();
     if (!("serviceWorker" in navigator) || !window.isSecureContext) return;
     try {
-      serviceWorkerRegistration = await navigator.serviceWorker.register("/sw.js", { scope: "/" });
+      const hadController = Boolean(navigator.serviceWorker.controller);
+      let reloadingForUpdate = false;
+      navigator.serviceWorker.addEventListener("controllerchange", () => {
+        if (!hadController || reloadingForUpdate) return;
+        reloadingForUpdate = true;
+        window.location.reload();
+      });
+      serviceWorkerRegistration = await navigator.serviceWorker.register("/sw.js", {
+        scope: "/",
+        updateViaCache: "none",
+      });
+      await serviceWorkerRegistration.update();
     } catch (error) {
       console.warn("O modo offline não pôde ser ativado.", error);
     }
@@ -929,7 +951,7 @@
     updateBrand();
     setStorageStatus("saving", "Conectando ao banco do campeonato");
     const authRequest = readAuthFromServer();
-    const stateRequest = readStateFromServer();
+    const stateRequest = readStateFromServer({ retryInitialConnection: true });
     const newsRequest = readNewsFromServer();
     const expansionRequest = readExpansionData();
     const liveRequest = readLiveData({ silent: true });

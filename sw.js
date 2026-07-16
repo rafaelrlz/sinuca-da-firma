@@ -1,6 +1,6 @@
 "use strict";
 
-const CACHE_VERSION = "sinuca-public-v3";
+const CACHE_VERSION = "sinuca-public-v4";
 const PUBLIC_SHELL = [
   "/",
   "/index.html",
@@ -30,14 +30,20 @@ self.addEventListener("activate", (event) => {
   );
 });
 
-async function networkFirst(request) {
+async function networkFirst(request, fallbackUrl = null) {
   const cache = await caches.open(CACHE_VERSION);
   try {
     const response = await fetch(request);
     if (response.ok && response.type === "basic") await cache.put(request, response.clone());
     return response;
   } catch (error) {
-    return (await cache.match(request)) || (await cache.match("/"));
+    const cached = await cache.match(request);
+    if (cached) return cached;
+    if (fallbackUrl) {
+      const fallback = await cache.match(fallbackUrl);
+      if (fallback) return fallback;
+    }
+    return Response.error();
   }
 }
 
@@ -62,6 +68,10 @@ self.addEventListener("fetch", (event) => {
   // no objeto Request de forma confiável para decidir se uma resposta é pública.
   if (url.pathname.startsWith("/api/")) return;
   if (request.mode === "navigate") {
+    event.respondWith(networkFirst(request, "/"));
+    return;
+  }
+  if (["script", "style", "worker", "manifest"].includes(request.destination)) {
     event.respondWith(networkFirst(request));
     return;
   }
