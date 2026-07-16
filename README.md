@@ -67,6 +67,40 @@ No painel administrativo, abra **Notícias** para:
 
 As imagens ficam em uma tabela própria do banco, separadas do estado geral do campeonato. O navegador reduz imagens grandes antes do envio; o arquivo final aceita até 900 KB.
 
+## Agenda flexível
+
+A agenda real é independente da numeração das rodadas. Na área administrativa, abra **Agenda** para:
+
+- escolher manualmente qualquer confronto pendente como o único próximo jogo oficial;
+- selecionar até três jogos em destaque;
+- informar data, horário, local, observação pública e nota interna;
+- adiar, cancelar ou limpar uma programação sem alterar a tabela da liga;
+- registrar disponibilidade dos jogadores e receber avisos não bloqueantes.
+
+Ao concluir o próximo jogo, o sistema remove a seleção e cria a tarefa **Escolher o próximo jogo**. Nenhum confronto é escolhido automaticamente. Todas as alterações de programação e disponibilidade registram o administrador e o horário no estado e no histórico de auditoria do banco.
+
+A área pública possui a rota `/#schedule`, arquivos `.ics`, compartilhamento e atalhos para o confronto e o bolão.
+
+## Perfis, confrontos e estatísticas
+
+Cada jogador possui uma rota pública `/#player/ID`, mesmo sem foto ou biografia. O perfil mostra campanha, forma recente, sequência, próximo adversário, notícias vinculadas e premiações. Administradores editam foto, apelido, biografia e jogada favorita no próprio perfil.
+
+Cada partida possui `/#match/ID`, com agenda, disponibilidade, ranking, forma, retrospecto, reações e comentários moderados.
+
+As rotas `/#statistics` e `/#compare` derivam todos os números dos resultados oficiais. Nenhuma estatística é armazenada manualmente.
+
+## Cards, temporadas e participação
+
+Na administração:
+
+- **Cards** gera PNGs quadrados, verticais e horizontais no navegador;
+- **Notícias** recebe rascunhos automáticos de resultados e confrontos agendados;
+- **Temporadas** arquiva snapshots imutáveis sem apagar a liga atual;
+- **Premiações** cria enquetes com um voto por visitante;
+- **Mural** modera mensagens e denúncias.
+
+As páginas públicas `/#hall`, `/#season/ID`, `/#awards` e `/#community` preservam o histórico e a participação. Automações sempre sugerem uma ação e exigem confirmação; nada é publicado automaticamente.
+
 ## Bolão com fichas virtuais
 
 Qualquer pessoa da rede pode abrir `/bolao` e criar um perfil com:
@@ -185,6 +219,10 @@ O banco armazena:
 - perfis do bolão;
 - PINs protegidos por hash;
 - fichas e apostas.
+- perfis e fotos de jogadores;
+- temporadas arquivadas e premiações;
+- enquetes, votos e reações;
+- mural, denúncias e auditoria administrativa.
 
 O arquivo adicional:
 
@@ -193,6 +231,24 @@ data/backup-latest.json
 ```
 
 é uma cópia legível do estado do campeonato. Para preservar também os dados do bolão, faça backup do arquivo `campeonato.db` inteiro.
+
+O JSON inclui agenda e disponibilidade, mas não contém fotos, temporadas arquivadas, votos, reações, mural, notícias nem auditoria. Para um backup completo, copie o banco inteiro.
+
+## Migração da expansão
+
+Ao iniciar a aplicação, a migração idempotente `site_expansion_v1` cria as novas tabelas e colunas sem descartar registros existentes. Faça uma cópia do banco antes da primeira inicialização de uma versão nova.
+
+Para testar com uma cópia isolada:
+
+```powershell
+$env:SINUCA_DATABASE_PATH="$PWD\data\teste\campeonato.db"
+$env:SINUCA_DATA_DIR="$PWD\data\teste"
+$env:SINUCA_PORT="3017"
+$env:NO_BROWSER="1"
+python server.py
+```
+
+As variáveis `SINUCA_DATABASE_PATH` e `SINUCA_DATA_DIR` são opcionais e úteis somente para testes, migrações e instalações com caminhos personalizados.
 
 ## Publicar gratuitamente com Vercel + Neon
 
