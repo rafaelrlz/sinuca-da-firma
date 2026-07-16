@@ -259,6 +259,11 @@
     } catch (error) {
       console.error(error);
       setConnectionStatus(false, "Servidor indisponível");
+      if (!appState) {
+        dom.content.innerHTML = `<section class="card pool-loading-card pool-error-card" role="alert">
+          <div class="empty-state"><div class="empty-state-icon">!</div><h2>Não foi possível abrir o bolão</h2><p>Verifique sua conexão e tente novamente. Nenhuma aposta foi alterada.</p><button class="button button-primary" type="button" data-pool-action="retry-load">Tentar novamente</button></div>
+        </section>`;
+      }
       if (!quiet) showToast("Não foi possível carregar o bolão.", "error");
     } finally {
       syncInProgress = false;
@@ -650,6 +655,8 @@
       cancelBet(button.dataset.kind, button.dataset.matchId);
     } else if (action === "reset-pool") {
       resetPool();
+    } else if (action === "retry-load") {
+      loadAll();
     }
   });
 

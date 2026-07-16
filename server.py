@@ -245,10 +245,22 @@ def initialize_database() -> None:
             CREATE TABLE IF NOT EXISTS admin_sessions (
                 token_hash TEXT PRIMARY KEY,
                 expires_at TEXT NOT NULL,
-                created_at TEXT NOT NULL
+                created_at TEXT NOT NULL,
+                username TEXT NOT NULL DEFAULT ''
             )
             """
         )
+        if IS_POSTGRES:
+            username_column = connection.execute(
+                "SELECT 1 FROM information_schema.columns WHERE table_name = 'admin_sessions' AND column_name = 'username'"
+            ).fetchone()
+        else:
+            username_column = next(
+                (row for row in connection.execute("PRAGMA table_info(admin_sessions)").fetchall() if row["name"] == "username"),
+                None,
+            )
+        if username_column is None:
+            connection.execute("ALTER TABLE admin_sessions ADD COLUMN username TEXT NOT NULL DEFAULT ''")
         connection.execute(
             f"""
             CREATE TABLE IF NOT EXISTS login_failures (
@@ -305,6 +317,16 @@ def initialize_database() -> None:
             """
         )
         connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS news_comment_reports (
+                comment_id TEXT NOT NULL,
+                visitor_id TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (comment_id, visitor_id)
+            )
+            """
+        )
+        connection.execute(
             "CREATE INDEX IF NOT EXISTS idx_bets_bettor ON bets(bettor_id)"
         )
         connection.execute(
@@ -318,6 +340,9 @@ def initialize_database() -> None:
         )
         connection.execute(
             "CREATE INDEX IF NOT EXISTS idx_news_ratings_article ON news_ratings(article_id)"
+        )
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_news_reports_comment ON news_comment_reports(comment_id)"
         )
         migrate_bettor_initial_balance(connection)
         existing = connection.execute(
@@ -584,6 +609,10 @@ def save_news_article(payload: dict[str, object]) -> dict[str, object]:
 
 def delete_news_article(article_id: str) -> bool:
     with connect_database() as connection:
+        connection.execute(
+            "DELETE FROM news_comment_reports WHERE comment_id IN (SELECT id FROM news_comments WHERE article_id = ?)",
+            (article_id,),
+        )
         connection.execute("DELETE FROM news_comments WHERE article_id = ?", (article_id,))
         connection.execute("DELETE FROM news_ratings WHERE article_id = ?", (article_id,))
         cursor = connection.execute("DELETE FROM news_articles WHERE id = ?", (article_id,))
@@ -616,8 +645,9 @@ def news_engagement(article_id: str, visitor_value: object, include_hidden: bool
     with connect_database() as connection:
         comments = connection.execute(
             """
-            SELECT id, author, body, created_at
-            FROM news_comments WHERE article_id = ?
+            SELECT c.id, c.author, c.body, c.created_at,
+                   (SELECT COUNT(*) FROM news_comment_reports r WHERE r.comment_id = c.id) AS report_count
+            FROM news_comments c WHERE c.article_id = ?
             ORDER BY created_at DESC
             """,
             (article_id,),
@@ -637,6 +667,7 @@ def news_engagement(article_id: str, visitor_value: object, include_hidden: bool
                 "author": row["author"],
                 "body": row["body"],
                 "createdAt": row["created_at"],
+                **({"reportCount": int(row["report_count"] or 0)} if include_hidden else {}),
             }
             for row in comments
         ],
@@ -704,8 +735,31 @@ def save_news_rating(article_id: object, visitor_value: object, score_value: obj
     return news_engagement(article_key, visitor_id)
 
 
+def report_news_comment(comment_id: object, visitor_value: object) -> dict[str, object]:
+    comment_key = str(comment_id or "").strip()
+    visitor_id = validate_news_visitor(visitor_value)
+    with DB_LOCK, connect_database() as connection:
+        comment = connection.execute(
+            "SELECT id FROM news_comments WHERE id = ?", (comment_key,)
+        ).fetchone()
+        if comment is None:
+            raise LookupError("Comentário não encontrado.")
+        existing = connection.execute(
+            "SELECT 1 FROM news_comment_reports WHERE comment_id = ? AND visitor_id = ?",
+            (comment_key, visitor_id),
+        ).fetchone()
+        if existing is None:
+            connection.execute(
+                "INSERT INTO news_comment_reports (comment_id, visitor_id, created_at) VALUES (?, ?, ?)",
+                (comment_key, visitor_id, utc_now()),
+            )
+            connection.commit()
+    return {"ok": True, "alreadyReported": existing is not None}
+
+
 def delete_news_comment(comment_id: str) -> bool:
     with connect_database() as connection:
+        connection.execute("DELETE FROM news_comment_reports WHERE comment_id = ?", (comment_id,))
         cursor = connection.execute("DELETE FROM news_comments WHERE id = ?", (comment_id,))
         connection.commit()
     return cursor.rowcount == 1
@@ -1160,7 +1214,7 @@ def verify_admin_credentials(username: str, password: str) -> bool:
     return authenticated
 
 
-def create_session() -> tuple[str, datetime]:
+def create_session(username: str) -> tuple[str, datetime]:
     token = secrets.token_urlsafe(36)
     expires_at = datetime.now(timezone.utc) + SESSION_DURATION
     now = utc_now()
@@ -1170,8 +1224,8 @@ def create_session() -> tuple[str, datetime]:
             (now,),
         )
         connection.execute(
-            "INSERT INTO admin_sessions (token_hash, expires_at, created_at) VALUES (?, ?, ?)",
-            (token_digest(token), expires_at.isoformat(timespec="seconds"), now),
+            "INSERT INTO admin_sessions (token_hash, expires_at, created_at, username) VALUES (?, ?, ?, ?)",
+            (token_digest(token), expires_at.isoformat(timespec="seconds"), now, username),
         )
         connection.commit()
     return token, expires_at
@@ -1192,6 +1246,17 @@ def session_is_valid(token: str | None) -> bool:
         ).fetchone()
         connection.commit()
     return row is not None
+
+
+def session_username(token: str | None) -> str | None:
+    if not token:
+        return None
+    with connect_database() as connection:
+        row = connection.execute(
+            "SELECT username FROM admin_sessions WHERE token_hash = ? AND expires_at > ?",
+            (token_digest(token), utc_now()),
+        ).fetchone()
+    return str(row["username"] or ADMIN_USERNAME) if row else None
 
 
 def invalidate_session(token: str | None) -> None:
@@ -1250,7 +1315,6 @@ class TournamentHandler(SimpleHTTPRequestHandler):
             "frame-src https://www.youtube-nocookie.com https://player.vimeo.com; frame-ancestors 'none'; "
             "base-uri 'none'; form-action 'self'",
         )
-        self.send_header("Cache-Control", "no-store")
         super().end_headers()
 
     def list_directory(self, path: str):  # type: ignore[override]
@@ -1333,12 +1397,13 @@ class TournamentHandler(SimpleHTTPRequestHandler):
             return
 
         if path == "/api/auth":
-            authenticated = self.is_authenticated()
+            username = session_username(self.session_token())
+            authenticated = username is not None
             self.send_json(
                 HTTPStatus.OK,
                 {
                     "authenticated": authenticated,
-                    "username": ADMIN_USERNAME if authenticated else None,
+                    "username": username,
                 },
             )
             return
@@ -1451,6 +1516,24 @@ class TournamentHandler(SimpleHTTPRequestHandler):
                 self.send_json(
                     HTTPStatus.INTERNAL_SERVER_ERROR,
                     {"error": "Não foi possível salvar a avaliação.", "detail": str(error)},
+                )
+            return
+        if path == "/api/news/comments/report":
+            try:
+                body = self.read_json_body()
+                payload = report_news_comment(
+                    body.get("commentId"),
+                    self.headers.get(NEWS_VISITOR_HEADER),
+                )
+                self.send_json(HTTPStatus.OK, payload)
+            except ValueError as error:
+                self.send_json(HTTPStatus.BAD_REQUEST, {"error": str(error)})
+            except LookupError as error:
+                self.send_json(HTTPStatus.NOT_FOUND, {"error": str(error)})
+            except Exception as error:  # pragma: no cover
+                self.send_json(
+                    HTTPStatus.INTERNAL_SERVER_ERROR,
+                    {"error": "Não foi possível enviar a denúncia.", "detail": str(error)},
                 )
             return
         if path == "/api/bettors/register":
@@ -1610,7 +1693,7 @@ class TournamentHandler(SimpleHTTPRequestHandler):
             return
 
         self.clear_login_failures(client_key)
-        token, expires_at = create_session()
+        token, expires_at = create_session(username)
         max_age = int(SESSION_DURATION.total_seconds())
         secure = "; Secure" if os.environ.get("VERCEL") == "1" else ""
         cookie = (
@@ -1736,6 +1819,10 @@ class TournamentHandler(SimpleHTTPRequestHandler):
         self.send_response(HTTPStatus.OK)
         self.send_header("Content-Type", f"{content_type or 'application/octet-stream'}; charset=utf-8")
         self.send_header("Content-Length", str(len(content)))
+        self.send_header(
+            "Cache-Control",
+            "public, max-age=86400" if relative.parts[0] == "assets" else "no-cache",
+        )
         self.end_headers()
         if not head_only:
             self.wfile.write(content)
@@ -1751,6 +1838,7 @@ class TournamentHandler(SimpleHTTPRequestHandler):
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(encoded)))
+        self.send_header("Cache-Control", "no-store")
         if extra_headers:
             for key, value in extra_headers.items():
                 self.send_header(key, value)

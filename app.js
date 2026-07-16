@@ -111,6 +111,8 @@
     confirmTitle: document.querySelector("#confirm-title"),
     confirmMessage: document.querySelector("#confirm-message"),
     confirmAction: document.querySelector("#confirm-action"),
+    newsPreviewDialog: document.querySelector("#news-preview-dialog"),
+    newsPreviewContent: document.querySelector("#news-preview-content"),
     importFile: document.querySelector("#import-file"),
     toastRegion: document.querySelector("#toast-region"),
     storageStatus: document.querySelector("#storage-status"),
@@ -128,12 +130,14 @@
     editingNewsId: null,
     selectedNewsId: null,
     moderatingNewsId: null,
+    editingPlayerId: null,
     confirmResolver: null,
   };
 
   let state = createDefaultState();
   let newsItems = [];
   let newsLoading = true;
+  let newsError = "";
   let newsEngagement = {};
   let auth = { authenticated: false, username: null };
   let serverRevision = 0;
@@ -417,6 +421,7 @@
   }
 
   async function readNewsFromServer() {
+    newsError = "";
     const response = await fetch("/api/news", { cache: "no-store" });
     if (!response.ok) throw new Error(`Falha ao carregar notícias: HTTP ${response.status}`);
     const payload = await response.json();
@@ -451,10 +456,15 @@
 
   async function initializeApp() {
     const cachedState = loadCachedState();
+    state = cachedState;
+    updateBrand();
     setStorageStatus("saving", "Conectando ao banco do campeonato");
+    const authRequest = readAuthFromServer();
+    const stateRequest = readStateFromServer();
+    const newsRequest = readNewsFromServer();
 
     try {
-      const authPayload = await readAuthFromServer();
+      const authPayload = await authRequest;
       auth = {
         authenticated: Boolean(authPayload.authenticated),
         username: authPayload.username || null,
@@ -465,7 +475,7 @@
     }
 
     try {
-      const payload = await readStateFromServer();
+      const payload = await stateRequest;
       serverRevision = Number(payload.revision) || 0;
       if (payload.state) {
         state = normalizeLoadedState(payload.state, createDefaultState());
@@ -483,10 +493,11 @@
     }
 
     try {
-      await readNewsFromServer();
+      await newsRequest;
     } catch (error) {
       console.warn("Não foi possível carregar as notícias.", error);
       newsLoading = false;
+      newsError = "Não foi possível buscar as notícias agora.";
     }
 
     const requestedParts = window.location.hash.slice(1).split("/");
@@ -499,7 +510,7 @@
         console.warn("Não foi possível carregar a conversa da notícia.", error);
       }
     }
-    if (VIEW_META[requestedView] && !HIDDEN_VIEWS.has(requestedView) && (isAdmin() || ["league", "news"].includes(requestedView))) {
+    if (VIEW_META[requestedView] && !HIDDEN_VIEWS.has(requestedView) && (isAdmin() || ["league", "league-ranking", "news"].includes(requestedView))) {
       ui.currentView = requestedView;
     } else if (HIDDEN_VIEWS.has(requestedView)) {
       window.history.replaceState(null, "", `${window.location.pathname}${window.location.search}#league`);
@@ -507,6 +518,9 @@
     }
     updateBrand();
     render();
+    if (ui.currentView === "league-ranking" && !isAdmin()) {
+      window.requestAnimationFrame(() => document.querySelector("#public-league-ranking")?.scrollIntoView({ block: "start" }));
+    }
     window.setInterval(syncFromServer, SYNC_INTERVAL_MS);
   }
 
@@ -623,24 +637,32 @@
     window.setTimeout(() => toast.remove(), 3300);
   }
 
+  function updateNavigationState(view) {
+    document.querySelectorAll(".nav-item[data-view], .public-nav [data-view]").forEach((button) => {
+      const active = button.dataset.view === view;
+      button.classList.toggle("is-active", active);
+      if (active) button.setAttribute("aria-current", "page");
+      else button.removeAttribute("aria-current");
+    });
+    document.querySelectorAll('.public-nav [data-action="navigate-public-ranking"]').forEach((button) => {
+      const active = view === "league-ranking";
+      button.classList.toggle("is-active", active);
+      if (active) button.setAttribute("aria-current", "page");
+      else button.removeAttribute("aria-current");
+    });
+  }
+
   function navigate(view, options = {}) {
     if (!VIEW_META[view]) return;
     if (HIDDEN_VIEWS.has(view)) view = "league";
-    if (!isAdmin() && !["dashboard", "league", "news"].includes(view)) {
+    if (!isAdmin() && !["dashboard", "league", "league-ranking", "news"].includes(view)) {
       view = "dashboard";
     }
     ui.currentView = view;
     const nextHash = view === "dashboard" ? "" : `#${view}`;
-    window.history.replaceState(null, "", `${window.location.pathname}${window.location.search}${nextHash}`);
-    document.querySelectorAll(".nav-item").forEach((button) => {
-      button.classList.toggle("is-active", button.dataset.view === view);
-    });
-    document.querySelectorAll(".public-nav [data-view]").forEach((button) => {
-      button.classList.toggle("is-active", button.dataset.view === view);
-    });
-    document.querySelectorAll('.public-nav [data-action="navigate-public-ranking"]').forEach((button) => {
-      button.classList.remove("is-active");
-    });
+    const historyMethod = options.replace ? "replaceState" : "pushState";
+    window.history[historyMethod](null, "", `${window.location.pathname}${window.location.search}${nextHash}`);
+    updateNavigationState(view);
     const meta = VIEW_META[view];
     dom.pageTitle.textContent = meta.title;
     dom.pageSubtitle.textContent = meta.subtitle;
@@ -654,7 +676,7 @@
   }
 
   function navigateToPublicLeagueRanking() {
-    navigate("league", { scrollToTop: false });
+    navigate("league-ranking", { scrollToTop: false });
     window.requestAnimationFrame(() => {
       window.requestAnimationFrame(() => {
         const ranking = document.querySelector("#public-league-ranking");
@@ -663,8 +685,6 @@
           window.scrollTo({ top: 0, behavior: reducedMotion ? "auto" : "smooth" });
           return;
         }
-        document.querySelectorAll(".public-nav [data-view]").forEach((button) => button.classList.remove("is-active"));
-        document.querySelectorAll('.public-nav [data-action="navigate-public-ranking"]').forEach((button) => button.classList.add("is-active"));
         ranking.scrollIntoView({ behavior: reducedMotion ? "auto" : "smooth", block: "start" });
         ranking.focus({ preventScroll: true });
       });
@@ -686,12 +706,7 @@
       const viewMeta = VIEW_META[ui.currentView];
       dom.pageTitle.textContent = viewMeta.title;
       dom.pageSubtitle.textContent = viewMeta.subtitle;
-      document.querySelectorAll(".nav-item, .public-nav [data-view]").forEach((button) => {
-        button.classList.toggle("is-active", button.dataset.view === ui.currentView);
-      });
-      document.querySelectorAll('.public-nav [data-action="navigate-public-ranking"]').forEach((button) => {
-        button.classList.remove("is-active");
-      });
+      updateNavigationState(ui.currentView);
       normalizeLeagueResults();
       normalizeTournamentResults();
       updateBrand();
@@ -1064,7 +1079,7 @@
       ${renderPublicViewHeader("Liga por pontos", "A corrida pela liderança.", "Cada rodada recalcula a disputa. Acompanhe pontos, saldo de bolas e todos os confrontos da temporada.", facts)}
       <div class="public-view-content">
         <section class="public-view-section public-league-board" id="public-league-ranking" tabindex="-1">
-          <div class="public-block-title"><div><span class="public-overline">Tabela atual</span><h2>Classificação</h2></div><p>${Number(state.settings.league.winPoints) || 0} pontos por vitória · derrota mantém a pontuação · desempate pelo saldo de bolas.</p></div>
+          <div class="public-block-title"><div><span class="public-overline">Tabela atual</span><h2>Classificação</h2></div><p>Vitória +${Number(state.settings.league.winPoints) || 0} · derrota +0 · desempate pelo saldo de bolas.</p></div>
           ${renderPublicStandings(standings)}
         </section>
         <section class="public-view-section">
@@ -1364,6 +1379,12 @@
           ${result ? "" : `<button class="button button-small ${match.inProgress ? "button-live" : "button-ghost"}" data-action="toggle-match-live" data-match-id="${match.id}">${match.inProgress ? "Encerrar andamento" : "Iniciar partida"}</button>`}
           <button class="button button-small button-primary" data-action="open-score" data-match-id="${match.id}" data-match-kind="league">${result ? "Editar" : "Placar"}</button>
         </div>
+        ${result ? `<div class="match-audit">Atualizado por ${escapeHTML(result.updatedBy || "Administrador")} · ${escapeHTML(formatDateTime(result.updatedAt || result.playedAt))}</div>` : `<form class="quick-score-form" data-match-id="${match.id}">
+          <label><span>Vencedor</span><select name="winner" required><option value="">Selecione</option><option value="${match.playerAId}">${escapeHTML(playerName(match.playerAId))}</option><option value="${match.playerBId}">${escapeHTML(playerName(match.playerBId))}</option></select></label>
+          <label><span>Bolas ${escapeHTML(playerName(match.playerAId))}</span><input name="ballsA" type="number" min="0" max="8" required inputmode="numeric"></label>
+          <label><span>Bolas ${escapeHTML(playerName(match.playerBId))}</span><input name="ballsB" type="number" min="0" max="8" required inputmode="numeric"></label>
+          <button class="button button-small button-primary" type="submit">Salvar rápido</button>
+        </form>`}
       </article>
     `;
   }
@@ -2100,20 +2121,21 @@
           ${players
             .map((player) => {
               const originalIndex = state.players.findIndex((item) => item.id === player.id);
+              const editing = ui.editingPlayerId === player.id;
               return `
                 <tr>
                   <td>${originalIndex + 1}</td>
                   <td>
-                    <div class="player-cell">
+                    <div class="player-cell ${editing ? "player-cell-editing" : ""}">
                       <span class="avatar">${escapeHTML(getInitials(player.name))}</span>
-                      <strong>${escapeHTML(player.name)}</strong>
+                      ${editing ? `<form class="inline-player-form" data-player-id="${player.id}"><input name="name" maxlength="60" value="${escapeHTML(player.name)}" required aria-label="Novo nome de ${escapeHTML(player.name)}"><button class="button button-small button-primary" type="submit">Salvar</button><button class="button button-small button-ghost" type="button" data-action="cancel-player-edit">Cancelar</button></form>` : `<strong>${escapeHTML(player.name)}</strong>`}
                     </div>
                   </td>
                   <td>${escapeHTML(formatDateTime(player.createdAt))}</td>
                   <td><span class="badge badge-green">Inscrito</span></td>
                   <td>
                     <div class="table-actions">
-                      <button class="button button-small button-ghost" data-action="edit-player" data-player-id="${player.id}">Editar</button>
+                      ${editing ? "" : `<button class="button button-small button-ghost" data-action="edit-player" data-player-id="${player.id}">Editar</button>`}
                       <button class="button button-small button-danger button-ghost" data-action="delete-player" data-player-id="${player.id}">Excluir</button>
                     </div>
                   </td>
@@ -2751,6 +2773,9 @@
     if (newsLoading) {
       return `<div class="public-view"><section class="news-loading" aria-label="Carregando notícias"><span></span><span></span><span></span></section></div>`;
     }
+    if (newsError) {
+      return `<div class="public-view"><section class="public-view-empty" role="alert"><span class="public-brand-ball" aria-hidden="true">!</span><div><h2>As notícias não carregaram</h2><p>${escapeHTML(newsError)} Seus outros dados continuam disponíveis.</p></div><button class="button button-primary" data-action="retry-news">Tentar novamente</button></section></div>`;
+    }
     if (!newsItems.length) {
       return `
         <div class="public-view news-public">
@@ -2822,6 +2847,7 @@
         ${renderRatingStars(article.id, engagement)}
         <div class="news-conversation-heading"><div><h2>Conversa da rodada</h2><p>${comments.length ? `${comments.length} ${comments.length === 1 ? "comentário publicado" : "comentários publicados"}` : "Seja o primeiro a comentar."}</p></div></div>
         <form id="news-comment-form" class="news-comment-form">
+          <div class="community-rules"><strong>Regras da conversa</strong><p>Comente sobre a partida com respeito. Não publique ataques pessoais, dados privados, discriminação ou conteúdo ofensivo. Comentários podem ser denunciados e removidos pela organização.</p></div>
           <input type="hidden" name="articleId" value="${escapeHTML(article.id)}">
           <label class="field"><span>Seu nome <small>(opcional)</small></span><input name="author" maxlength="50" autocomplete="name" placeholder="Deixe vazio para comentar como Anônimo"></label>
           <label class="field"><span>Comentário</span><textarea name="body" minlength="2" maxlength="500" required placeholder="O que você achou da partida ou da notícia?"></textarea></label>
@@ -2832,7 +2858,7 @@
           ${comments.length ? comments.map((comment) => `
             <article class="news-comment">
               <div class="news-comment-avatar" aria-hidden="true">${escapeHTML(getInitials(comment.author || "Anônimo"))}</div>
-              <div><div class="news-comment-meta"><strong>${escapeHTML(comment.author || "Anônimo")}</strong><time datetime="${escapeHTML(comment.createdAt)}">${formatRelativeTime(comment.createdAt)}</time></div><p>${escapeHTML(comment.body).replace(/\n/g, "<br>")}</p></div>
+              <div><div class="news-comment-meta"><strong>${escapeHTML(comment.author || "Anônimo")}</strong><time datetime="${escapeHTML(comment.createdAt)}">${formatRelativeTime(comment.createdAt)}</time></div><p>${escapeHTML(comment.body).replace(/\n/g, "<br>")}</p><button class="news-report-button" type="button" data-action="report-news-comment" data-comment-id="${escapeHTML(comment.id)}">Denunciar</button></div>
             </article>`).join("") : `<div class="news-comments-empty"><span aria-hidden="true">◌</span><p>A conversa ainda está silenciosa. Deixe a primeira opinião.</p></div>`}
         </div>
       </section>
@@ -2885,11 +2911,12 @@
           <div class="news-admin-item-meta"><span class="badge ${article.status === "published" ? "badge-green" : ""}">${article.status === "published" ? "Publicada" : "Rascunho"}</span>${article.featured ? '<span class="badge badge-gold">Destaque</span>' : ""}</div>
           <h3>${escapeHTML(article.title)}</h3>
           <p>${formatNewsDate(article.publishedAt)} · ${escapeHTML(article.category)} · ★ ${Number(article.ratingAverage || 0).toFixed(1)} · ${Number(article.commentCount) || 0} comentário(s)</p>
+          <p class="news-admin-history">Criada ${formatDateTime(article.createdAt)} · última alteração ${formatDateTime(article.updatedAt)} · por ${escapeHTML(article.author)}</p>
           <div class="news-admin-actions"><button class="button button-small button-ghost" data-action="edit-news" data-news-id="${escapeHTML(article.id)}">Editar</button><button class="button button-small button-ghost" data-action="moderate-news" data-news-id="${escapeHTML(article.id)}">${moderating ? "Fechar comentários" : "Comentários"}</button><button class="button button-small button-danger button-ghost" data-action="delete-news" data-news-id="${escapeHTML(article.id)}">Excluir</button></div>
         </div>
         ${moderating ? `<div class="news-admin-comments">
           <strong>Moderação</strong>
-          ${engagement ? (comments.length ? comments.map((comment) => `<div class="news-admin-comment"><div><b>${escapeHTML(comment.author)}</b><span>${escapeHTML(comment.body)}</span></div><button class="button button-small button-danger button-ghost" data-action="delete-news-comment" data-comment-id="${escapeHTML(comment.id)}" data-news-id="${escapeHTML(article.id)}">Excluir</button></div>`).join("") : "<p>Nenhum comentário nesta notícia.</p>") : "<p>Carregando comentários...</p>"}
+          ${engagement ? (comments.length ? comments.map((comment) => `<div class="news-admin-comment"><div><b>${escapeHTML(comment.author)}</b><span>${escapeHTML(comment.body)}</span>${Number(comment.reportCount) ? `<em>${Number(comment.reportCount)} denúncia(s)</em>` : ""}</div><button class="button button-small button-danger button-ghost" data-action="delete-news-comment" data-comment-id="${escapeHTML(comment.id)}" data-news-id="${escapeHTML(article.id)}">Excluir</button></div>`).join("") : "<p>Nenhum comentário nesta notícia.</p>") : "<p>Carregando comentários...</p>"}
         </div>` : ""}
       </article>
     `;
@@ -2904,6 +2931,7 @@
           <section class="card news-editor-card">
             <div class="card-header"><div><h2>${editing ? "Editar notícia" : "Nova notícia"}</h2><p>Campos com * são obrigatórios.</p></div>${editing ? `<button class="button button-small button-ghost" data-action="cancel-news-edit">Cancelar edição</button>` : ""}</div>
             <div class="card-body">
+              <div class="editorial-guidance"><strong>Publicação responsável</strong><p>Relate fatos verificáveis, resultados e contexto da competição. Evite humilhação, ataques pessoais e brincadeiras que possam expor colegas. Na descrição da imagem, diga objetivamente quem ou o que aparece.</p></div>
               <form id="news-form" class="form-grid">
                 <input type="hidden" name="id" value="${escapeHTML(editing?.id || "")}">
                 <label class="field col-8"><span>Título *</span><input name="title" maxlength="140" required value="${escapeHTML(editing?.title || "")}" placeholder="Ex.: Rodada decisiva muda a liderança"></label>
@@ -2913,12 +2941,12 @@
                 <label class="field col-6"><span>Autor *</span><input name="author" maxlength="80" required value="${escapeHTML(editing?.author || "Organização")}"></label>
                 <label class="field col-6"><span>Data de publicação *</span><input name="publishedAt" type="datetime-local" required value="${newsDateInputValue(editing?.publishedAt)}"></label>
                 <label class="field col-6"><span>Imagem de capa</span><input name="image" type="file" accept="image/jpeg,image/png,image/webp"><small class="field-help">JPG, PNG ou WebP. A imagem é otimizada antes do envio.</small></label>
-                <label class="field col-6"><span>Descrição da imagem</span><input name="imageAlt" maxlength="180" value="${escapeHTML(editing?.imageAlt || "")}" placeholder="Descreva a cena para acessibilidade"></label>
+                <label class="field col-6"><span>Descrição da imagem</span><input name="imageAlt" maxlength="180" value="${escapeHTML(editing?.imageAlt || "")}" placeholder="Ex.: Mind Rocha e Gracyanne Filth diante da mesa"><small class="field-help">Use uma descrição factual, sem julgamento sobre aparência.</small></label>
                 ${editing?.imageUrl ? `<div class="news-admin-cover col-12">${renderNewsImage(editing)}<span>Capa atual — escolha outro arquivo apenas para substituir.</span></div>` : ""}
                 <label class="field col-12"><span>Vídeo (opcional)</span><input name="videoUrl" type="url" value="${escapeHTML(editing?.videoUrl || "")}" placeholder="https://www.youtube.com/watch?v=..."><small class="field-help">Cole um link público do YouTube ou Vimeo.</small></label>
-                <label class="field col-6"><span>Status</span><select name="status"><option value="published" ${editing?.status !== "draft" ? "selected" : ""}>Publicada</option><option value="draft" ${editing?.status === "draft" ? "selected" : ""}>Rascunho</option></select></label>
+                <label class="field col-6"><span>Status</span><select name="status"><option value="draft" ${!editing || editing?.status === "draft" ? "selected" : ""}>Rascunho</option><option value="published" ${editing?.status === "published" ? "selected" : ""}>Publicada</option></select></label>
                 <label class="news-check col-6"><input name="featured" type="checkbox" ${editing?.featured ? "checked" : ""}><span><strong>Destacar na capa</strong><small>A matéria ganha a posição principal.</small></span></label>
-                <div class="news-form-actions col-12"><span id="news-form-status" role="status"></span><button class="button button-primary" type="submit">${editing ? "Salvar alterações" : "Publicar notícia"}</button></div>
+                <div class="news-form-actions col-12"><span id="news-form-status" role="status"></span><button class="button button-ghost" type="button" data-action="preview-news">Ver prévia completa</button><button class="button button-primary" type="submit">${editing ? "Salvar alterações" : "Salvar notícia"}</button></div>
               </form>
             </div>
           </section>
@@ -2958,7 +2986,7 @@
 
               <section class="settings-section">
                 <h3>Liga por pontos</h3>
-                <p>A pontuação só aumenta: vitórias somam pontos e derrotas mantêm o total atual.</p>
+                <p>Vitória +${Number(settings.league.winPoints) || 0} · derrota +0. A classificação é recalculada automaticamente.</p>
                 <div class="form-grid">
                   ${renderNumberField("Pontos por vitória", "league-winPoints", settings.league.winPoints, "col-12", true)}
                 </div>
@@ -2996,36 +3024,6 @@
           </div>
         </section>
 
-        <section class="card col-12">
-          <div class="card-header">
-            <div>
-              <h2>Referências usadas no projeto</h2>
-              <p>Fontes para liga, regras e bolão.</p>
-            </div>
-          </div>
-          <div class="card-body reference-list">
-            <a class="reference-item" href="https://www.wst.tv/news/2024/june/11/betvictor-championship-league-explainer/" target="_blank" rel="noreferrer">
-              <strong>World Snooker Tour · Championship League</strong>
-              <span>Exemplo oficial de snooker com grupos em formato round-robin e classificação por pontos.</span>
-            </a>
-            <a class="reference-item" href="https://www.fifa.com/en/tournaments/mens/worldcup/canadamexicousa2026/articles/groups-how-teams-qualify-tie-breakers" target="_blank" rel="noreferrer">
-              <strong>FIFA · Pontuação e classificação em grupos</strong>
-              <span>Referência para o modelo de três pontos por vitória e tabela classificatória.</span>
-            </a>
-            <a class="reference-item" href="https://www.wpbsa.com/rules/" target="_blank" rel="noreferrer">
-              <strong>WPBSA · Regras oficiais de snooker</strong>
-              <span>Referência para partidas divididas em frames e definição do vencedor.</span>
-            </a>
-            <a class="reference-item" href="https://sportspoule.com/en/blog/frequently-asked-questions-about-sportspoule-and-world-cup-pools" target="_blank" rel="noreferrer">
-              <strong>Sportspoule · Exemplo de bolão esportivo</strong>
-              <span>Referência para previsões por partida e ranking atualizado pelos resultados.</span>
-            </a>
-            <div class="reference-item">
-              <strong>Banco persistente do campeonato</strong>
-              <span>SQLite no uso local e PostgreSQL/Neon na publicação online.</span>
-            </div>
-          </div>
-        </section>
       </div>
     `;
   }
@@ -3066,6 +3064,19 @@
     return bracket.rounds
       .reduce((all, round) => all.concat(round.matches), [])
       .find((match) => match.id === matchId) || null;
+  }
+
+  function adjacentScoreMatch(matchId, kind, direction) {
+    const matches = kind === "league"
+      ? flattenLeagueMatches()
+      : flattenMatches().filter((match) => match.kind === kind && match.playerAId && match.playerBId);
+    const index = matches.findIndex((match) => match.id === matchId);
+    if (index < 0) return null;
+    const step = direction === "previous" ? -1 : 1;
+    for (let cursor = index + step; cursor >= 0 && cursor < matches.length; cursor += step) {
+      if (matches[cursor].playerAId && matches[cursor].playerBId) return matches[cursor];
+    }
+    return null;
   }
 
   function openScoreDialog(matchId, kind) {
@@ -3178,6 +3189,7 @@
     event.preventDefault();
     const matchId = dom.scoreMatchId.value;
     const kind = dom.scoreMatchKind.value;
+    const continuation = event.submitter?.value || "";
     const match = findMatch(matchId, kind);
     if (!match) return;
 
@@ -3214,7 +3226,9 @@
       ballsA,
       ballsB,
       winnerId,
-      playedAt: new Date().toISOString(),
+      playedAt: match.result?.playedAt || new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+      updatedBy: auth.username || "Administrador",
     };
 
     if (kind === "league") {
@@ -3236,6 +3250,40 @@
     saveState();
     dom.scoreDialog.close();
     showToast("Resultado salvo.");
+    render();
+    const adjacent = continuation ? adjacentScoreMatch(matchId, kind, continuation) : null;
+    if (adjacent) window.setTimeout(() => openScoreDialog(adjacent.id, kind), 30);
+  }
+
+  function saveQuickLeagueScore(form) {
+    if (!requireAdmin()) return;
+    const match = findMatch(form.dataset.matchId, "league");
+    if (!match) return;
+    const values = new FormData(form);
+    const winnerId = String(values.get("winner") || "");
+    const ballsA = Number(values.get("ballsA"));
+    const ballsB = Number(values.get("ballsB"));
+    const error = ![match.playerAId, match.playerBId].includes(winnerId)
+      ? "Escolha o vencedor."
+      : validateBallCounts(ballsA, ballsB);
+    if (error) {
+      showToast(error, "error");
+      return;
+    }
+    const now = new Date().toISOString();
+    const result = {
+      playerAId: match.playerAId, playerBId: match.playerBId,
+      scoreA: winnerId === match.playerAId ? 1 : 0,
+      scoreB: winnerId === match.playerBId ? 1 : 0,
+      ballsA, ballsB, winnerId, playedAt: now, updatedAt: now,
+      updatedBy: auth.username || "Administrador",
+    };
+    state.league.results[match.id] = result;
+    delete state.league.inProgress[match.id];
+    normalizeLeagueResults();
+    logActivity("score", `${playerName(winnerId)} venceu`, `${match.roundName} · lançamento rápido · ${formatBallSummary(result).toLocaleLowerCase("pt-BR")}`);
+    saveState();
+    showToast("Resultado salvo. Próxima partida liberada para lançamento.");
     render();
   }
 
@@ -3398,12 +3446,27 @@
     document.querySelector("#new-player-name")?.focus();
   }
 
-  async function editPlayer(playerId) {
+  function startPlayerEdit(playerId) {
     if (!requireAdmin()) return;
     const player = playerById(playerId);
     if (!player) return;
-    const newName = window.prompt("Novo nome do jogador:", player.name)?.trim();
-    if (!newName || newName === player.name) return;
+    ui.editingPlayerId = playerId;
+    render();
+    window.setTimeout(() => document.querySelector(".inline-player-form input")?.select(), 20);
+  }
+
+  function savePlayerEdit(form) {
+    if (!requireAdmin()) return;
+    const playerId = form.dataset.playerId;
+    const player = playerById(playerId);
+    if (!player) return;
+    const newName = String(new FormData(form).get("name") || "").trim();
+    if (!newName) return;
+    if (newName === player.name) {
+      ui.editingPlayerId = null;
+      render();
+      return;
+    }
     const duplicate = state.players.some(
       (item) =>
         item.id !== playerId &&
@@ -3415,6 +3478,7 @@
     }
     const oldName = player.name;
     player.name = newName;
+    ui.editingPlayerId = null;
     logActivity("player", `${oldName} agora é ${newName}`, "Nome atualizado sem alterar confrontos");
     saveState();
     showToast("Nome atualizado.");
@@ -3603,6 +3667,7 @@
       await readNewsFromServer();
       ui.editingNewsId = null;
       logActivity("news", payload.id ? "Notícia atualizada" : "Notícia publicada", payload.title);
+      saveState();
       showToast(payload.status === "draft" ? "Rascunho salvo." : "Notícia publicada no site.");
       render();
     } catch (error) {
@@ -3611,6 +3676,26 @@
       showToast(error.message, "error");
       button.disabled = false;
     }
+  }
+
+  async function previewNews() {
+    const form = document.querySelector("#news-form");
+    if (!form || !dom.newsPreviewDialog || !dom.newsPreviewContent) return;
+    const values = new FormData(form);
+    const body = String(values.get("body") || "").trim();
+    const file = values.get("image");
+    let imageUrl = newsItems.find((article) => article.id === String(values.get("id") || ""))?.imageUrl || "";
+    if (file instanceof File && file.size) imageUrl = await readFileAsDataUrl(file);
+    const paragraphs = body.split(/\n{2,}/).filter(Boolean).map((item) => `<p>${escapeHTML(item.replace(/\s*\n\s*/g, " "))}</p>`).join("");
+    dom.newsPreviewContent.innerHTML = `<article class="news-preview-article">
+      <span class="news-category">${escapeHTML(String(values.get("category") || "Campeonato"))}</span>
+      <h1>${escapeHTML(String(values.get("title") || "Título da notícia"))}</h1>
+      <p class="news-preview-summary">${escapeHTML(String(values.get("summary") || "O resumo aparecerá aqui."))}</p>
+      <div class="news-preview-meta">Por ${escapeHTML(String(values.get("author") || "Organização"))}</div>
+      ${imageUrl ? `<img src="${escapeHTML(imageUrl)}" alt="${escapeHTML(String(values.get("imageAlt") || ""))}">` : ""}
+      <div class="news-article-body">${paragraphs || "<p>O texto completo aparecerá aqui.</p>"}</div>
+    </article>`;
+    dom.newsPreviewDialog.showModal();
   }
 
   async function deleteNews(articleId) {
@@ -3631,6 +3716,8 @@
     }
     await readNewsFromServer();
     if (ui.editingNewsId === articleId) ui.editingNewsId = null;
+    logActivity("news", "Notícia excluída", article.title);
+    saveState();
     showToast("Notícia excluída.");
     render();
   }
@@ -3717,6 +3804,27 @@
     }
   }
 
+  async function reportNewsComment(commentId) {
+    const confirmed = await askConfirm(
+      "Denunciar este comentário?",
+      "A organização receberá a denúncia para revisar o conteúdo. Use este recurso para ataques, exposição de dados, discriminação ou conteúdo ofensivo.",
+      "Enviar denúncia",
+    );
+    if (!confirmed) return;
+    try {
+      const response = await fetch("/api/news/comments/report", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "X-News-Visitor": newsVisitorId() },
+        body: JSON.stringify({ commentId }),
+      });
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(payload.error || "Não foi possível enviar a denúncia.");
+      showToast(payload.alreadyReported ? "Este comentário já havia sido denunciado por você." : "Denúncia enviada à organização.");
+    } catch (error) {
+      showToast(error.message, "error");
+    }
+  }
+
   async function toggleNewsModeration(articleId) {
     if (ui.moderatingNewsId === articleId) {
       ui.moderatingNewsId = null;
@@ -3736,6 +3844,7 @@
       "Excluir comentário",
     );
     if (!confirmed) return;
+    const comment = newsEngagement[articleId]?.comments?.find((item) => item.id === commentId);
     const response = await fetch(`/api/news/comments?id=${encodeURIComponent(commentId)}`, { method: "DELETE" });
     const payload = await response.json().catch(() => ({}));
     if (!response.ok) {
@@ -3743,6 +3852,8 @@
       return;
     }
     await Promise.all([readNewsFromServer(), readNewsEngagement(articleId)]);
+    logActivity("news", "Comentário removido na moderação", comment ? `${comment.author}: ${comment.body.slice(0, 80)}` : articleId);
+    saveState();
     showToast("Comentário excluído.");
     render();
   }
@@ -3772,7 +3883,11 @@
         await toggleLeagueMatchLive(button.dataset.matchId);
         break;
       case "edit-player":
-        await editPlayer(button.dataset.playerId);
+        startPlayerEdit(button.dataset.playerId);
+        break;
+      case "cancel-player-edit":
+        ui.editingPlayerId = null;
+        render();
         break;
       case "delete-player":
         await deletePlayer(button.dataset.playerId);
@@ -3791,7 +3906,7 @@
         break;
       case "open-news":
         ui.selectedNewsId = button.dataset.newsId;
-        window.history.replaceState(null, "", `${window.location.pathname}${window.location.search}#news/${encodeURIComponent(ui.selectedNewsId)}`);
+        window.history.pushState(null, "", `${window.location.pathname}${window.location.search}#news/${encodeURIComponent(ui.selectedNewsId)}`);
         render();
         if (!newsEngagement[ui.selectedNewsId]) await loadAndShowNewsEngagement(ui.selectedNewsId);
         window.scrollTo({ top: 0, behavior: window.matchMedia("(prefers-reduced-motion: reduce)").matches ? "auto" : "smooth" });
@@ -3802,6 +3917,12 @@
         break;
       case "share-news":
         await shareNews();
+        break;
+      case "preview-news":
+        await previewNews();
+        break;
+      case "report-news-comment":
+        await reportNewsComment(button.dataset.commentId);
         break;
       case "edit-news":
         ui.editingNewsId = button.dataset.newsId;
@@ -3817,6 +3938,18 @@
         break;
       case "reload-news-engagement":
         await loadAndShowNewsEngagement(button.dataset.newsId);
+        break;
+      case "retry-news":
+        newsLoading = true;
+        newsError = "";
+        render();
+        try {
+          await readNewsFromServer();
+        } catch (error) {
+          newsError = "Não foi possível buscar as notícias agora.";
+        }
+        newsLoading = false;
+        render();
         break;
       case "rate-news":
         await rateNews(button.dataset.newsId, Number(button.dataset.score));
@@ -3861,6 +3994,14 @@
     if (event.target.matches("#news-comment-form")) {
       event.preventDefault();
       submitNewsComment(event.target);
+    }
+    if (event.target.matches(".inline-player-form")) {
+      event.preventDefault();
+      savePlayerEdit(event.target);
+    }
+    if (event.target.matches(".quick-score-form")) {
+      event.preventDefault();
+      saveQuickLeagueScore(event.target);
     }
   });
 
@@ -3919,6 +4060,9 @@
       closeConfirmDialog();
     });
   });
+  document.querySelectorAll("[data-close-news-preview]").forEach((button) => {
+    button.addEventListener("click", () => dom.newsPreviewDialog?.close());
+  });
   dom.scoreDialog.addEventListener("cancel", (event) => {
     event.preventDefault();
     closeScoreDialog();
@@ -3936,6 +4080,21 @@
 
   window.addEventListener("keydown", (event) => {
     if (event.key === "Escape") closeMenu();
+    if (dom.scoreDialog.open && event.ctrlKey && event.key === "Enter") {
+      event.preventDefault();
+      dom.scoreForm.requestSubmit(dom.scoreForm.querySelector('[name="score-continuation"][value="next"]'));
+    }
+  });
+
+  window.addEventListener("popstate", async () => {
+    const parts = window.location.hash.slice(1).split("/");
+    const requested = parts[0] || "dashboard";
+    const allowed = VIEW_META[requested] && !HIDDEN_VIEWS.has(requested) && (isAdmin() || ["dashboard", "league", "league-ranking", "news"].includes(requested));
+    ui.currentView = allowed ? requested : "dashboard";
+    ui.selectedNewsId = requested === "news" && parts[1] ? decodeURIComponent(parts.slice(1).join("/")) : null;
+    render();
+    if (ui.selectedNewsId && !newsEngagement[ui.selectedNewsId]) await loadAndShowNewsEngagement(ui.selectedNewsId);
+    window.scrollTo({ top: 0, behavior: "auto" });
   });
 
   initializeApp();
