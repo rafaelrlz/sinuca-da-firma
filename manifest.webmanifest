@@ -1,0 +1,39 @@
+{
+  "name": "Sinuca da Firma",
+  "short_name": "Sinuca",
+  "description": "O campeonato acontece aqui — agenda, resultados, Central ao Vivo e bolão virtual.",
+  "id": "/",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#f3f5f3",
+  "theme_color": "#0c4a36",
+  "lang": "pt-BR",
+  "orientation": "any",
+  "categories": ["sports", "social"],
+  "icons": [
+    {
+      "src": "/assets/icons/icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ],
+  "shortcuts": [
+    {
+      "name": "Central ao Vivo",
+      "short_name": "Ao vivo",
+      "url": "/#live"
+    },
+    {
+      "name": "Agenda",
+      "short_name": "Agenda",
+      "url": "/#schedule"
+    },
+    {
+      "name": "Bolão virtual",
+      "short_name": "Bolão",
+      "url": "/bolao"
+    }
+  ]
+}

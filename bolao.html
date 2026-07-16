@@ -3,36 +3,54 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-  <meta name="theme-color" content="#0c4a36">
-  <meta name="description" content="Bolão interno com fichas virtuais para as partidas do campeonato de sinuca.">
-  <title>Bolão virtual · Sinuca da Firma</title>
+  <meta name="theme-color" content="#062c21">
+  <meta name="description" content="Bolão recreativo com fichas virtuais para acompanhar o campeonato de sinuca.">
+  <title>Bolão · Sinuca da Firma</title>
+  <link rel="manifest" href="/manifest.webmanifest">
+  <link rel="icon" href="/assets/icons/icon.svg" type="image/svg+xml">
   <link rel="stylesheet" href="styles.css">
+  <link rel="stylesheet" href="bolao.css">
 </head>
 <body class="pool-page">
+  <a class="skip-link" href="#pool-content">Ir para o conteúdo</a>
+
   <header class="pool-header">
     <div class="pool-header-inner">
-      <a class="pool-brand" href="/">
+      <a class="pool-brand" href="/" aria-label="Voltar ao campeonato">
         <span class="brand-mark" aria-hidden="true">8</span>
-        <span><strong id="pool-title">Sinuca da Firma</strong><small>Bolão virtual</small></span>
+        <span><strong id="pool-title">Sinuca da Firma</strong><small>Bolão recreativo</small></span>
       </a>
       <div class="pool-header-actions">
-        <span class="pool-live-status" id="pool-live-status"><span class="status-dot"></span> Conectando</span>
-        <a class="button button-ghost" href="/">Voltar ao campeonato</a>
+        <span class="pool-user-label" id="pool-user-label" hidden></span>
+        <span class="pool-live-status" id="pool-live-status">
+          <span class="status-dot" aria-hidden="true"></span>
+          <span>Conectando</span>
+        </span>
+        <button class="pool-text-action" type="button" data-pool-action="scroll-rules">Regras</button>
+        <a class="button button-ghost" href="/">Campeonato</a>
       </div>
     </div>
   </header>
 
-  <main class="pool-main" id="pool-content">
-    <section class="card pool-loading-card">
-      <div class="empty-state">
-        <div class="empty-state-icon">◉</div>
-        <h2>Carregando o bolão</h2>
-        <p>Consultando partidas e saldo de fichas.</p>
+  <div class="pool-connection-banner" id="pool-connection-banner" role="status" hidden>
+    <span aria-hidden="true">!</span>
+    <span id="pool-connection-message">Você está offline. Os últimos dados continuam disponíveis para consulta.</span>
+  </div>
+
+  <main class="pool-main" id="pool-content" tabindex="-1">
+    <section class="pool-loading-shell" aria-labelledby="pool-loading-title" aria-busy="true">
+      <div class="pool-loading-heading">
+        <span></span>
+        <div><span></span><span></span></div>
       </div>
+      <div class="pool-loading-grid">
+        <span></span><span></span><span></span>
+      </div>
+      <p class="sr-only" id="pool-loading-title">Carregando partidas, perfil e ranking do bolão.</p>
     </section>
   </main>
 
-  <dialog class="modal modal-small" id="pool-confirm-dialog">
+  <dialog class="modal modal-small pool-dialog" id="pool-confirm-dialog" aria-labelledby="pool-confirm-title">
     <form method="dialog">
       <div class="modal-header">
         <h2 id="pool-confirm-title">Confirmar ação</h2>
@@ -41,13 +59,14 @@
       <div class="modal-body"><p id="pool-confirm-message"></p></div>
       <div class="modal-footer">
         <span class="modal-spacer"></span>
-        <button class="button button-ghost" type="button" data-close-confirm>Cancelar</button>
+        <button class="button button-ghost" type="button" data-close-confirm>Voltar</button>
         <button class="button button-danger" value="confirm" id="pool-confirm-action">Confirmar</button>
       </div>
     </form>
   </dialog>
 
   <div class="toast-region" id="pool-toast-region" aria-live="polite" aria-atomic="true"></div>
+  <script src="betting-domain.js"></script>
   <script src="bolao.js"></script>
 </body>
 </html>

@@ -127,17 +127,27 @@ Regras padrão:
 - a aposta é encerrada quando o administrador registra o placar;
 - se o confronto for recriado com outros jogadores, a aposta é anulada e as fichas são devolvidas.
 
+### Bolão 2.0
+
+O modo recreativo `refund` continua sendo o padrão. A área **Gestão do bolão** permite ao administrador configurar, sem editar código:
+
+- devolução integral, perda integral ou devolução parcial em erros;
+- multiplicador fixo ou calculado pela distribuição da turma;
+- limites, fechamento e visibilidade dos palpites;
+- suspensão de participantes e ajustes auditáveis de saldo;
+- bloqueio ou reabertura por partida;
+- prévia e reprocessamento idempotente da apuração;
+- temporadas próprias do bolão sem apagar apostas antigas.
+
+Cada palpite salva a odd aceita e um snapshot das regras. Início da partida, resultado oficial, bloqueio manual e horário configurado são validados no servidor. Cancelamentos, bloqueios, apurações, correções e anulações permanecem na linha do tempo.
+
+Na página `/bolao`, o participante encontra **Meu Bolão**, partidas abertas, prévia oficial do retorno, histórico, rankings por período, conquistas e perfil público opcional. Tudo permanece exclusivamente virtual, sem dinheiro, pagamento ou saque.
+
 O ranking do bolão usa o saldo apurado das apostas encerradas. Ele apenas sobe com acertos; erros não retiram pontos. Fichas reservadas em apostas abertas aparecem separadamente.
 
 ### Administração do bolão
 
-Quando o administrador estiver logado e abrir `/bolao`, aparecerá o botão:
-
-```text
-Zerar bolão e perfis
-```
-
-Essa ação apaga somente os perfis e apostas. Liga, jogadores e placares não são alterados.
+Quando o administrador estiver logado, a navegação lateral oferece **Gestão do bolão**. O reset destrutivo foi retirado do fluxo principal e fica desativado por padrão; temporadas e arquivamento seguro substituem a exclusão de histórico.
 
 > O bolão é exclusivamente recreativo e usa pontos virtuais. O sistema não possui depósitos, pagamentos, saque, prêmio em dinheiro ou integração financeira.
 
@@ -237,6 +247,14 @@ O JSON inclui agenda e disponibilidade, mas não contém fotos, temporadas arqui
 ## Migração da expansão
 
 Ao iniciar a aplicação, a migração idempotente `site_expansion_v1` cria as novas tabelas e colunas sem descartar registros existentes. Faça uma cópia do banco antes da primeira inicialização de uma versão nova.
+
+As migrações idempotentes `betting_v2` e `betting_v2_season_key` ampliam o bolão com temporadas, snapshots, eventos, controles ao vivo, conquistas e notificações opcionais. Apostas antigas recebem a regra recreativa, odd `2.0` e temporada lógica legada sem alterar o resultado numérico anterior.
+
+## Central ao Vivo e PWA
+
+A rota `/#live` acompanha a partida oficial em andamento, fecha palpites, mostra placar, contexto, timeline, distribuição permitida, mural e reações. Administradores registram início, pausa, retomada, notas, placar e finalização; o modo telão é somente leitura.
+
+O site possui `manifest.webmanifest` e `sw.js`. O cache offline contém apenas o shell público e arquivos estáticos. Respostas de API, sessões administrativas, tokens do bolão e conteúdo privado nunca entram no Cache Storage.
 
 Para testar com uma cópia isolada:
 

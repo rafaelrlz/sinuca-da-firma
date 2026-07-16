@@ -2,13 +2,17 @@
   "use strict";
 
   const TOKEN_KEY = "sinuca-bolao-token-v1";
-  const SYNC_INTERVAL_MS = 5000;
+  const SYNC_INTERVAL_MS = 15000;
   const DEFAULT_STAKE = 50;
+  const domain = window.BettingDomain;
 
   const dom = {
     content: document.querySelector("#pool-content"),
     title: document.querySelector("#pool-title"),
+    userLabel: document.querySelector("#pool-user-label"),
     liveStatus: document.querySelector("#pool-live-status"),
+    connectionBanner: document.querySelector("#pool-connection-banner"),
+    connectionMessage: document.querySelector("#pool-connection-message"),
     toastRegion: document.querySelector("#pool-toast-region"),
     confirmDialog: document.querySelector("#pool-confirm-dialog"),
     confirmTitle: document.querySelector("#pool-confirm-title"),
@@ -17,15 +21,27 @@
   };
 
   let appState = null;
-  let betting = {
-    profile: null,
-    leaderboard: [],
-    myBets: [],
-    settings: { initialBalance: 10000, maxStake: 500, payoutMultiplier: 2 },
-  };
+  let betting = domain.normalizeSnapshot({});
   let adminAuthenticated = false;
   let syncInProgress = false;
+  let initialLoadComplete = false;
   let confirmResolver = null;
+  let confirmTrigger = null;
+  let lastFocusedKey = "";
+  let serverPreviewTimer = 0;
+  const INITIAL_PANEL = ["matches", "history", "ranking", "performance"].includes(window.location.hash.slice(1))
+    ? window.location.hash.slice(1)
+    : "matches";
+  let ui = {
+    matchFilter: "available",
+    playerFilter: "",
+    historyFilter: "all",
+    rankingScope: "overall",
+    activePanel: INITIAL_PANEL,
+    expandedBetId: "",
+    profileEditorOpen: false,
+    matchLimit: 12,
+  };
 
   function token() {
     try {
@@ -48,9 +64,7 @@
   async function fetchJSON(url, options = {}) {
     const headers = new Headers(options.headers || {});
     if (token()) headers.set("X-Bettor-Token", token());
-    if (options.body && !headers.has("Content-Type")) {
-      headers.set("Content-Type", "application/json");
-    }
+    if (options.body && !headers.has("Content-Type")) headers.set("Content-Type", "application/json");
     const response = await fetch(url, { ...options, headers, cache: "no-store" });
     let payload = {};
     try {
@@ -59,11 +73,21 @@
       payload = {};
     }
     if (!response.ok) {
-      const failure = new Error(payload.error || `Falha HTTP ${response.status}`);
+      const failure = new Error(payload.error || payload.message || `Falha HTTP ${response.status}`);
       failure.status = response.status;
+      failure.payload = payload;
       throw failure;
     }
     return payload;
+  }
+
+  async function optionalJSON(url) {
+    try {
+      return await fetchJSON(url);
+    } catch (error) {
+      if ([404, 405, 501].includes(error.status)) return null;
+      throw error;
+    }
   }
 
   function escapeHTML(value) {
@@ -76,704 +100,956 @@
     })[character]);
   }
 
-  function formatNumber(value) {
-    return new Intl.NumberFormat("pt-BR").format(Number(value) || 0);
+  function formatNumber(value, digits = 0) {
+    return new Intl.NumberFormat("pt-BR", {
+      maximumFractionDigits: digits,
+      minimumFractionDigits: digits,
+    }).format(Number(value) || 0);
   }
 
-  function formatDateTime(value) {
-    if (!value) return "—";
+  function formatDateTime(value, fallback = "A definir") {
+    if (!value) return fallback;
     const date = new Date(value);
-    if (Number.isNaN(date.getTime())) return "—";
+    if (Number.isNaN(date.getTime())) return fallback;
     return new Intl.DateTimeFormat("pt-BR", {
       dateStyle: "short",
       timeStyle: "short",
     }).format(date);
   }
 
-  function cleanText(value, fallback = "") {
-    if (value === null || value === undefined) return fallback;
-    const text = String(value).trim();
-    return text || fallback;
+  function formatRelative(value) {
+    if (!value) return "sem horário definido";
+    const date = new Date(value);
+    if (Number.isNaN(date.getTime())) return "sem horário definido";
+    const distance = date.getTime() - Date.now();
+    if (distance <= 0) return "fechado";
+    const minutes = Math.ceil(distance / 60000);
+    if (minutes < 60) return `fecha em ${minutes} min`;
+    const hours = Math.floor(minutes / 60);
+    const remaining = minutes % 60;
+    if (hours < 24) return `fecha em ${hours}h${remaining ? ` ${remaining}min` : ""}`;
+    const days = Math.floor(hours / 24);
+    return `fecha em ${days} dia${days === 1 ? "" : "s"}`;
   }
 
-  function normalizeKey(value) {
-    return cleanText(value)
-      .normalize("NFD")
-      .replace(/[\u0300-\u036f]/g, "")
-      .toLowerCase()
-      .replace(/[\s_]+/g, "-");
-  }
-
-  function normalizeDateTime(value) {
-    const text = cleanText(value);
-    if (!text) return "";
-    const date = new Date(text);
-    return Number.isNaN(date.getTime()) ? "" : text;
-  }
-
-  function combineLegacyDateTime(entry) {
-    const date = cleanText(entry.date || entry.scheduledDate || entry.dia);
-    if (!date) return "";
-    const time = cleanText(entry.time || entry.scheduledTime || entry.horario, "00:00");
-    const offset = cleanText(entry.offset || entry.timezoneOffset || entry.utcOffset);
-    return normalizeDateTime(`${date}T${time.length === 5 ? `${time}:00` : time}${offset}`);
-  }
-
-  function normalizeProgrammingStatus(value, fallback = "unscheduled") {
-    const aliases = {
-      unscheduled: "unscheduled",
-      pending: "unscheduled",
-      pendente: "unscheduled",
-      "nao-agendado": "unscheduled",
-      scheduled: "scheduled",
-      agendado: "scheduled",
-      confirmado: "scheduled",
-      postponed: "postponed",
-      adiado: "postponed",
-      remarcado: "postponed",
-      cancelled: "cancelled",
-      canceled: "cancelled",
-      cancelado: "cancelled",
-    };
-    return aliases[normalizeKey(value)] || fallback;
-  }
-
-  function normalizeProgrammingEntry(value) {
-    const entry = typeof value === "string"
-      ? { scheduledAt: value }
-      : value && typeof value === "object" && !Array.isArray(value)
-        ? value
-        : {};
-    const scheduledAt = normalizeDateTime(
-      entry.scheduledAt ||
-      entry.dateTime ||
-      entry.startsAt ||
-      entry.start ||
-      entry.datetime ||
-      combineLegacyDateTime(entry),
-    );
-    const inferredStatus = scheduledAt ? "scheduled" : "unscheduled";
-    let status = normalizeProgrammingStatus(
-      entry.status || entry.state || entry.situacao,
-      inferredStatus,
-    );
-    if (status === "scheduled" && !scheduledAt) status = "unscheduled";
-    return {
-      scheduledAt,
-      location: cleanText(entry.location || entry.venue || entry.local),
-      status,
-      publicNote: cleanText(
-        entry.publicNote ||
-        entry.publicObservation ||
-        entry.observacaoPublica ||
-        entry.note ||
-        entry.observation ||
-        entry.observacao,
-      ),
-    };
-  }
-
-  function rawProgrammingEntries(rawProgramming) {
-    const raw = rawProgramming && typeof rawProgramming === "object" && !Array.isArray(rawProgramming)
-      ? rawProgramming
-      : {};
-    const source = raw.matches || raw.schedule || raw.scheduledMatches;
-    if (Array.isArray(source)) {
-      return source
-        .filter((entry) => entry && cleanText(entry.matchId || entry.id))
-        .map((entry) => [String(entry.matchId || entry.id), entry]);
-    }
-    if (source && typeof source === "object") return Object.entries(source);
-    const reserved = new Set([
-      "nextMatchId",
-      "next_match_id",
-      "nextMatch",
-      "featuredMatchIds",
-      "featuredMatches",
-      "highlights",
-    ]);
-    return Object.entries(raw).filter(([key]) => !reserved.has(key));
-  }
-
-  function normalizedProgramming() {
-    const league = appState?.league || {};
-    const raw = league.programming && typeof league.programming === "object"
-      ? league.programming
-      : {};
-    const leagueMatches = collectMatches().filter((match) => match.kind === "league");
-    const matchesById = new Map(leagueMatches.map((match) => [String(match.id), match]));
-    const pendingMatch = (id) => {
-      const match = matchesById.get(String(id || ""));
-      return match && !match.result ? match : null;
-    };
-    const matches = {};
-
-    rawProgrammingEntries(raw).forEach(([matchId, entry]) => {
-      const id = cleanText(matchId);
-      if (!pendingMatch(id)) return;
-      matches[id] = normalizeProgrammingEntry(entry);
-    });
-
-    const nextCandidate = cleanText(
-      raw.nextMatchId ||
-      raw.next_match_id ||
-      raw.nextMatch?.id ||
-      (typeof raw.nextMatch === "string" ? raw.nextMatch : "") ||
-      league.nextMatchId,
-    );
-    const nextMatchId = pendingMatch(nextCandidate) && matches[nextCandidate]?.status !== "cancelled"
-      ? nextCandidate
-      : null;
-
-    const featuredSource = raw.featuredMatchIds ||
-      raw.featuredMatches ||
-      raw.highlights ||
-      league.featuredMatchIds ||
-      [];
-    const featuredValues = Array.isArray(featuredSource)
-      ? featuredSource
-      : Object.keys(
-        featuredSource && typeof featuredSource === "object" ? featuredSource : {},
-      ).filter((id) => featuredSource[id]);
-    const featuredMatchIds = [];
-    featuredValues.forEach((value) => {
-      const id = cleanText(value?.id || value?.matchId || value);
-      if (
-        featuredMatchIds.length < 3 &&
-        !featuredMatchIds.includes(id) &&
-        pendingMatch(id) &&
-        matches[id]?.status !== "cancelled"
-      ) {
-        featuredMatchIds.push(id);
-      }
-    });
-
-    return { nextMatchId, featuredMatchIds, matches };
-  }
-
-  function programmingEntry(matchId, programming = normalizedProgramming()) {
-    return programming.matches[matchId] || normalizeProgrammingEntry({});
-  }
-
-  function orderedLeagueMatches(matches) {
-    const programming = normalizedProgramming();
-    const featuredOrder = new Map(
-      programming.featuredMatchIds.map((matchId, index) => [matchId, index]),
-    );
-    const rank = (match, entry) => {
-      if (match.inProgress) return 0;
-      if (programming.nextMatchId === match.id) return 1;
-      if (entry.status === "scheduled" && entry.scheduledAt) return 2;
-      if (featuredOrder.has(match.id)) return 3;
-      return 4;
-    };
-    const dateValue = (entry) => {
-      if (!entry.scheduledAt) return Number.MAX_SAFE_INTEGER;
-      const value = new Date(entry.scheduledAt).getTime();
-      return Number.isNaN(value) ? Number.MAX_SAFE_INTEGER : value;
-    };
-
-    return [...matches]
-      .filter((match) => !match.result)
-      .sort((matchA, matchB) => {
-        const entryA = programmingEntry(matchA.id, programming);
-        const entryB = programmingEntry(matchB.id, programming);
-        const rankDifference = rank(matchA, entryA) - rank(matchB, entryB);
-        if (rankDifference) return rankDifference;
-        if (rank(matchA, entryA) === 2) {
-          const dateDifference = dateValue(entryA) - dateValue(entryB);
-          if (dateDifference) return dateDifference;
-        }
-        if (rank(matchA, entryA) === 3) {
-          const featuredDifference = featuredOrder.get(matchA.id) - featuredOrder.get(matchB.id);
-          if (featuredDifference) return featuredDifference;
-        }
-        return (matchA.orderIndex || 0) - (matchB.orderIndex || 0);
-      });
-  }
-
-  function showToast(message, kind = "success") {
-    const toast = document.createElement("div");
-    toast.className = `toast${kind === "error" ? " is-error" : ""}`;
-    toast.innerHTML = `<span>${kind === "error" ? "!" : "✓"}</span><span>${escapeHTML(message)}</span>`;
-    dom.toastRegion.append(toast);
-    window.setTimeout(() => toast.remove(), 3600);
-  }
-
-  function setConnectionStatus(ok, text = "Atualizado") {
-    dom.liveStatus.classList.toggle("is-offline", !ok);
-    dom.liveStatus.innerHTML = `<span class="status-dot"></span> ${escapeHTML(text)}`;
-  }
-
-  function playersMap() {
-    return new Map(
-      (appState?.players || []).map((player) => [player.id, player.name]),
-    );
-  }
-
-  function playerName(id, fallback = "A definir") {
-    return playersMap().get(id) || fallback;
-  }
-
-  function validResult(result, playerAId, playerBId) {
-    if (!result || typeof result !== "object") return null;
-    const resultPlayerAId = result.playerAId || playerAId;
-    const resultPlayerBId = result.playerBId || playerBId;
-    if (resultPlayerAId !== playerAId || resultPlayerBId !== playerBId) return null;
-    if (![playerAId, playerBId].includes(result.winnerId)) return null;
-    return { ...result, playerAId, playerBId };
-  }
-
-  function collectMatches() {
-    const matches = [];
-    if (!appState || typeof appState !== "object") return matches;
-
-    const league = appState.league;
-    if (league?.rounds) {
-      const results = league.results || {};
-      const inProgress = league.inProgress || {};
-      let orderIndex = 0;
-      league.rounds.forEach((round, roundIndex) => {
-        (round.matches || []).forEach((match) => {
-          if (!match?.id || !match.playerAId || !match.playerBId) return;
-          const result = validResult(results[match.id], match.playerAId, match.playerBId);
-          matches.push({
-            kind: "league",
-            id: match.id,
-            roundName: `Liga · Rodada ${round.number || roundIndex + 1}`,
-            roundNumber: Number(round.number) || roundIndex + 1,
-            orderIndex,
-            playerAId: match.playerAId,
-            playerBId: match.playerBId,
-            result,
-            winnerId: result?.winnerId || null,
-            inProgress: Boolean(inProgress[match.id]) && !result,
-          });
-          orderIndex += 1;
-        });
-      });
-    }
-
-    const tournament = appState.tournament;
-    if (tournament?.bracketSize && Array.isArray(tournament.seeds)) {
-      const bracketSize = Number(tournament.bracketSize);
-      const results = tournament.results || {};
-      const rounds = [];
-      let previous = null;
-      const roundCount = Math.log2(bracketSize);
-      for (let roundIndex = 0; roundIndex < roundCount; roundIndex += 1) {
-        const matchCount = bracketSize / 2 ** (roundIndex + 1);
-        const roundNames = {
-          1: "Final",
-          2: "Semifinais",
-          4: "Quartas de final",
-          8: "Oitavas de final",
-          16: "Primeira fase",
-        };
-        const roundName = roundNames[matchCount] || `Rodada de ${matchCount * 2}`;
-        const current = [];
-        for (let matchIndex = 0; matchIndex < matchCount; matchIndex += 1) {
-          const id = `r${roundIndex}m${matchIndex}`;
-          let playerAId = null;
-          let playerBId = null;
-          if (roundIndex === 0) {
-            playerAId = tournament.seeds[matchIndex * 2] || null;
-            playerBId = tournament.seeds[matchIndex * 2 + 1] || null;
-          } else {
-            playerAId = previous?.[matchIndex * 2]?.winnerId || null;
-            playerBId = previous?.[matchIndex * 2 + 1]?.winnerId || null;
-          }
-          const result = validResult(results[id], playerAId, playerBId);
-          const automatic = roundIndex === 0 && Boolean(playerAId) !== Boolean(playerBId);
-          const winnerId = automatic
-            ? playerAId || playerBId
-            : result?.winnerId || null;
-          const loserId = result
-            ? winnerId === playerAId
-              ? playerBId
-              : playerAId
-            : null;
-          current.push({ id, playerAId, playerBId, result, winnerId, loserId });
-          if (playerAId && playerBId) {
-            matches.push({
-              kind: "bracket",
-              id,
-              roundName: `Mata-mata · ${roundName}`,
-              playerAId,
-              playerBId,
-              result,
-              winnerId: result?.winnerId || null,
-            });
-          }
-        }
-        rounds.push(current);
-        previous = current;
-      }
-
-      if (appState.settings?.thirdPlace && rounds.length >= 2) {
-        const semifinals = rounds[rounds.length - 2];
-        const playerAId = semifinals?.[0]?.loserId || null;
-        const playerBId = semifinals?.[1]?.loserId || null;
-        const result = validResult(tournament.thirdPlaceResult, playerAId, playerBId);
-        if (playerAId && playerBId) {
-          matches.push({
-            kind: "third",
-            id: "third-place",
-            roundName: "Mata-mata · Disputa de 3º lugar",
-            playerAId,
-            playerBId,
-            result,
-            winnerId: result?.winnerId || null,
-          });
-        }
-      }
-    }
-
-    return matches;
+  function initials(name) {
+    return String(name || "?").trim().split(/\s+/).slice(0, 2)
+      .map((part) => part.charAt(0).toUpperCase()).join("");
   }
 
   function matchKey(kind, id) {
     return `${kind}:${id}`;
   }
 
-  function myBetsMap() {
-    return new Map(
-      (betting.myBets || []).map((bet) => [matchKey(bet.matchKind, bet.matchId), bet]),
-    );
+  function cleanText(value, fallback = "") {
+    const text = String(value ?? "").trim();
+    return text || fallback;
   }
 
-  function currentMatchesMap() {
-    return new Map(collectMatches().map((match) => [matchKey(match.kind, match.id), match]));
+  function showToast(message, kind = "success") {
+    const toast = document.createElement("div");
+    toast.className = `toast${kind === "error" ? " is-error" : ""}`;
+    toast.innerHTML = `<span aria-hidden="true">${kind === "error" ? "!" : "✓"}</span><span>${escapeHTML(message)}</span>`;
+    dom.toastRegion.append(toast);
+    window.setTimeout(() => toast.remove(), 4200);
+  }
+
+  function setConnectionStatus(status, message) {
+    const offline = status === "offline";
+    const syncing = status === "syncing";
+    dom.liveStatus.classList.toggle("is-offline", offline);
+    dom.liveStatus.classList.toggle("is-syncing", syncing);
+    dom.liveStatus.innerHTML = `<span class="status-dot" aria-hidden="true"></span><span>${escapeHTML(message)}</span>`;
+    dom.connectionBanner.hidden = !offline;
+    if (offline) dom.connectionMessage.textContent = message;
+  }
+
+  function playersMap() {
+    return new Map((appState?.players || []).map((player) => [String(player.id), player]));
+  }
+
+  function playerName(id, fallback = "A definir") {
+    return playersMap().get(String(id))?.name || fallback;
+  }
+
+  function scheduleEntry(matchId) {
+    const programming = appState?.league?.programming || {};
+    const source = programming.matches || programming.schedule || programming.scheduledMatches || programming;
+    let entry = Array.isArray(source)
+      ? source.find((item) => String(item?.matchId || item?.id) === String(matchId))
+      : source?.[matchId];
+    if (typeof entry === "string") entry = { scheduledAt: entry };
+    entry = entry && typeof entry === "object" ? entry : {};
+    const date = entry.scheduledAt || entry.dateTime || entry.startsAt || entry.start || "";
+    return {
+      scheduledAt: date,
+      location: cleanText(entry.location || entry.venue || entry.local),
+      status: cleanText(entry.status || entry.state, date ? "scheduled" : "unscheduled"),
+      note: cleanText(entry.publicNote || entry.note || entry.observation),
+    };
+  }
+
+  function collectLegacyMatches() {
+    const league = appState?.league;
+    if (!league?.rounds) return [];
+    const results = league.results || {};
+    const inProgress = league.inProgress || {};
+    const nextMatchId = String(
+      league.programming?.nextMatchId || league.nextMatchId || "",
+    );
+    const matches = [];
+    league.rounds.forEach((round, roundIndex) => {
+      (round.matches || []).forEach((match, matchIndex) => {
+        if (!match?.id || !match.playerAId || !match.playerBId) return;
+        const schedule = scheduleEntry(match.id);
+        const result = results[match.id] || null;
+        matches.push({
+          kind: "league",
+          id: String(match.id),
+          matchKind: "league",
+          matchId: String(match.id),
+          roundName: `Liga · Rodada ${round.number || roundIndex + 1}`,
+          roundNumber: Number(round.number) || roundIndex + 1,
+          orderIndex: roundIndex * 100 + matchIndex,
+          playerAId: match.playerAId,
+          playerBId: match.playerBId,
+          result,
+          winnerId: result?.winnerId || "",
+          inProgress: Boolean(inProgress[match.id]) && !result,
+          isNext: nextMatchId === String(match.id),
+          ...schedule,
+        });
+      });
+    });
+    return matches;
+  }
+
+  function normalizeMatch(raw, legacy = null) {
+    const match = raw && typeof raw === "object" ? raw : {};
+    const base = legacy || {};
+    const normalized = {
+      ...base,
+      ...match,
+      kind: String(match.kind || match.matchKind || match.match_kind || base.kind || "league"),
+      id: String(match.id || match.matchId || match.match_id || base.id || ""),
+      roundName: cleanText(match.roundName || match.round_name || base.roundName, "Liga"),
+      playerAId: match.playerAId || match.player_a_id || base.playerAId || "",
+      playerBId: match.playerBId || match.player_b_id || base.playerBId || "",
+      scheduledAt: match.closesAt || match.closes_at || match.scheduledAt || match.scheduled_at || base.scheduledAt || "",
+      closesAt: match.closesAt || match.closes_at || match.lockAt || match.lock_at || match.scheduledAt || match.scheduled_at || base.scheduledAt || "",
+      location: cleanText(match.location || match.venue || base.location),
+      bettingStatus: match.bettingStatus || match.betting_status || "inherit",
+      inProgress: Boolean(match.inProgress ?? match.in_progress ?? base.inProgress),
+      result: match.result || base.result || null,
+      winnerId: match.winnerId || match.winner_id || base.winnerId || "",
+      isNext: Boolean(match.isNext ?? match.is_next ?? base.isNext),
+      distribution: match.distribution || match.predictionDistribution || null,
+    };
+    const lock = domain.resolveLockState(normalized, betting.rules);
+    normalized.locked = match.locked === true || match.open === false || lock.locked;
+    normalized.lockReason = match.lockReason || match.lock_reason ||
+      ({
+        result_recorded: "result",
+        in_progress: "started",
+        manual_lock: "manual",
+        disabled: "disabled",
+        scheduled_lock: "scheduled",
+      })[match.closeReason || match.close_reason] ||
+      lock.reason;
+    return normalized;
+  }
+
+  function allMatches() {
+    const legacy = collectLegacyMatches();
+    const byKey = new Map(legacy.map((match) => [matchKey(match.kind, match.id), match]));
+    (betting.matches || []).forEach((raw) => {
+      const kind = String(raw.kind || raw.matchKind || raw.match_kind || "league");
+      const id = String(raw.id || raw.matchId || raw.match_id || "");
+      if (!id) return;
+      byKey.set(matchKey(kind, id), normalizeMatch(raw, byKey.get(matchKey(kind, id))));
+    });
+    return [...byKey.values()].map((match) => normalizeMatch(match));
+  }
+
+  function betsMap() {
+    return new Map((betting.myBets || []).map((bet) => [matchKey(bet.matchKind, bet.matchId), bet]));
+  }
+
+  function preserveInteraction() {
+    const active = document.activeElement;
+    lastFocusedKey = active?.dataset?.focusKey || active?.id || "";
+    return { scrollX: window.scrollX, scrollY: window.scrollY };
+  }
+
+  function restoreInteraction(position) {
+    window.scrollTo(position.scrollX, position.scrollY);
+    if (!lastFocusedKey) return;
+    const target = dom.content.querySelector(`[data-focus-key="${CSS.escape(lastFocusedKey)}"], #${CSS.escape(lastFocusedKey)}`);
+    target?.focus({ preventScroll: true });
   }
 
   async function loadAll({ quiet = false } = {}) {
     if (syncInProgress) return;
     syncInProgress = true;
+    const position = initialLoadComplete ? preserveInteraction() : null;
+    if (!quiet) setConnectionStatus("syncing", "Atualizando");
     try {
-      const [statePayload, bettingPayload, authPayload] = await Promise.all([
+      const [stateResult, betsResult, authResult] = await Promise.all([
         fetchJSON("/api/state"),
         fetchJSON("/api/bets"),
-        fetchJSON("/api/auth"),
+        optionalJSON("/api/auth"),
       ]);
-      appState = statePayload.state || null;
-      betting = bettingPayload;
-      adminAuthenticated = Boolean(authPayload.authenticated);
-      if (appState?.settings?.title) {
-        dom.title.textContent = appState.settings.title;
-        document.title = `Bolão virtual · ${appState.settings.title}`;
+      appState = stateResult.state || stateResult || null;
+      betting = domain.normalizeSnapshot(betsResult);
+      adminAuthenticated = Boolean(authResult?.authenticated);
+
+      const expanded = await Promise.allSettled([
+        optionalJSON("/api/bets/me"),
+        optionalJSON("/api/bets/matches"),
+        optionalJSON("/api/bets/rules"),
+        token() ? optionalJSON("/api/bets/history") : Promise.resolve(null),
+      ]);
+      const me = expanded[0].status === "fulfilled" ? expanded[0].value : null;
+      const matches = expanded[1].status === "fulfilled" ? expanded[1].value : null;
+      const rules = expanded[2].status === "fulfilled" ? expanded[2].value : null;
+      const history = expanded[3].status === "fulfilled" ? expanded[3].value : null;
+      if (me) {
+        betting.profile = me.profile || me.me || me;
+        betting.achievements = me.achievements || betting.profile?.achievements || betting.achievements;
       }
-      setConnectionStatus(true, "Dados atualizados");
+      if (matches) betting.matches = matches.matches || (Array.isArray(matches) ? matches : betting.matches);
+      if (rules) {
+        betting.rules = domain.normalizeRules(rules.rules || rules);
+        betting.settings = betting.rules;
+      }
+      if (history) {
+        const rows = history.history || history.bets || history.items || (Array.isArray(history) ? history : []);
+        if (rows.length) betting.myBets = rows.map(domain.normalizeBet);
+      }
+
+      const title = appState?.settings?.title;
+      if (title) {
+        dom.title.textContent = title;
+        document.title = `Bolão · ${title}`;
+      }
+      setConnectionStatus("online", "Atualizado agora");
       render();
+      initialLoadComplete = true;
+      if (position) restoreInteraction(position);
     } catch (error) {
       console.error(error);
-      setConnectionStatus(false, "Servidor indisponível");
-      if (!appState) {
-        dom.content.innerHTML = `<section class="card pool-loading-card pool-error-card" role="alert">
-          <div class="empty-state"><div class="empty-state-icon">!</div><h2>Não foi possível abrir o bolão</h2><p>Verifique sua conexão e tente novamente. Nenhuma aposta foi alterada.</p><button class="button button-primary" type="button" data-pool-action="retry-load">Tentar novamente</button></div>
-        </section>`;
-      }
-      if (!quiet) showToast("Não foi possível carregar o bolão.", "error");
+      const hasData = initialLoadComplete && appState;
+      setConnectionStatus("offline", hasData
+        ? "Sem conexão. Exibindo os últimos dados carregados; confirmações estão pausadas."
+        : "Não foi possível conectar ao servidor.");
+      if (!hasData) renderFatalError(error);
+      else disableMutations();
+      if (!quiet) showToast("A atualização falhou. Nenhum palpite foi alterado.", "error");
     } finally {
       syncInProgress = false;
     }
   }
 
-  function render() {
-    const pendingMatches = collectMatches().filter((match) => !match.result);
-    const leagueMatches = orderedLeagueMatches(
-      pendingMatches.filter((match) => match.kind === "league"),
-    );
-    const profile = betting.profile;
-
+  function renderFatalError(error) {
     dom.content.innerHTML = `
-      <section class="pool-hero">
+      <section class="pool-system-state" role="alert">
+        <span class="pool-state-mark" aria-hidden="true">!</span>
         <div>
-          <span class="eyebrow">Bolão interno</span>
-          <h1>Aposte fichas virtuais nas disputas</h1>
-          <p>Escolha o vencedor e reserve parte do seu saldo. Acerto aumenta suas fichas; erro mantém a pontuação atual. Não há dinheiro, pagamento ou saque.</p>
+          <h1>Não foi possível abrir o bolão</h1>
+          <p>${escapeHTML(error?.message || "Verifique sua conexão e tente novamente.")} Nenhum palpite foi alterado.</p>
+          <button class="button button-primary" type="button" data-pool-action="retry-load">Tentar novamente</button>
         </div>
-        <div class="pool-rules-chip"><strong>${formatNumber(betting.settings?.initialBalance || 10000)}</strong><span>fichas iniciais</span></div>
-      </section>
+      </section>`;
+  }
 
-      ${profile ? renderProfile(profile) : renderAccessForms()}
+  function disableMutations() {
+    dom.content.querySelectorAll("form button[type='submit'], [data-pool-action='review-bet'], [data-pool-action='cancel-bet']")
+      .forEach((control) => {
+        control.disabled = true;
+        control.title = "A ação volta a ficar disponível quando a conexão for restabelecida.";
+      });
+  }
 
-      <div class="pool-layout">
-        <section class="pool-main-column">
-          ${renderBettingSection("Liga por pontos", "Todos contra todos", leagueMatches, "↻")}
-          ${profile ? renderMyBets() : ""}
-        </section>
-        <aside class="pool-side-column">
-          ${renderLeaderboard()}
+  function render() {
+    const profile = betting.profile;
+    dom.userLabel.hidden = !profile;
+    dom.userLabel.textContent = profile ? `Olá, ${profile.name}` : "";
+    dom.content.innerHTML = `
+      ${renderIntro(profile)}
+      ${profile ? renderMyPool(profile) : renderAccess()}
+      ${renderPrimaryNav(profile)}
+      <div class="pool-workspace">
+        <div class="pool-workspace-main">
+          ${renderActivePanel(profile)}
+        </div>
+        <aside class="pool-workspace-side" aria-label="Resumo do bolão">
+          ${renderQuickRanking()}
+          ${profile ? renderAchievements() : ""}
           ${renderRules()}
-          ${adminAuthenticated ? renderAdminTools() : ""}
         </aside>
       </div>
+      ${profile ? renderProfileEditor(profile) : ""}
     `;
+    updateCountdowns();
   }
 
-  function renderAccessForms() {
+  function renderIntro(profile) {
+    const open = allMatches().filter((match) => !match.result && !match.locked);
     return `
-      <section class="card pool-access-card">
-        <div class="card-header">
-          <div>
-            <h2>Entre no bolão</h2>
-            <p>O campeonato continua público; o perfil serve somente para registrar suas apostas.</p>
-          </div>
+      <section class="pool-intro" aria-labelledby="pool-page-title">
+        <div>
+          <p class="pool-context">Competição entre colegas · somente fichas virtuais</p>
+          <h1 id="pool-page-title">${profile ? "Seu próximo palpite começa aqui." : "Acompanhe, escolha e torça."}</h1>
+          <p>${profile
+            ? "Veja primeiro o que está perto de fechar. Antes de confirmar, você confere retorno, regra de perda e horário."
+            : "Entre com seu nome e PIN para registrar palpites. O campeonato e o ranking continuam abertos para consulta."}</p>
         </div>
-        <div class="pool-access-grid">
+        <div class="pool-intro-status">
+          <strong>${formatNumber(open.length)}</strong>
+          <span>${open.length === 1 ? "partida aberta" : "partidas abertas"}</span>
+          <small>Sem dinheiro, pagamento ou saque.</small>
+        </div>
+      </section>`;
+  }
+
+  function renderAccess() {
+    return `
+      <section class="pool-access" aria-labelledby="pool-access-title">
+        <div class="pool-access-copy">
+          <h2 id="pool-access-title">Entre no seu bolão</h2>
+          <p>Seu perfil guarda saldo, palpites e conquistas. O PIN tem de 4 a 8 números.</p>
+        </div>
+        <div class="pool-access-forms">
           <form class="pool-access-form" id="bettor-login-form">
             <h3>Já tenho perfil</h3>
-            <label class="field"><span>Nome</span><input name="name" autocomplete="username" maxlength="30" required></label>
-            <label class="field"><span>PIN</span><input name="pin" type="password" inputmode="numeric" autocomplete="current-password" minlength="4" maxlength="8" required></label>
-            <button class="button button-primary" type="submit">Entrar</button>
+            <label class="field"><span>Nome no ranking</span><input name="name" autocomplete="username" maxlength="30" required></label>
+            <label class="field"><span>PIN</span><input name="pin" type="password" inputmode="numeric" pattern="[0-9]{4,8}" autocomplete="current-password" required></label>
+            <button class="button button-primary" type="submit">Entrar no bolão</button>
           </form>
           <form class="pool-access-form" id="bettor-register-form">
-            <h3>Criar perfil</h3>
+            <h3>Quero participar</h3>
             <label class="field"><span>Nome no ranking</span><input name="name" autocomplete="nickname" maxlength="30" required></label>
-            <label class="field"><span>PIN de 4 a 8 números</span><input name="pin" type="password" inputmode="numeric" autocomplete="new-password" minlength="4" maxlength="8" required></label>
-            <label class="field"><span>Confirmar PIN</span><input name="pinConfirm" type="password" inputmode="numeric" autocomplete="new-password" minlength="4" maxlength="8" required></label>
-            <button class="button button-primary" type="submit">Criar e receber fichas</button>
+            <div class="pool-pin-fields">
+              <label class="field"><span>Crie um PIN</span><input name="pin" type="password" inputmode="numeric" pattern="[0-9]{4,8}" autocomplete="new-password" required></label>
+              <label class="field"><span>Repita o PIN</span><input name="pinConfirm" type="password" inputmode="numeric" pattern="[0-9]{4,8}" autocomplete="new-password" required></label>
+            </div>
+            <button class="button button-secondary" type="submit">Criar perfil</button>
           </form>
         </div>
-      </section>
-    `;
+      </section>`;
   }
 
-  function renderProfile(profile) {
-    const profit = Number(profile.profit) || 0;
+  function profilePosition(profile) {
+    const rows = betting.rankings?.overall || betting.leaderboard || [];
+    const index = rows.findIndex((row) => String(row.id) === String(profile.id));
+    return Number(profile.position || profile.rank || (index >= 0 ? index + 1 : 0));
+  }
+
+  function renderMyPool(profile) {
+    const reserved = Number(profile.reservedStake ?? profile.pendingStake ?? 0);
+    const sequence = Number(profile.currentStreak ?? profile.streak ?? 0);
+    const position = profilePosition(profile);
+    const next = prioritizedMatches().find((match) => !match.locked);
+    const variation = Number(profile.positionChange ?? profile.rankChange ?? 0);
     return `
-      <section class="card pool-profile-card">
-        <div class="pool-profile-head">
-          <div class="player-cell">
-            <span class="avatar gold">${escapeHTML(initials(profile.name))}</span>
-            <div><span class="eyebrow">Seu perfil</span><h2>${escapeHTML(profile.name)}</h2></div>
+      <section class="pool-scoreboard" aria-labelledby="my-pool-title">
+        <div class="pool-scoreboard-head">
+          <div class="pool-person">
+            <span class="avatar gold" aria-hidden="true">${escapeHTML(initials(profile.name))}</span>
+            <div>
+              <p>Meu bolão</p>
+              <h2 id="my-pool-title">${escapeHTML(profile.name)}</h2>
+            </div>
           </div>
-          <button class="button button-small button-ghost" data-pool-action="logout">Sair do bolão</button>
+          <div class="pool-scoreboard-actions">
+            <button class="button button-ghost button-small" type="button" data-pool-action="edit-profile">Perfil</button>
+            <button class="button button-ghost button-small" type="button" data-pool-action="logout">Sair</button>
+          </div>
         </div>
-        <div class="pool-profile-stats">
-          ${poolStat("Disponível", formatNumber(profile.availableBalance), "fichas para apostar")}
-          ${poolStat("Saldo apurado", formatNumber(profile.settledBalance), "sem descontar apostas abertas")}
-          ${poolStat("Resultado", `${profit > 0 ? "+" : ""}${formatNumber(profit)}`, profit >= 0 ? "lucro virtual" : "prejuízo virtual")}
-          ${poolStat("Acertos", `${formatNumber(profile.accuracy)}%`, `${profile.wins || 0} vitória(s) · ${profile.losses || 0} erro(s)`) }
+        <div class="pool-scoreboard-grid">
+          <div class="pool-rank-block">
+            <span>Posição geral</span>
+            <strong>${position ? `${position}º` : "—"}</strong>
+            <small>${variation > 0 ? `subiu ${variation}` : variation < 0 ? `caiu ${Math.abs(variation)}` : "sem mudança registrada"}</small>
+          </div>
+          <dl class="pool-balance-strip">
+            <div><dt>Disponível</dt><dd>${formatNumber(profile.availableBalance)}</dd></div>
+            <div><dt>Apurado</dt><dd>${formatNumber(profile.settledBalance)}</dd></div>
+            <div><dt>Reservado</dt><dd>${formatNumber(reserved)}</dd></div>
+            <div><dt>Acertos</dt><dd>${formatNumber(profile.accuracy)}%</dd></div>
+            <div><dt>Sequência</dt><dd>${sequence > 0 ? `${sequence} acerto${sequence === 1 ? "" : "s"}` : "—"}</dd></div>
+          </dl>
+          <div class="pool-next-action">
+            <span>Próxima ação</span>
+            ${next ? `
+              <strong>${escapeHTML(playerName(next.playerAId))} × ${escapeHTML(playerName(next.playerBId))}</strong>
+              <small data-countdown="${escapeHTML(next.closesAt)}">${escapeHTML(formatRelative(next.closesAt))}</small>
+              <button class="button button-primary" type="button" data-pool-action="open-match" data-match-id="${escapeHTML(next.id)}">Fazer palpite</button>
+            ` : `<strong>Tudo em dia</strong><small>Você não tem partidas abertas agora.</small>`}
+          </div>
         </div>
-      </section>
-    `;
+      </section>`;
   }
 
-  function poolStat(label, value, detail) {
-    return `<div class="pool-stat"><span>${escapeHTML(label)}</span><strong>${escapeHTML(value)}</strong><small>${escapeHTML(detail)}</small></div>`;
-  }
-
-  function renderBettingSection(title, subtitle, matches, icon) {
-    const liveCount = matches.filter((match) => match.inProgress).length;
-    const openCount = matches.length - liveCount;
-    const programming = normalizedProgramming();
-    const nextMatch = programming.nextMatchId
-      ? matches.find((match) => match.id === programming.nextMatchId)
-      : null;
+  function renderPrimaryNav(profile) {
+    const items = [
+      ["matches", "Partidas", allMatches().filter((match) => !match.result && !match.locked).length],
+      ["history", profile ? "Meus palpites" : "Resultados", profile ? betting.myBets.length : 0],
+      ["ranking", "Rankings", null],
+      ["performance", "Desempenho", null],
+    ];
     return `
-      <section class="card pool-matches-card">
-        <div class="card-header">
-          <div>
-            <h2>${escapeHTML(title)}</h2>
-            <p>${escapeHTML(subtitle)} · ${openCount} aposta(s) aberta(s)${liveCount ? ` · ${liveCount} em andamento` : ""}.</p>
-            <a class="button button-small button-ghost" href="/#schedule">Consultar agenda oficial</a>
+      <nav class="pool-tabs" aria-label="Áreas do bolão">
+        ${items.map(([key, label, count]) => `
+          <button type="button" aria-pressed="${ui.activePanel === key}" class="${ui.activePanel === key ? "is-active" : ""}" data-pool-action="switch-panel" data-panel="${key}">
+            ${label}${count !== null ? `<span>${formatNumber(count)}</span>` : ""}
+          </button>`).join("")}
+      </nav>`;
+  }
+
+  function renderActivePanel(profile) {
+    if (ui.activePanel === "history") return renderHistory(profile);
+    if (ui.activePanel === "ranking") return renderRankings();
+    if (ui.activePanel === "performance") return renderPerformance(profile);
+    return renderMatches(profile);
+  }
+
+  function prioritizedMatches() {
+    const myBets = betsMap();
+    return allMatches().filter((match) => !match.result).sort((a, b) => {
+      const priority = (match) => {
+        if (match.inProgress) return 0;
+        if (match.isNext) return 1;
+        if (myBets.has(matchKey(match.kind, match.id))) return 2;
+        if (match.closesAt) return 3;
+        return 4;
+      };
+      const difference = priority(a) - priority(b);
+      if (difference) return difference;
+      const dateA = new Date(a.closesAt || 8640000000000000).getTime();
+      const dateB = new Date(b.closesAt || 8640000000000000).getTime();
+      return dateA - dateB || (a.orderIndex || 0) - (b.orderIndex || 0);
+    });
+  }
+
+  function filteredMatches() {
+    const existing = betsMap();
+    return prioritizedMatches().filter((match) => {
+      if (ui.matchFilter === "available" && match.locked) return false;
+      if (ui.matchFilter === "mine" && !existing.has(matchKey(match.kind, match.id))) return false;
+      if (ui.matchFilter === "locked" && !match.locked) return false;
+      if (ui.playerFilter && ![match.playerAId, match.playerBId].includes(ui.playerFilter)) return false;
+      return true;
+    });
+  }
+
+  function renderMatches(profile) {
+    const allFilteredMatches = filteredMatches();
+    const matches = allFilteredMatches.slice(0, ui.matchLimit);
+    const players = [...playersMap().values()].sort((a, b) => a.name.localeCompare(b.name, "pt-BR"));
+    return `
+      <section class="pool-panel pool-matches-panel" aria-labelledby="matches-title">
+        <header class="pool-panel-head">
+          <div><h2 id="matches-title">Partidas</h2><p>Próximos jogos e fechamentos aparecem primeiro.</p></div>
+          <a class="button button-ghost button-small" href="/#schedule">Agenda oficial</a>
+        </header>
+        <div class="pool-filters">
+          <div class="pool-filter-chips" role="group" aria-label="Filtrar partidas por estado">
+            ${filterButton("available", "Abertas")}
+            ${filterButton("mine", "Com meu palpite")}
+            ${filterButton("locked", "Fechadas")}
+            ${filterButton("all", "Todas")}
           </div>
-          <span class="pool-section-icon" aria-hidden="true">${icon}</span>
+          <label><span class="sr-only">Filtrar por jogador</span>
+            <select id="pool-player-filter" data-focus-key="player-filter">
+              <option value="">Todos os jogadores</option>
+              ${players.map((player) => `<option value="${escapeHTML(player.id)}"${ui.playerFilter === String(player.id) ? " selected" : ""}>${escapeHTML(player.name)}</option>`).join("")}
+            </select>
+          </label>
         </div>
-        ${nextMatch ? `<p class="notice" role="status"><span aria-hidden="true">◷</span><span><strong>Próximo jogo oficial:</strong> ${escapeHTML(playerName(nextMatch.playerAId))} × ${escapeHTML(playerName(nextMatch.playerBId))}. A organização escolheu este confronto sem fechar as apostas das demais partidas.</span></p>` : ""}
         <div class="pool-match-list">
-          ${matches.length
-            ? matches.map((match) => renderBetCard(match, programming)).join("")
-            : `<div class="empty-state compact"><div class="empty-state-icon">✓</div><h3>Nenhuma disputa aberta</h3><p>Novas opções aparecem quando os confrontos forem definidos.</p></div>`}
+          ${matches.length ? matches.map((match) => renderMatch(match, profile)).join("") : renderMatchesEmpty()}
         </div>
-      </section>
-    `;
+        ${allFilteredMatches.length > matches.length ? `<div class="pool-show-more"><button class="button button-ghost" type="button" data-pool-action="show-more-matches">Mostrar mais ${Math.min(12, allFilteredMatches.length - matches.length)} partidas</button><small>${formatNumber(matches.length)} de ${formatNumber(allFilteredMatches.length)} exibidas</small></div>` : ""}
+      </section>`;
   }
 
-  function renderBetCard(match, currentProgramming = null) {
-    const existing = myBetsMap().get(matchKey(match.kind, match.id));
+  function filterButton(value, label) {
+    return `<button type="button" class="${ui.matchFilter === value ? "is-active" : ""}" aria-pressed="${ui.matchFilter === value}" data-pool-action="filter-matches" data-filter="${value}">${label}</button>`;
+  }
+
+  function renderMatchesEmpty() {
+    const messages = {
+      available: ["Nenhuma partida aberta", "Quando novos confrontos forem liberados, eles aparecerão aqui."],
+      mine: ["Nenhum palpite nesta lista", "Faça um palpite em uma partida aberta para acompanhá-lo aqui."],
+      locked: ["Nenhuma partida fechada", "Partidas em andamento ou encerradas aparecerão neste filtro."],
+      all: ["Nenhuma partida disponível", "A organização ainda não definiu novos confrontos."],
+    };
+    const [title, text] = messages[ui.matchFilter] || messages.all;
+    return `<div class="pool-empty"><span aria-hidden="true">8</span><h3>${title}</h3><p>${text}</p></div>`;
+  }
+
+  function renderMatch(match, profile) {
+    const existing = betsMap().get(matchKey(match.kind, match.id));
+    const rules = existing?.rulesSnapshot || betting.rules;
+    const stake = existing?.stake || Math.min(DEFAULT_STAKE, Number(profile?.availableBalance) || DEFAULT_STAKE);
     const selected = existing?.predictedWinnerId || "";
-    const stake = existing?.stake || Math.min(DEFAULT_STAKE, betting.profile?.availableBalance || DEFAULT_STAKE);
-    const isLive = match.kind === "league" && match.inProgress;
-    const programming = match.kind === "league"
-      ? currentProgramming || normalizedProgramming()
-      : null;
-    const entry = programming ? programmingEntry(match.id, programming) : normalizeProgrammingEntry({});
-    const isNext = programming?.nextMatchId === match.id;
-    const isFeatured = programming?.featuredMatchIds.includes(match.id);
-    const disabled = !betting.profile || isLive;
+    const preview = domain.calculatePreview({
+      stake,
+      acceptedOdds: existing?.acceptedOdds,
+      rules,
+    });
     const formId = `bet-${match.kind}-${match.id}`.replace(/[^a-zA-Z0-9_-]/g, "-");
-    const badges = [];
-    if (isLive) badges.push('<span class="badge badge-live"><i aria-hidden="true"></i>Em andamento</span>');
-    if (isNext) badges.push('<span class="badge badge-gold">Próximo jogo oficial</span>');
-    if (isFeatured) badges.push('<span class="badge badge-green">Em destaque</span>');
-    if (existing) badges.push('<span class="badge badge-gold">Sua aposta está aberta</span>');
-    else if (!isLive) badges.push('<span class="badge badge-green">Aberta</span>');
+    const unavailable = !profile || match.locked;
     return `
-      <form class="pool-match-card${isLive ? " is-live" : ""}${isNext ? " is-next" : ""}${isFeatured ? " is-featured" : ""}" data-bet-form data-kind="${escapeHTML(match.kind)}" data-match-id="${escapeHTML(match.id)}"${isNext ? ` aria-label="${escapeHTML(`Aposta em ${playerName(match.playerAId)} contra ${playerName(match.playerBId)} — próximo jogo oficial`)}"` : ""}>
-        <div class="pool-match-meta">
-          <span>${escapeHTML(match.roundName)}</span>
-          <span>${badges.join(" ")}</span>
-        </div>
-        <div class="pool-pick-grid">
-          ${renderPickOption(formId, match.playerAId, selected, disabled)}
-          <span class="pool-versus">×</span>
-          ${renderPickOption(formId, match.playerBId, selected, disabled)}
-        </div>
-        <div class="pool-wager-row">
-          <label class="pool-stake-field"><span>Fichas</span><input name="stake" type="number" min="1" max="${Number(betting.settings?.maxStake) || 500}" step="1" value="${stake}" ${disabled ? "disabled" : ""} required></label>
-          <button class="button button-primary" type="submit" ${disabled ? "disabled" : ""}>${existing ? "Atualizar aposta" : "Apostar"}</button>
-          ${existing ? `<button class="button button-small button-ghost" type="button" data-pool-action="cancel-bet" data-kind="${escapeHTML(match.kind)}" data-match-id="${escapeHTML(match.id)}" ${isLive ? "disabled" : ""}>Cancelar</button>` : ""}
-          ${match.kind === "league" ? `<a class="button button-small button-ghost" href="/#match/${encodeURIComponent(match.id)}">Ver confronto</a>` : ""}
-        </div>
-        ${renderProgrammingContext(match, entry, { isNext, isFeatured })}
-        ${isLive ? `<p class="pool-live-notice"><span aria-hidden="true">●</span><span>A partida já começou. ${existing ? "Seu palpite foi preservado, mas não pode mais ser alterado ou cancelado." : "Novos palpites estão bloqueados até o resultado."}</span></p>` : disabled ? '<p class="pool-login-hint">Crie ou acesse seu perfil acima para apostar.</p>' : ""}
-      </form>
-    `;
+      <article class="pool-match${match.isNext ? " is-next" : ""}${match.locked ? " is-locked" : ""}" id="match-${escapeHTML(match.id)}">
+        <header class="pool-match-head">
+          <div>
+            <span>${escapeHTML(match.roundName)}</span>
+            <div class="pool-match-badges">
+              ${match.isNext ? '<span class="pool-badge is-priority">Próximo oficial</span>' : ""}
+              ${match.inProgress ? '<span class="pool-badge is-live">Em andamento</span>' : ""}
+              ${existing ? '<span class="pool-badge is-mine">Seu palpite</span>' : ""}
+              ${match.locked && !match.inProgress ? '<span class="pool-badge">Fechada</span>' : ""}
+            </div>
+          </div>
+          <div class="pool-deadline">
+            <strong data-countdown="${escapeHTML(match.closesAt)}">${escapeHTML(match.locked ? lockReasonText(match) : formatRelative(match.closesAt))}</strong>
+            <small>${escapeHTML(match.closesAt ? formatDateTime(match.closesAt) : "A organização ainda definirá o horário")}</small>
+          </div>
+        </header>
+        <form data-bet-form data-kind="${escapeHTML(match.kind)}" data-match-id="${escapeHTML(match.id)}" data-form-id="${escapeHTML(formId)}">
+          <fieldset class="pool-picks"${unavailable ? " disabled" : ""}>
+            <legend class="sr-only">Escolha o vencedor de ${escapeHTML(playerName(match.playerAId))} contra ${escapeHTML(playerName(match.playerBId))}</legend>
+            ${renderPick(formId, match.playerAId, selected)}
+            <span class="pool-versus" aria-hidden="true">×</span>
+            ${renderPick(formId, match.playerBId, selected)}
+          </fieldset>
+          <div class="pool-wager">
+            <label class="pool-stake-field">
+              <span>Fichas virtuais</span>
+              <input name="stake" type="number" inputmode="numeric" min="${betting.rules.minStake}" max="${betting.rules.maxStake}" step="1" value="${preview.stake}" data-focus-key="stake-${escapeHTML(match.id)}" ${unavailable ? "disabled" : ""} required>
+            </label>
+            <div class="pool-preview-summary" aria-live="polite">
+              <span>Retorno se acertar</span>
+              <strong data-preview-return>${formatNumber(preview.potentialReturn)} fichas</strong>
+              <small data-preview-odds>multiplicador ${formatNumber(preview.acceptedOdds, 2)}×</small>
+            </div>
+            <button class="button ${existing ? "button-secondary" : "button-primary"}" type="button" data-pool-action="review-bet" ${unavailable ? "disabled" : ""}>
+              ${existing ? "Revisar alteração" : "Revisar palpite"}
+            </button>
+          </div>
+          <div class="pool-bet-review" data-bet-review hidden></div>
+          ${renderMatchContext(match, existing, profile)}
+        </form>
+      </article>`;
   }
 
-  function renderProgrammingContext(match, entry, { isNext = false, isFeatured = false } = {}) {
-    if (match.kind !== "league") return "";
-    const hasProgramming = Boolean(
-      entry.scheduledAt ||
-      entry.location ||
-      entry.publicNote ||
-      entry.status !== "unscheduled" ||
-      isNext ||
-      isFeatured,
-    );
-    if (!hasProgramming) return "";
+  function renderPick(formId, playerId, selected) {
+    const checked = String(selected) === String(playerId);
+    return `
+      <label class="pool-pick${checked ? " is-selected" : ""}">
+        <input type="radio" name="winner" value="${escapeHTML(playerId)}" ${checked ? "checked" : ""} required>
+        <span class="avatar" aria-hidden="true">${escapeHTML(initials(playerName(playerId)))}</span>
+        <span><strong>${escapeHTML(playerName(playerId))}</strong><small>${checked ? "Escolhido" : "Escolher vencedor"}</small></span>
+      </label>`;
+  }
 
-    const dateMarkup = entry.scheduledAt
-      ? `<time datetime="${escapeHTML(entry.scheduledAt)}">${escapeHTML(formatDateTime(entry.scheduledAt))}</time>`
-      : "data a definir";
-    const location = entry.location ? escapeHTML(entry.location) : "local a definir";
-    const note = entry.publicNote ? ` · <span>${escapeHTML(entry.publicNote)}</span>` : "";
-
-    if (entry.status === "postponed") {
-      return `<p class="notice notice-warning" role="status"><span aria-hidden="true">!</span><span><strong>Partida adiada.</strong> ${dateMarkup} · ${location}${note}</span></p>`;
+  function renderMatchContext(match, existing, profile) {
+    if (match.locked) {
+      return `<p class="pool-inline-state"><strong>${escapeHTML(lockReasonText(match))}.</strong> ${existing ? "Seu snapshot foi preservado e pode ser consultado em Meus palpites." : "Novos palpites e alterações não são aceitos."}</p>`;
     }
-    if (entry.status === "cancelled") {
-      return `<p class="notice notice-danger" role="status"><span aria-hidden="true">!</span><span><strong>Partida cancelada na agenda.</strong> ${dateMarkup} · ${location}${note}</span></p>`;
+    if (!profile) {
+      return '<p class="pool-inline-state">Entre no seu perfil acima para confirmar um palpite.</p>';
     }
-
-    const label = entry.status === "scheduled"
-      ? "Agenda oficial"
-      : isNext
-        ? "Próximo oficial"
-        : "Programação";
-    return `<p class="pool-login-hint"><strong>${label}:</strong> ${dateMarkup} · ${location}${note}</p>`;
+    const pieces = [];
+    if (match.location) pieces.push(match.location);
+    if (match.note) pieces.push(match.note);
+    return pieces.length
+      ? `<p class="pool-match-context"><strong>Agenda:</strong> ${escapeHTML(pieces.join(" · "))}</p>`
+      : "";
   }
 
-  function renderPickOption(formId, playerId, selected, disabled) {
-    const checked = selected === playerId ? "checked" : "";
-    return `
-      <label class="pool-pick-option ${checked ? "is-selected" : ""}">
-        <input type="radio" name="winner" value="${escapeHTML(playerId)}" ${checked} ${disabled ? "disabled" : ""} required>
-        <span class="avatar">${escapeHTML(initials(playerName(playerId)))}</span>
-        <strong>${escapeHTML(playerName(playerId))}</strong>
-        <small>Escolher vencedor</small>
-      </label>
-    `;
+  function lockReasonText(match) {
+    const reasons = {
+      result: "Resultado registrado",
+      started: "Palpites fechados: partida iniciada",
+      manual: "Palpites fechados pela organização",
+      disabled: "Palpites indisponíveis nesta partida",
+      scheduled: "Horário de fechamento atingido",
+    };
+    return reasons[match.lockReason] || "Palpites fechados";
   }
 
-  function renderMyBets() {
-    const matches = currentMatchesMap();
-    const bets = (betting.myBets || []).filter((bet) => bet.matchKind === "league");
-    return `
-      <section class="card pool-history-card">
-        <div class="card-header"><div><h2>Minhas apostas</h2><p>As fichas são apuradas automaticamente quando o administrador salva o placar.</p></div></div>
-        ${bets.length
-          ? `<div class="pool-bet-history">${bets.map((bet) => renderBetHistoryRow(bet, matches.get(matchKey(bet.matchKind, bet.matchId)))).join("")}</div>`
-          : '<div class="empty-state compact"><div class="empty-state-icon">◉</div><h3>Você ainda não apostou</h3><p>Escolha um confronto aberto acima.</p></div>'}
-      </section>
-    `;
-  }
-
-  function renderBetHistoryRow(bet, match) {
-    let statusMeta = {
-      pending: ["Aberta", "badge-gold", `-${formatNumber(bet.stake)} fichas reservadas`],
-      won: ["Ganhou", "badge-green", `+${formatNumber(bet.stake)} de lucro`],
-      lost: ["Não acertou", "", "saldo mantido"],
-      void: ["Anulada", "", "fichas devolvidas"],
-    }[bet.status] || [bet.status, "", ""];
-    if (bet.status === "pending" && match?.inProgress) {
-      statusMeta = ["Em andamento", "badge-live", `${formatNumber(bet.stake)} fichas reservadas`];
+  function renderHistory(profile) {
+    if (!profile) {
+      return `<section class="pool-panel"><div class="pool-empty"><h2>Seus palpites ficam aqui</h2><p>Entre ou crie um perfil para consultar snapshots e eventos.</p></div></section>`;
     }
-    const playerA = match?.playerAId || bet.playerAId;
-    const playerB = match?.playerBId || bet.playerBId;
+    const bets = betting.myBets.filter((bet) => {
+      if (ui.historyFilter === "all") return true;
+      return domain.statusGroup(bet.status) === ui.historyFilter;
+    });
     return `
-      <article class="pool-history-row">
-        <div><span class="badge ${statusMeta[1]}">${statusMeta[0]}</span><small>${escapeHTML(match?.roundName || `${bet.matchKind} · ${bet.matchId}`)}</small></div>
-        <div class="pool-history-match"><span>${escapeHTML(playerName(playerA, "Jogador removido"))}</span><strong>×</strong><span>${escapeHTML(playerName(playerB, "Jogador removido"))}</span></div>
-        <div><strong>${escapeHTML(playerName(bet.predictedWinnerId, "Jogador removido"))}</strong><small>seu vencedor · ${formatNumber(bet.stake)} fichas</small></div>
-        <div class="pool-history-result"><strong>${statusMeta[2]}</strong><small>${formatDateTime(bet.updatedAt)}</small></div>
-      </article>
-    `;
+      <section class="pool-panel" aria-labelledby="history-title">
+        <header class="pool-panel-head"><div><h2 id="history-title">Meus palpites</h2><p>Cada resultado mantém a regra e o multiplicador aceitos na confirmação.</p></div></header>
+        <div class="pool-filter-chips pool-history-filters" role="group" aria-label="Filtrar meus palpites">
+          ${historyFilter("all", "Todos")}
+          ${historyFilter("open", "Abertos")}
+          ${historyFilter("won", "Acertos")}
+          ${historyFilter("lost", "Erros")}
+          ${historyFilter("void", "Anulados")}
+        </div>
+        <div class="pool-history-list">
+          ${bets.length ? bets.map(renderHistoryItem).join("") : '<div class="pool-empty"><h3>Nenhum palpite neste filtro</h3><p>Escolha outro estado ou volte às partidas abertas.</p></div>'}
+        </div>
+      </section>`;
   }
 
-  function renderLeaderboard() {
+  function historyFilter(value, label) {
+    return `<button type="button" class="${ui.historyFilter === value ? "is-active" : ""}" aria-pressed="${ui.historyFilter === value}" data-pool-action="filter-history" data-filter="${value}">${label}</button>`;
+  }
+
+  function renderHistoryItem(bet) {
+    const match = allMatches().find((item) => item.id === bet.matchId && item.kind === bet.matchKind);
+    const expanded = ui.expandedBetId === bet.id;
+    const status = statusMeta(bet);
+    const latestEvent = bet.events.at?.(-1);
+    return `
+      <article class="pool-history-item">
+        <button type="button" class="pool-history-summary" aria-expanded="${expanded}" data-pool-action="toggle-timeline" data-bet-id="${escapeHTML(bet.id)}">
+          <span><span class="pool-badge ${status.className}">${status.label}</span><small>${escapeHTML(match?.roundName || bet.matchId)}</small></span>
+          <span><strong>${escapeHTML(playerName(bet.predictedWinnerId, "Jogador removido"))}</strong><small>seu vencedor · ${formatNumber(bet.stake)} fichas</small></span>
+          <span><strong>${formatNumber(bet.acceptedOdds, 2)}×</strong><small>retorno previsto ${formatNumber(bet.potentialReturn)}</small></span>
+          <span><strong>${escapeHTML(status.result)}</strong><small>${escapeHTML(formatDateTime(bet.updatedAt))}</small></span>
+          <span class="pool-disclosure" aria-hidden="true">${expanded ? "−" : "+"}</span>
+        </button>
+        ${expanded ? renderTimeline(bet, latestEvent, match) : ""}
+      </article>`;
+  }
+
+  function statusMeta(bet) {
+    const delta = Number(bet.settlementDelta || 0);
+    const map = {
+      pending: ["Aberto", "is-mine", "Aguardando fechamento"],
+      locked: ["Fechado", "", "Aguardando resultado"],
+      won: ["Acertou", "is-won", `+${formatNumber(delta || bet.potentialReturn - bet.stake)} fichas`],
+      lost: ["Não acertou", "is-lost", delta < 0 ? `${formatNumber(delta)} fichas` : "Saldo preservado"],
+      void: ["Anulado", "", "Fichas devolvidas"],
+      voided: ["Anulado", "", "Fichas devolvidas"],
+    };
+    const [label, className, result] = map[bet.status] || [bet.status, "", bet.settlementReason || "Processado"];
+    return { label, className, result };
+  }
+
+  function renderTimeline(bet, latestEvent, match) {
+    const events = bet.events.length ? bet.events : fallbackEvents(bet);
+    const cancellable = domain.statusGroup(bet.status) === "open" &&
+      !match?.locked &&
+      bet.rulesSnapshot.allowCancellation;
+    return `
+      <div class="pool-timeline-wrap">
+        <div class="pool-snapshot">
+          <h3>Snapshot aceito</h3>
+          <dl>
+            <div><dt>Multiplicador</dt><dd>${formatNumber(bet.acceptedOdds, 2)}×</dd></div>
+            <div><dt>Retorno potencial</dt><dd>${formatNumber(bet.potentialReturn)} fichas</dd></div>
+            <div><dt>Regra ao errar</dt><dd>${escapeHTML(domain.lossPolicyText(bet.rulesSnapshot))}</dd></div>
+            <div><dt>Cancelamento</dt><dd>${bet.rulesSnapshot.allowCancellation ? "Permitido enquanto aberto" : "Não permitido"}</dd></div>
+          </dl>
+          ${cancellable ? `<button class="button button-ghost button-small pool-cancel-bet" type="button" data-pool-action="cancel-bet" data-kind="${escapeHTML(bet.matchKind)}" data-match-id="${escapeHTML(bet.matchId)}">Cancelar palpite</button>` : ""}
+        </div>
+        <ol class="pool-timeline" aria-label="Linha do tempo do palpite">
+          ${events.map((event) => `
+            <li>
+              <span aria-hidden="true"></span>
+              <div><strong>${escapeHTML(eventLabel(event.eventType || event.type))}</strong><small>${escapeHTML(event.detail || event.reason || "")}</small></div>
+              <time datetime="${escapeHTML(event.createdAt || event.created_at || "")}">${escapeHTML(formatDateTime(event.createdAt || event.created_at))}</time>
+            </li>`).join("")}
+        </ol>
+        ${latestEvent ? `<p class="sr-only">Evento mais recente: ${escapeHTML(eventLabel(latestEvent.eventType || latestEvent.type))}.</p>` : ""}
+      </div>`;
+  }
+
+  function fallbackEvents(bet) {
+    const events = [{ eventType: "created", createdAt: bet.createdAt }];
+    if (bet.updatedAt && bet.updatedAt !== bet.createdAt) events.push({ eventType: "updated", createdAt: bet.updatedAt });
+    if (bet.lockedAt) events.push({ eventType: "locked", createdAt: bet.lockedAt });
+    if (bet.settledAt) events.push({ eventType: "settled", createdAt: bet.settledAt, detail: bet.settlementReason });
+    return events;
+  }
+
+  function eventLabel(type) {
+    return ({
+      created: "Palpite confirmado",
+      updated: "Palpite atualizado",
+      cancelled: "Palpite cancelado",
+      locked: "Palpite fechado",
+      reopened: "Palpite reaberto",
+      settled: "Resultado apurado",
+      resettled: "Resultado corrigido",
+      voided: "Palpite anulado",
+    })[type] || "Evento registrado";
+  }
+
+  function scopes() {
+    return [
+      ["overall", "Geral"],
+      ["round", "Rodada"],
+      ["month", "Mês"],
+      ["season", "Temporada"],
+      ["streak", "Sequência"],
+      ["underdog", "Azarões"],
+    ];
+  }
+
+  function rankingRows(scope = ui.rankingScope) {
+    return betting.rankings?.[scope] || (scope === "overall" ? betting.leaderboard : []) || [];
+  }
+
+  function renderRankings() {
+    const rows = rankingRows();
+    return `
+      <section class="pool-panel" aria-labelledby="ranking-title">
+        <header class="pool-panel-head">
+          <div><h2 id="ranking-title">Rankings</h2><p>Recortes do bolão não alteram a classificação oficial do campeonato.</p></div>
+          ${renderSeasonSelect()}
+        </header>
+        <div class="pool-ranking-scopes" role="group" aria-label="Escopo do ranking">
+          ${scopes().map(([value, label]) => `<button type="button" class="${ui.rankingScope === value ? "is-active" : ""}" aria-pressed="${ui.rankingScope === value}" data-pool-action="ranking-scope" data-scope="${value}">${label}</button>`).join("")}
+        </div>
+        ${rows.length ? renderRankingList(rows, 30, ui.rankingScope) : `
+          <div class="pool-empty"><h3>Ranking ainda sem dados</h3><p>Este recorte aparece quando houver palpites apurados suficientes.</p></div>`}
+      </section>`;
+  }
+
+  function renderSeasonSelect() {
+    const seasons = betting.seasons || [];
+    const current = betting.currentSeason || betting.activeSeason;
+    if (!seasons.length && !current) return "";
+    return `<span class="pool-season-label">${escapeHTML(current?.title || current?.name || "Temporada atual")}</span>`;
+  }
+
+  function renderRankingList(rows, limit = 8, scope = "overall") {
+    return `<ol class="pool-ranking-list">${rows.slice(0, limit).map((row, index) => {
+      const position = Number(row.position || row.rank || index + 1);
+      const isMe = String(row.id) === String(betting.profile?.id);
+      const value = scope === "streak"
+        ? `${formatNumber(row.currentStreak ?? row.streak)}`
+        : formatNumber(row.settledBalance ?? row.balance ?? row.score);
+      const secondary = scope === "streak"
+        ? "acertos seguidos"
+        : `${formatNumber(row.wins)} acertos · ${formatNumber(row.accuracy)}%`;
+      return `
+        <li class="${isMe ? "is-me" : ""}">
+          <span class="pool-position ${position <= 3 ? `is-top-${position}` : ""}">${position}</span>
+          <span class="avatar" aria-hidden="true">${escapeHTML(initials(row.name))}</span>
+          <span><strong>${escapeHTML(row.name)}${isMe ? " (você)" : ""}</strong><small>${secondary}</small></span>
+          <span><strong>${value}</strong><small>${scope === "streak" ? "sequência" : "fichas"}</small></span>
+        </li>`;
+    }).join("")}</ol>`;
+  }
+
+  function renderQuickRanking() {
     const rows = betting.leaderboard || [];
     return `
-      <section class="card pool-leaderboard-card">
-        <div class="card-header"><div><h2>Ranking do bolão</h2><p>Ordenado pelo saldo apurado.</p></div></div>
-        ${rows.length
-          ? `<div class="pool-leaderboard">${rows.map((row, index) => `
-              <div class="pool-leader-row ${betting.profile?.id === row.id ? "is-me" : ""}">
-                <span class="ranking-position pos-${index + 1}">${index + 1}</span>
-                <span class="avatar">${escapeHTML(initials(row.name))}</span>
-                <div><strong>${escapeHTML(row.name)}</strong><small>${row.wins} acerto(s) · ${row.accuracy}%${betting.profile?.id === row.id ? " · Você" : ""}</small></div>
-                <div class="pool-leader-balance"><strong>${formatNumber(row.settledBalance)}</strong><small>${Number(row.profit) >= 0 ? "+" : ""}${formatNumber(row.profit)}</small></div>
-              </div>`).join("")}</div>`
-          : '<div class="empty-state compact"><p>Ninguém entrou no bolão ainda.</p></div>'}
-      </section>
-    `;
+      <section class="pool-side-section pool-quick-ranking" aria-labelledby="quick-ranking-title">
+        <header><h2 id="quick-ranking-title">Liderança geral</h2><button type="button" data-pool-action="switch-panel" data-panel="ranking">Ver ranking</button></header>
+        ${rows.length ? renderRankingList(rows, 5, "overall") : '<p class="pool-side-empty">O ranking começa com o primeiro perfil.</p>'}
+      </section>`;
+  }
+
+  function renderPerformance(profile) {
+    if (!profile) {
+      return `<section class="pool-panel"><div class="pool-empty"><h2>Desempenho pessoal</h2><p>Entre no bolão para acompanhar sua evolução e conquistas.</p></div></section>`;
+    }
+    const history = profile.balanceHistory || betting.balanceHistory || [];
+    const max = Math.max(...history.map((point) => Number(point.balance || point.value || 0)), 1);
+    const choices = profile.choiceDistribution || betting.choiceDistribution || [];
+    const profit = Number(profile.profit || 0);
+    return `
+      <section class="pool-panel" aria-labelledby="performance-title">
+        <header class="pool-panel-head"><div><h2 id="performance-title">Seu desempenho</h2><p>Números virtuais da temporada, com o mesmo resumo disponível em texto.</p></div>${renderSeasonSelect()}</header>
+        <div class="pool-performance-summary">
+          <div><span>Resultado virtual</span><strong>${profit > 0 ? "+" : ""}${formatNumber(profit)}</strong><small>${profit >= 0 ? "acima do saldo inicial" : "abaixo do saldo inicial"}</small></div>
+          <div><span>Melhor sequência</span><strong>${formatNumber(profile.bestStreak ?? profile.currentStreak ?? 0)}</strong><small>acertos consecutivos</small></div>
+          <div><span>Palpites apurados</span><strong>${formatNumber((profile.wins || 0) + (profile.losses || 0))}</strong><small>${formatNumber(profile.accuracy)}% de acerto</small></div>
+        </div>
+        <div class="pool-chart-section">
+          <div>
+            <h3>Evolução do saldo</h3>
+            <p>${history.length ? `Do primeiro registro de ${formatNumber(history[0].balance || history[0].value)} até ${formatNumber(history.at(-1).balance || history.at(-1).value)} fichas.` : "A evolução aparece depois dos primeiros resultados."}</p>
+          </div>
+          ${history.length ? `<div class="pool-bar-chart" role="img" aria-label="Evolução do saldo: ${escapeHTML(history.map((point) => `${formatNumber(point.balance || point.value)} fichas`).join(", "))}">
+            ${history.slice(-16).map((point) => `<span style="--bar-height:${Math.max(8, Math.round(Number(point.balance || point.value || 0) / max * 100))}%"></span>`).join("")}
+          </div>` : '<div class="pool-chart-empty">Sem dados suficientes</div>'}
+        </div>
+        <div class="pool-chart-section">
+          <div><h3>Distribuição de escolhas</h3><p>${choices.length ? choices.map((item) => `${playerName(item.playerId, item.name)}: ${formatNumber(item.percent)}%`).join(" · ") : "A distribuição aparece quando houver histórico suficiente."}</p></div>
+          ${choices.length ? `<div class="pool-choice-bars">${choices.slice(0, 5).map((item) => `<div><span>${escapeHTML(playerName(item.playerId, item.name))}</span><i><b style="width:${Math.max(0, Math.min(100, Number(item.percent) || 0))}%"></b></i><strong>${formatNumber(item.percent)}%</strong></div>`).join("")}</div>` : ""}
+        </div>
+      </section>`;
+  }
+
+  function renderAchievements() {
+    const achievements = betting.achievements || [];
+    return `
+      <section class="pool-side-section" aria-labelledby="achievements-title">
+        <header><h2 id="achievements-title">Conquistas</h2><span>${achievements.length}</span></header>
+        ${achievements.length ? `<ul class="pool-achievements">${achievements.slice(0, 6).map((achievement) => `
+          <li><span aria-hidden="true">✓</span><div><strong>${escapeHTML(achievement.title || achievement.name || achievementLabel(achievement.achievementType || achievement.type))}</strong><small>${escapeHTML(achievement.description || formatDateTime(achievement.earnedAt || achievement.earned_at, ""))}</small></div></li>`).join("")}</ul>`
+          : '<p class="pool-side-empty">O primeiro palpite já abre caminho para sua primeira conquista.</p>'}
+      </section>`;
+  }
+
+  function achievementLabel(type) {
+    return ({
+      first_bet: "Primeiro palpite",
+      first_win: "Primeiro acerto",
+      streak_3: "Três acertos seguidos",
+      three_win_streak: "Três acertos seguidos",
+      streak_5: "Cinco acertos seguidos",
+      five_win_streak: "Cinco acertos seguidos",
+      underdog: "Acerto no azarão",
+      underdog_win: "Acerto no azarão",
+      round_leader: "Líder da rodada",
+      monthly_leader: "Líder do mês",
+      season_champion: "Campeão da temporada",
+    })[type] || "Conquista do bolão";
   }
 
   function renderRules() {
+    const rules = betting.rules;
     return `
-      <section class="card pool-rules-card">
-        <div class="card-header"><div><h2>Como funciona</h2></div></div>
-        <ol class="pool-rule-list">
-          <li>Todo perfil começa com <strong>${formatNumber(betting.settings?.initialBalance || 10000)} fichas virtuais</strong>.</li>
-          <li>Escolha um vencedor e aposte até <strong>${formatNumber(betting.settings?.maxStake || 500)} fichas</strong> por disputa.</li>
-          <li>Acertou: recebe <strong>2× a aposta</strong>, incluindo a devolução das fichas apostadas.</li>
-          <li>Não acertou: as fichas reservadas voltam ao saldo, sem perda de pontos.</li>
-          <li>A aposta fecha quando o placar é registrado pelo administrador.</li>
-        </ol>
-        <div class="notice notice-warning"><span>!</span><span>Este módulo é recreativo e usa somente pontos virtuais. Não registra dinheiro, pagamentos ou prêmios.</span></div>
-      </section>
-    `;
+      <section class="pool-side-section pool-rules" id="pool-rules" aria-labelledby="rules-title">
+        <header><h2 id="rules-title">Regras vigentes</h2><span>versão ${rules.schemaVersion}</span></header>
+        <dl>
+          <div><dt>Ao acertar</dt><dd>Retorno conforme o multiplicador aceito em cada palpite.</dd></div>
+          <div><dt>Ao errar</dt><dd>${escapeHTML(domain.lossPolicyText(rules))}</dd></div>
+          <div><dt>Fechamento</dt><dd>${escapeHTML(closePolicyText(rules))}</dd></div>
+          <div><dt>Limite</dt><dd>De ${formatNumber(rules.minStake)} a ${formatNumber(rules.maxStake)} fichas por partida.</dd></div>
+        </dl>
+        <p class="pool-virtual-notice"><strong>Uso recreativo.</strong> Fichas não têm valor financeiro e não podem ser compradas, sacadas ou trocadas por prêmio.</p>
+      </section>`;
   }
 
-  function renderAdminTools() {
-    return `
-      <section class="card pool-admin-card">
-        <div class="card-header"><div><h2>Administração</h2><p>Sessão administrativa detectada.</p></div></div>
-        <button class="button button-danger button-ghost" data-pool-action="reset-pool">Zerar bolão e perfis</button>
-      </section>
-    `;
+  function closePolicyText(rules) {
+    if (rules.closePolicy === "started_only") return "Quando a partida começa.";
+    if (rules.closePolicy === "manual_or_started") return "Por decisão da organização ou quando a partida começa.";
+    return rules.lockMinutesBefore
+      ? `${rules.lockMinutesBefore} min antes do horário ou quando a partida começa.`
+      : "No horário marcado ou quando a partida começa.";
   }
 
-  function initials(name) {
-    return String(name || "?")
-      .trim()
-      .split(/\s+/)
-      .slice(0, 2)
-      .map((part) => part.charAt(0).toUpperCase())
-      .join("");
+  function renderProfileEditor(profile) {
+    if (!ui.profileEditorOpen) return "";
+    const enabled = Boolean(profile.publicProfileEnabled ?? profile.public_profile_enabled);
+    return `
+      <section class="pool-profile-editor" aria-labelledby="profile-editor-title">
+        <header><div><h2 id="profile-editor-title">Perfil no bolão</h2><p>Seu perfil público começa desligado. Ative somente se quiser aparecer além do ranking.</p></div><button class="icon-button" type="button" data-pool-action="close-profile" aria-label="Fechar edição do perfil">×</button></header>
+        <form id="bettor-profile-form">
+          <label class="pool-opt-in">
+            <input type="checkbox" name="publicProfileEnabled" ${enabled ? "checked" : ""}>
+            <span><strong>Permitir perfil público</strong><small>Mostra bio, jogador favorito e conquistas. Seu PIN nunca é exibido.</small></span>
+          </label>
+          <label class="field"><span>Bio curta <small>(opcional)</small></span><textarea name="bio" maxlength="180" rows="3">${escapeHTML(profile.bio || "")}</textarea></label>
+          <label class="field"><span>Jogador favorito <small>(opcional)</small></span>
+            <select name="favoritePlayerId"><option value="">Não informar</option>${[...playersMap().values()].map((player) => `<option value="${escapeHTML(player.id)}"${String(profile.favoritePlayerId || "") === String(player.id) ? " selected" : ""}>${escapeHTML(player.name)}</option>`).join("")}</select>
+          </label>
+          <div class="pool-form-actions"><button class="button button-ghost" type="button" data-pool-action="close-profile">Cancelar</button><button class="button button-primary" type="submit">Salvar perfil</button></div>
+        </form>
+      </section>`;
+  }
+
+  function updateCountdowns() {
+    dom.content.querySelectorAll("[data-countdown]").forEach((element) => {
+      const value = element.dataset.countdown;
+      if (value) element.textContent = formatRelative(value);
+    });
+  }
+
+  function updateLocalPreview(form) {
+    const stake = Number(new FormData(form).get("stake"));
+    const existing = betsMap().get(matchKey(form.dataset.kind, form.dataset.matchId));
+    const preview = domain.calculatePreview({ stake, acceptedOdds: existing?.acceptedOdds, rules: existing?.rulesSnapshot || betting.rules });
+    form.querySelector("[data-preview-return]").textContent = `${formatNumber(preview.potentialReturn)} fichas`;
+    form.querySelector("[data-preview-odds]").textContent = `multiplicador ${formatNumber(preview.acceptedOdds, 2)}×`;
+  }
+
+  function reviewBet(form) {
+    if (!form.reportValidity()) return;
+    const data = new FormData(form);
+    const winnerId = String(data.get("winner") || "");
+    if (!winnerId) {
+      showToast("Escolha um vencedor antes de revisar.", "error");
+      return;
+    }
+    const existing = betsMap().get(matchKey(form.dataset.kind, form.dataset.matchId));
+    const preview = domain.calculatePreview({
+      stake: data.get("stake"),
+      acceptedOdds: existing?.acceptedOdds,
+      rules: existing?.rulesSnapshot || betting.rules,
+    });
+    const review = form.querySelector("[data-bet-review]");
+    review.hidden = false;
+    review.innerHTML = `
+      <div>
+        <span>Você escolheu</span>
+        <strong>${escapeHTML(playerName(winnerId))}</strong>
+        <small>${formatNumber(preview.stake)} fichas reservadas</small>
+      </div>
+      <dl>
+        <div><dt>Se acertar</dt><dd>${formatNumber(preview.potentialReturn)} fichas retornam ao saldo</dd></div>
+        <div><dt>Se não acertar</dt><dd>${escapeHTML(domain.lossPolicyText(preview.rules))}</dd></div>
+        <div><dt>Multiplicador</dt><dd>${formatNumber(preview.acceptedOdds, 2)}× na prévia; o servidor confirma o valor aceito</dd></div>
+      </dl>
+      <div class="pool-review-actions">
+        <button class="button button-ghost" type="button" data-pool-action="close-review">Continuar editando</button>
+        <button class="button button-primary" type="submit">${existing ? "Confirmar alteração" : "Confirmar palpite"}</button>
+      </div>`;
+    review.querySelector("button[type='submit']")?.focus();
+    requestServerPreview(form, review);
+  }
+
+  function requestServerPreview(form, review) {
+    window.clearTimeout(serverPreviewTimer);
+    serverPreviewTimer = window.setTimeout(async () => {
+      const data = new FormData(form);
+      const params = new URLSearchParams({
+        matchId: form.dataset.matchId,
+        winnerId: String(data.get("winner") || ""),
+        stake: String(data.get("stake") || ""),
+      });
+      try {
+        const payload = await optionalJSON(`/api/bets/preview?${params}`);
+        if (!payload || review.hidden) return;
+        const preview = domain.calculatePreview({
+          stake: payload.stake ?? data.get("stake"),
+          acceptedOdds: payload.acceptedOddsPreview ?? payload.acceptedOdds ?? payload.odds,
+          rules: payload.rules || betting.rules,
+        });
+        const odds = review.querySelector("dl div:nth-child(3) dd");
+        const returnField = review.querySelector("dl div:first-child dd");
+        if (odds) odds.textContent = `${formatNumber(preview.acceptedOdds, 2)}× será aceito na confirmação`;
+        if (returnField) returnField.textContent = `${formatNumber(payload.potentialReturn ?? preview.potentialReturn)} fichas retornam ao saldo`;
+      } catch (error) {
+        console.warn("Prévia oficial indisponível; mantendo cálculo local.", error);
+      }
+    }, 250);
   }
 
   async function submitAccess(form, mode) {
     const data = new FormData(form);
-    const name = String(data.get("name") || "").trim();
-    const pin = String(data.get("pin") || "").trim();
-    if (mode === "register" && pin !== String(data.get("pinConfirm") || "").trim()) {
+    const name = cleanText(data.get("name"));
+    const pin = cleanText(data.get("pin"));
+    if (!/^\d{4,8}$/.test(pin)) {
+      showToast("Use um PIN com 4 a 8 números.", "error");
+      return;
+    }
+    if (mode === "register" && pin !== cleanText(data.get("pinConfirm"))) {
       showToast("Os PINs não conferem.", "error");
       return;
     }
-    const button = form.querySelector('button[type="submit"]');
+    const button = form.querySelector("button[type='submit']");
     button.disabled = true;
     try {
       const payload = await fetchJSON(
@@ -791,83 +1067,121 @@
   }
 
   async function submitBet(form) {
-    const match = currentMatchesMap().get(matchKey(form.dataset.kind, form.dataset.matchId));
-    if (match?.kind === "league" && match.inProgress) {
-      showToast("A partida já começou. Este palpite não pode mais ser alterado.", "error");
-      render();
-      return;
-    }
     const data = new FormData(form);
-    const predictedWinnerId = String(data.get("winner") || "");
-    const stake = Number(data.get("stake"));
-    const button = form.querySelector('button[type="submit"]');
+    const button = form.querySelector("button[type='submit']");
     button.disabled = true;
     try {
-      betting = await fetchJSON("/api/bets/wager", {
+      const payload = await fetchJSON("/api/bets/wager", {
         method: "POST",
         body: JSON.stringify({
           matchKind: form.dataset.kind,
           matchId: form.dataset.matchId,
-          predictedWinnerId,
-          stake,
+          predictedWinnerId: String(data.get("winner") || ""),
+          stake: Number(data.get("stake")),
         }),
       });
-      showToast("Aposta virtual salva.");
+      betting = domain.normalizeSnapshot(payload);
+      showToast("Palpite confirmado com seu snapshot de regras.");
       render();
+      document.querySelector(`#match-${CSS.escape(form.dataset.matchId)}`)?.scrollIntoView({ block: "center" });
     } catch (error) {
       if (error.status === 401) {
         saveToken("");
+        showToast("Sua sessão expirou. Entre novamente para confirmar.", "error");
         await loadAll({ quiet: true });
+      } else if (error.status === 409) {
+        showConflict(form, error);
+      } else {
+        showToast(error.message, "error");
+        button.disabled = false;
       }
-      showToast(error.message, "error");
-    } finally {
+    }
+  }
+
+  function showConflict(form, error) {
+    const review = form.querySelector("[data-bet-review]");
+    review.hidden = false;
+    review.innerHTML = `
+      <div class="pool-conflict" role="alert">
+        <strong>Esta partida mudou enquanto você confirmava.</strong>
+        <p>${escapeHTML(error.message || "O horário, multiplicador ou estado de fechamento foi atualizado.")}</p>
+        <button class="button button-primary" type="button" data-pool-action="refresh-conflict">Recarregar dados</button>
+      </div>`;
+    review.querySelector("button")?.focus();
+  }
+
+  async function cancelBet(button) {
+    const confirmed = await askConfirm(
+      "Cancelar este palpite?",
+      "As fichas reservadas voltarão ao saldo conforme a regra aceita.",
+      "Cancelar palpite",
+      button,
+    );
+    if (!confirmed) return;
+    try {
+      const payload = await fetchJSON("/api/bets/cancel", {
+        method: "POST",
+        body: JSON.stringify({ matchKind: button.dataset.kind, matchId: button.dataset.matchId }),
+      });
+      betting = domain.normalizeSnapshot(payload);
+      showToast("Palpite cancelado.");
+      render();
+    } catch (error) {
+      if (error.status === 409) showToast("A partida fechou e o palpite não pode mais ser cancelado.", "error");
+      else showToast(error.message, "error");
+    }
+  }
+
+  async function saveProfile(form) {
+    const data = new FormData(form);
+    const body = {
+      publicProfileEnabled: data.get("publicProfileEnabled") === "on",
+      bio: cleanText(data.get("bio")),
+      favoritePlayerId: cleanText(data.get("favoritePlayerId")) || null,
+    };
+    const button = form.querySelector("button[type='submit']");
+    button.disabled = true;
+    try {
+      const payload = await fetchJSON("/api/bettors/profile", {
+        method: "PUT",
+        body: JSON.stringify(body),
+      });
+      betting.profile = payload.profile || payload.me || payload;
+      ui.profileEditorOpen = false;
+      showToast("Preferências do perfil salvas.");
+      render();
+    } catch (error) {
+      if ([404, 405, 501].includes(error.status)) {
+        showToast("O servidor ainda não habilitou a edição de perfil público.", "error");
+      } else {
+        showToast(error.message, "error");
+      }
       button.disabled = false;
     }
   }
 
-  async function cancelBet(kind, matchId) {
-    const match = currentMatchesMap().get(matchKey(kind, matchId));
-    if (match?.kind === "league" && match.inProgress) {
-      showToast("A partida já começou. O palpite foi preservado e não pode ser cancelado.", "error");
-      render();
-      return;
-    }
-    const confirmed = await askConfirm(
-      "Cancelar esta aposta?",
-      "As fichas reservadas voltarão ao seu saldo disponível.",
-      "Cancelar aposta",
-    );
-    if (!confirmed) return;
+  async function loadRanking(scope) {
+    ui.rankingScope = scope;
+    const position = preserveInteraction();
+    render();
+    restoreInteraction(position);
+    if (betting.rankings?.[scope]) return;
     try {
-      betting = await fetchJSON("/api/bets/cancel", {
-        method: "POST",
-        body: JSON.stringify({ matchKind: kind, matchId }),
-      });
-      showToast("Aposta cancelada.");
+      const payload = await optionalJSON(`/api/bets/leaderboard?scope=${encodeURIComponent(scope)}`);
+      if (!payload) return;
+      betting.rankings = {
+        ...betting.rankings,
+        [scope]: payload.leaderboard || payload.rows || (Array.isArray(payload) ? payload : []),
+      };
       render();
+      restoreInteraction(position);
     } catch (error) {
-      showToast(error.message, "error");
+      showToast("Não foi possível carregar este ranking.", "error");
     }
   }
 
-  async function resetPool() {
-    const confirmed = await askConfirm(
-      "Zerar todo o bolão?",
-      "Todos os perfis, PINs, fichas e apostas serão apagados. O campeonato não será alterado.",
-      "Apagar bolão",
-    );
-    if (!confirmed) return;
-    try {
-      await fetchJSON("/api/bets/reset", { method: "POST", body: JSON.stringify({ confirm: true }) });
-      saveToken("");
-      showToast("Bolão zerado.");
-      await loadAll({ quiet: true });
-    } catch (error) {
-      showToast(error.message, "error");
-    }
-  }
-
-  function askConfirm(title, message, actionLabel) {
+  function askConfirm(title, message, actionLabel, trigger = null) {
+    confirmTrigger = trigger || document.activeElement;
     dom.confirmTitle.textContent = title;
     dom.confirmMessage.textContent = message;
     dom.confirmAction.textContent = actionLabel;
@@ -879,58 +1193,108 @@
   }
 
   function closeConfirm() {
-    if (!dom.confirmDialog.open) return;
-    dom.confirmDialog.close("cancel");
+    if (dom.confirmDialog.open) dom.confirmDialog.close("cancel");
   }
 
   dom.content.addEventListener("submit", (event) => {
-    if (event.target.matches("#bettor-login-form")) {
+    const form = event.target;
+    if (form.matches("#bettor-login-form")) {
       event.preventDefault();
-      submitAccess(event.target, "login");
-      return;
-    }
-    if (event.target.matches("#bettor-register-form")) {
+      submitAccess(form, "login");
+    } else if (form.matches("#bettor-register-form")) {
       event.preventDefault();
-      submitAccess(event.target, "register");
-      return;
-    }
-    if (event.target.matches("[data-bet-form]")) {
+      submitAccess(form, "register");
+    } else if (form.matches("[data-bet-form]")) {
       event.preventDefault();
-      submitBet(event.target);
+      submitBet(form);
+    } else if (form.matches("#bettor-profile-form")) {
+      event.preventDefault();
+      saveProfile(form);
     }
   });
 
+  dom.content.addEventListener("input", (event) => {
+    const form = event.target.closest("[data-bet-form]");
+    if (!form) return;
+    if (event.target.matches("input[name='stake']")) updateLocalPreview(form);
+    const review = form.querySelector("[data-bet-review]");
+    if (review && !review.hidden) review.hidden = true;
+  });
+
   dom.content.addEventListener("change", (event) => {
-    if (!event.target.matches('[data-bet-form] input[name="winner"]')) return;
-    event.target.closest("[data-bet-form]")?.querySelectorAll(".pool-pick-option").forEach((option) => {
-      option.classList.toggle("is-selected", option.contains(event.target) && event.target.checked);
-    });
+    if (event.target.matches("#pool-player-filter")) {
+      ui.playerFilter = event.target.value;
+      ui.matchLimit = 12;
+      render();
+      return;
+    }
+    if (event.target.matches("[data-bet-form] input[name='winner']")) {
+      const form = event.target.closest("[data-bet-form]");
+      form.querySelectorAll(".pool-pick").forEach((option) => {
+        const selected = option.contains(event.target) && event.target.checked;
+        option.classList.toggle("is-selected", selected);
+        option.querySelector("small").textContent = selected ? "Escolhido" : "Escolher vencedor";
+      });
+    }
   });
 
   dom.content.addEventListener("click", (event) => {
     const button = event.target.closest("[data-pool-action]");
     if (!button) return;
     const action = button.dataset.poolAction;
-    if (action === "logout") {
+    if (action === "retry-load" || action === "refresh-conflict") loadAll();
+    else if (action === "scroll-rules") document.querySelector("#pool-rules")?.scrollIntoView({ behavior: "smooth" });
+    else if (action === "logout") {
       saveToken("");
       betting.profile = null;
       betting.myBets = [];
+      ui.profileEditorOpen = false;
       showToast("Você saiu do bolão.");
       loadAll({ quiet: true });
-    } else if (action === "cancel-bet") {
-      cancelBet(button.dataset.kind, button.dataset.matchId);
-    } else if (action === "reset-pool") {
-      resetPool();
-    } else if (action === "retry-load") {
-      loadAll();
-    }
+    } else if (action === "switch-panel") {
+      ui.activePanel = button.dataset.panel;
+      window.history.pushState({ panel: ui.activePanel }, "", `#${ui.activePanel}`);
+      render();
+      dom.content.querySelector(".pool-panel")?.focus?.();
+    } else if (action === "filter-matches") {
+      ui.matchFilter = button.dataset.filter;
+      ui.matchLimit = 12;
+      render();
+    } else if (action === "show-more-matches") {
+      ui.matchLimit += 12;
+      render();
+    } else if (action === "filter-history") {
+      ui.historyFilter = button.dataset.filter;
+      render();
+    } else if (action === "ranking-scope") {
+      loadRanking(button.dataset.scope);
+    } else if (action === "open-match") {
+      ui.activePanel = "matches";
+      window.history.pushState({ panel: "matches" }, "", "#matches");
+      ui.matchFilter = "all";
+      render();
+      document.querySelector(`#match-${CSS.escape(button.dataset.matchId)}`)?.scrollIntoView({ behavior: "smooth", block: "center" });
+    } else if (action === "review-bet") reviewBet(button.closest("[data-bet-form]"));
+    else if (action === "close-review") {
+      const review = button.closest("[data-bet-review]");
+      review.hidden = true;
+      button.closest("[data-bet-form]")?.querySelector("input:checked")?.focus();
+    } else if (action === "toggle-timeline") {
+      ui.expandedBetId = ui.expandedBetId === button.dataset.betId ? "" : button.dataset.betId;
+      render();
+      dom.content.querySelector(`[data-bet-id="${CSS.escape(button.dataset.betId)}"]`)?.focus();
+    } else if (action === "edit-profile") {
+      ui.profileEditorOpen = true;
+      render();
+      document.querySelector("#profile-editor-title")?.scrollIntoView({ behavior: "smooth" });
+    } else if (action === "close-profile") {
+      ui.profileEditorOpen = false;
+      render();
+    } else if (action === "cancel-bet") cancelBet(button);
   });
 
   document.querySelectorAll("[data-close-confirm]").forEach((button) => {
-    button.addEventListener("click", (event) => {
-      event.preventDefault();
-      closeConfirm();
-    });
+    button.addEventListener("click", closeConfirm);
   });
 
   dom.confirmDialog.addEventListener("cancel", (event) => {
@@ -939,16 +1303,39 @@
   });
 
   dom.confirmDialog.addEventListener("close", () => {
-    if (!confirmResolver) return;
-    const resolver = confirmResolver;
-    confirmResolver = null;
-    resolver(dom.confirmDialog.returnValue === "confirm");
+    if (confirmResolver) {
+      const resolver = confirmResolver;
+      confirmResolver = null;
+      resolver(dom.confirmDialog.returnValue === "confirm");
+    }
+    confirmTrigger?.focus?.();
+    confirmTrigger = null;
   });
+
+  window.addEventListener("online", () => loadAll({ quiet: true }));
+  window.addEventListener("offline", () => setConnectionStatus(
+    "offline",
+    "Você está offline. Os últimos dados continuam visíveis; confirmações estão pausadas.",
+  ));
+  window.addEventListener("storage", (event) => {
+    if (event.key === TOKEN_KEY) loadAll({ quiet: true });
+  });
+  window.addEventListener("popstate", () => {
+    const panel = window.location.hash.slice(1);
+    ui.activePanel = ["matches", "history", "ranking", "performance"].includes(panel) ? panel : "matches";
+    render();
+  });
+
+  if ("serviceWorker" in navigator && window.isSecureContext) {
+    navigator.serviceWorker.register("/sw.js", { scope: "/" }).catch((error) => {
+      console.warn("O modo offline do bolão não pôde ser ativado.", error);
+    });
+  }
 
   loadAll();
   window.setInterval(() => {
-    const active = document.activeElement;
-    if (document.hidden || active?.closest?.("form")) return;
+    updateCountdowns();
+    if (document.hidden || document.activeElement?.closest?.("form, dialog")) return;
     loadAll({ quiet: true });
   }, SYNC_INTERVAL_MS);
 })();

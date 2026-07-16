@@ -5,7 +5,14 @@
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <meta name="theme-color" content="#0c4a36">
   <meta name="description" content="Campeonato de sinuca em liga por pontos, com rodadas, classificação e bolão virtual.">
+  <meta name="application-name" content="Sinuca da Firma">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="Sinuca da Firma">
   <title>Sinuca da Firma</title>
+  <link rel="manifest" href="/manifest.webmanifest">
+  <link rel="icon" href="/assets/icons/icon.svg" type="image/svg+xml">
+  <link rel="apple-touch-icon" href="/assets/icons/icon.svg">
   <link rel="stylesheet" href="styles.css">
 </head>
 <body class="is-public" data-view="dashboard">
@@ -24,6 +31,9 @@
         <span class="nav-section-label">Competição</span>
         <button class="nav-item is-active" data-view="dashboard">
           <span aria-hidden="true">▦</span> Visão geral
+        </button>
+        <button class="nav-item" data-view="live">
+          <span aria-hidden="true">●</span> Central ao Vivo
         </button>
         <button class="nav-item" data-view="schedule">
           <span aria-hidden="true">◷</span> Agenda
@@ -44,6 +54,9 @@
           <span aria-hidden="true">◇</span> Temporadas
         </button>
         <span class="nav-section-label">Conteúdo</span>
+        <button class="nav-item" data-view="betting-admin">
+          <span aria-hidden="true">◎</span> Gestão do bolão
+        </button>
         <a class="nav-item nav-anchor" href="/bolao">
           <span aria-hidden="true">◉</span> Bolão virtual
         </a>
@@ -84,6 +97,7 @@
         </a>
         <nav class="public-nav" aria-label="Navegação pública">
           <button type="button" data-action="navigate" data-view="dashboard">Início</button>
+          <button type="button" data-action="navigate" data-view="live">Ao vivo</button>
           <button type="button" data-action="navigate" data-view="league">Liga</button>
           <button type="button" data-action="navigate" data-view="schedule">Agenda</button>
           <button type="button" data-action="navigate-public-ranking" aria-controls="public-league-ranking">Ranking</button>
@@ -112,6 +126,11 @@
           <div class="loading-grid"><span></span><span></span><span></span></div>
         </div>
       </main>
+      <div class="connection-banner" id="connection-banner" role="status" aria-live="polite" hidden>
+        <span aria-hidden="true">●</span>
+        <p><strong id="connection-banner-title">Você está offline</strong><span id="connection-banner-text">Mostrando a última versão pública disponível.</span></p>
+        <button type="button" data-action="retry-connection">Tentar novamente</button>
+      </div>
     </div>
   </div>
 

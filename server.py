@@ -51,6 +51,10 @@ BACKUP_PATH = DATA_DIR / "backup-latest.json"
 DB_LOCK = threading.Lock()
 BET_ACTION_LOCK = threading.Lock()
 
+
+class ConflictError(ValueError):
+    """Conflito de estado que pode ser resolvido recarregando o snapshot."""
+
 ADMIN_USERNAME = os.environ.get("SINUCA_ADMIN_USER", "admin")
 ADMIN_PASSWORD_OVERRIDE = os.environ.get("SINUCA_ADMIN_PASSWORD")
 DEFAULT_PASSWORD_SALT = bytes.fromhex("9c7e21a47684b6124cf059e46dd84aed")
@@ -95,6 +99,40 @@ BET_EXISTING_BALANCE_BONUS = 9_000
 BET_MAX_STAKE = 500
 BET_MAX_USERS = 200
 BET_PIN_ITERATIONS = 120_000
+BETTING_V2_MIGRATION = "betting_v2"
+BETTING_V2_SEASON_KEY_MIGRATION = "betting_v2_season_key"
+BET_LOSS_POLICIES = {"refund", "forfeit", "partial"}
+BET_ODDS_MODES = {"fixed", "crowd"}
+BET_CLOSE_POLICIES = {"started_only", "scheduled_or_started", "manual_or_started"}
+BET_VISIBILITY_POLICIES = {"after_lock", "always", "admin_only"}
+BETTING_STATUSES = {"inherit", "open", "locked", "disabled"}
+BET_SEASON_STATUSES = {"draft", "active", "archived"}
+LIVE_EVENT_TYPES = {"started", "score_updated", "note", "paused", "resumed", "finished", "corrected"}
+ACHIEVEMENT_TYPES = {
+    "first_bet", "first_win", "three_win_streak", "five_win_streak",
+    "underdog_win", "round_leader", "monthly_leader", "season_champion",
+}
+
+DEFAULT_BETTING_RULES = {
+    "schemaVersion": 1,
+    "mode": "recreational",
+    "initialBalance": BET_INITIAL_BALANCE,
+    "minStake": 1,
+    "maxStake": BET_MAX_STAKE,
+    "roundStakeLimit": None,
+    "lossPolicy": "refund",
+    "lossRefundPercent": 100,
+    "oddsMode": "fixed",
+    "fixedOdds": 2.0,
+    "minimumOdds": 1.25,
+    "maximumOdds": 4.0,
+    "minimumCrowdStake": 100,
+    "closePolicy": "scheduled_or_started",
+    "lockMinutesBefore": 0,
+    "predictionVisibility": "after_lock",
+    "allowCancellation": True,
+    "virtualOnly": True,
+}
 
 STATIC_FILES = {
     "/": "index.html",
@@ -111,6 +149,10 @@ STATIC_FILES = {
     "/bolao/": "bolao.html",
     "/bolao.html": "bolao.html",
     "/bolao.js": "bolao.js",
+    "/betting-domain.js": "betting-domain.js",
+    "/bolao.css": "bolao.css",
+    "/manifest.webmanifest": "manifest.webmanifest",
+    "/sw.js": "sw.js",
 }
 
 
@@ -200,6 +242,314 @@ def migrate_bettor_initial_balance(connection: object) -> bool:
         (BET_EXISTING_BALANCE_BONUS, utc_now()),
     )
     return True
+
+
+def database_column_names(connection: object, table_name: str) -> set[str]:
+    if IS_POSTGRES:
+        rows = connection.execute(
+            "SELECT column_name FROM information_schema.columns WHERE table_name = ?",
+            (table_name,),
+        ).fetchall()
+        return {str(row["column_name"]) for row in rows}
+    return {
+        str(row["name"])
+        for row in connection.execute(f"PRAGMA table_info({table_name})").fetchall()
+    }
+
+
+def add_columns(connection: object, table_name: str, columns: tuple[tuple[str, str], ...]) -> None:
+    existing = database_column_names(connection, table_name)
+    for column_name, definition in columns:
+        if column_name not in existing:
+            connection.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {definition}")
+
+
+def normalize_betting_rules(value: object) -> dict[str, object]:
+    incoming = value if isinstance(value, dict) else {}
+    rules = dict(DEFAULT_BETTING_RULES)
+    for key in rules:
+        if key in incoming:
+            rules[key] = incoming[key]
+    if rules["lossPolicy"] not in BET_LOSS_POLICIES:
+        raise ValueError("Política de perda inválida.")
+    if rules["oddsMode"] not in BET_ODDS_MODES:
+        raise ValueError("Modo de odds inválido.")
+    if rules["closePolicy"] not in BET_CLOSE_POLICIES:
+        raise ValueError("Política de fechamento inválida.")
+    if rules["predictionVisibility"] not in BET_VISIBILITY_POLICIES:
+        raise ValueError("Política de visibilidade inválida.")
+    for key in ("initialBalance", "minStake", "maxStake", "minimumCrowdStake", "lockMinutesBefore"):
+        try:
+            rules[key] = int(rules[key])
+        except (TypeError, ValueError) as error:
+            raise ValueError(f"O campo {key} deve ser inteiro.") from error
+    for key in ("fixedOdds", "minimumOdds", "maximumOdds", "lossRefundPercent"):
+        try:
+            rules[key] = float(rules[key])
+        except (TypeError, ValueError) as error:
+            raise ValueError(f"O campo {key} deve ser numérico.") from error
+    if rules["minStake"] < 1 or rules["maxStake"] < rules["minStake"]:
+        raise ValueError("Os limites de fichas são inválidos.")
+    if not 0 <= float(rules["lossRefundPercent"]) <= 100:
+        raise ValueError("O percentual de devolução deve ficar entre 0 e 100.")
+    if float(rules["minimumOdds"]) < 1 or float(rules["maximumOdds"]) < float(rules["minimumOdds"]):
+        raise ValueError("Os limites de odds são inválidos.")
+    rules["fixedOdds"] = max(
+        float(rules["minimumOdds"]),
+        min(float(rules["maximumOdds"]), float(rules["fixedOdds"])),
+    )
+    rules["schemaVersion"] = 1
+    rules["virtualOnly"] = True
+    rules["allowCancellation"] = bool(rules["allowCancellation"])
+    if rules["lossPolicy"] == "refund":
+        rules["lossRefundPercent"] = 100.0
+    elif rules["lossPolicy"] == "forfeit":
+        rules["lossRefundPercent"] = 0.0
+    return rules
+
+
+def migrate_betting_v2(connection: object, state: dict[str, object] | None = None) -> bool:
+    """Migração repetível do bolão 2.0, preservando a equivalência do legado."""
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS schema_migrations (
+            migration_id TEXT PRIMARY KEY,
+            applied_at TEXT NOT NULL
+        )
+        """
+    )
+    marker = connection.execute(
+        "SELECT 1 FROM schema_migrations WHERE migration_id = ?",
+        (BETTING_V2_MIGRATION,),
+    ).fetchone()
+    legacy_rules = normalize_betting_rules(DEFAULT_BETTING_RULES)
+    rules_json = json.dumps(legacy_rules, ensure_ascii=False, separators=(",", ":"))
+    now = utc_now()
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS betting_seasons (
+            id TEXT PRIMARY KEY, title TEXT NOT NULL, status TEXT NOT NULL,
+            starts_at TEXT, ends_at TEXT, initial_balance INTEGER NOT NULL,
+            rules_json TEXT NOT NULL, created_by TEXT NOT NULL,
+            created_at TEXT NOT NULL, updated_at TEXT NOT NULL, archived_at TEXT
+        )
+        """
+    )
+    add_columns(connection, "betting_seasons", (("snapshot_json", "TEXT"),))
+    add_columns(connection, "bets", (
+        ("season_id", "TEXT"),
+        ("accepted_odds", "DOUBLE PRECISION"),
+        ("potential_return", "INTEGER"),
+        ("rules_snapshot_json", "TEXT"),
+        ("locked_at", "TEXT"),
+        ("settled_at", "TEXT"),
+        ("settlement_status", "TEXT NOT NULL DEFAULT 'pending'"),
+        ("settlement_delta", "INTEGER NOT NULL DEFAULT 0"),
+        ("settlement_reason", "TEXT"),
+        ("void_reason", "TEXT"),
+    ))
+    season_key_marker = connection.execute(
+        "SELECT 1 FROM schema_migrations WHERE migration_id = ?",
+        (BETTING_V2_SEASON_KEY_MIGRATION,),
+    ).fetchone()
+    if season_key_marker is None:
+        if IS_POSTGRES:
+            constraints = connection.execute(
+                """
+                SELECT constraint_name FROM information_schema.table_constraints
+                WHERE table_name = 'bets' AND constraint_type = 'UNIQUE'
+                """
+            ).fetchall()
+            for constraint in constraints:
+                name = str(constraint["constraint_name"])
+                columns = connection.execute(
+                    """
+                    SELECT column_name FROM information_schema.constraint_column_usage
+                    WHERE table_name = 'bets' AND constraint_name = ?
+                    """,
+                    (name,),
+                ).fetchall()
+                names = {str(item["column_name"]) for item in columns}
+                if names == {"bettor_id", "match_kind", "match_id"}:
+                    safe_name = name.replace('"', '""')
+                    connection.execute(f'ALTER TABLE bets DROP CONSTRAINT "{safe_name}"')
+        else:
+            connection.execute(
+                """
+                CREATE TABLE bets_season_key (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    bettor_id TEXT NOT NULL, match_kind TEXT NOT NULL, match_id TEXT NOT NULL,
+                    player_a_id TEXT NOT NULL, player_b_id TEXT NOT NULL,
+                    predicted_winner_id TEXT NOT NULL, stake INTEGER NOT NULL,
+                    created_at TEXT NOT NULL, updated_at TEXT NOT NULL, season_id TEXT,
+                    accepted_odds DOUBLE PRECISION, potential_return INTEGER,
+                    rules_snapshot_json TEXT, locked_at TEXT, settled_at TEXT,
+                    settlement_status TEXT NOT NULL DEFAULT 'pending',
+                    settlement_delta INTEGER NOT NULL DEFAULT 0,
+                    settlement_reason TEXT, void_reason TEXT,
+                    UNIQUE (bettor_id, match_kind, match_id, season_id),
+                    FOREIGN KEY (bettor_id) REFERENCES bettors(id) ON DELETE CASCADE
+                )
+                """
+            )
+            connection.execute(
+                """
+                INSERT INTO bets_season_key SELECT
+                    id, bettor_id, match_kind, match_id, player_a_id, player_b_id,
+                    predicted_winner_id, stake, created_at, updated_at, season_id,
+                    accepted_odds, potential_return, rules_snapshot_json, locked_at,
+                    settled_at, settlement_status, settlement_delta, settlement_reason, void_reason
+                FROM bets
+                """
+            )
+            connection.execute("DROP TABLE bets")
+            connection.execute("ALTER TABLE bets_season_key RENAME TO bets")
+        connection.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_bets_season_match ON bets(bettor_id, match_kind, match_id, season_id)"
+        )
+        connection.execute(
+            "INSERT INTO schema_migrations (migration_id, applied_at) VALUES (?, ?)",
+            (BETTING_V2_SEASON_KEY_MIGRATION, now),
+        )
+    add_columns(connection, "bettors", (
+        ("public_profile_enabled", "INTEGER NOT NULL DEFAULT 0"),
+        ("bio", "TEXT NOT NULL DEFAULT ''"),
+        ("favorite_player_id", "TEXT"),
+        ("avatar_data", "BYTEA" if IS_POSTGRES else "BLOB"),
+        ("avatar_type", "TEXT"),
+        ("last_seen_at", "TEXT"),
+    ))
+    bet_event_id = "BIGSERIAL PRIMARY KEY" if IS_POSTGRES else "INTEGER PRIMARY KEY AUTOINCREMENT"
+    connection.execute(f"""
+        CREATE TABLE IF NOT EXISTS bet_events (
+            id {bet_event_id}, bet_id BIGINT NOT NULL, bettor_id TEXT NOT NULL,
+            event_type TEXT NOT NULL, detail_json TEXT NOT NULL DEFAULT '{{}}',
+            actor_type TEXT NOT NULL, actor_id TEXT, created_at TEXT NOT NULL
+        )
+    """)
+    connection.execute(f"""
+        CREATE TABLE IF NOT EXISTS bettor_balance_events (
+            id {bet_event_id}, bettor_id TEXT NOT NULL, season_id TEXT,
+            event_type TEXT NOT NULL, amount INTEGER NOT NULL, reason TEXT NOT NULL,
+            created_by TEXT NOT NULL, created_at TEXT NOT NULL
+        )
+    """)
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS bettor_achievements (
+            id TEXT PRIMARY KEY, bettor_id TEXT NOT NULL, season_id TEXT,
+            achievement_type TEXT NOT NULL, context_key TEXT NOT NULL DEFAULT '',
+            detail_json TEXT NOT NULL DEFAULT '{}', earned_at TEXT NOT NULL,
+            UNIQUE (bettor_id, season_id, achievement_type, context_key)
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS match_betting_controls (
+            match_kind TEXT NOT NULL, match_id TEXT NOT NULL,
+            betting_status TEXT NOT NULL DEFAULT 'inherit', lock_at TEXT, note TEXT,
+            updated_by TEXT NOT NULL, updated_at TEXT NOT NULL,
+            PRIMARY KEY (match_kind, match_id)
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS match_live_events (
+            id TEXT PRIMARY KEY, match_kind TEXT NOT NULL, match_id TEXT NOT NULL,
+            event_type TEXT NOT NULL, payload_json TEXT NOT NULL DEFAULT '{}',
+            created_by TEXT NOT NULL, created_at TEXT NOT NULL
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS notification_subscriptions (
+            id TEXT PRIMARY KEY, visitor_id TEXT NOT NULL, bettor_id TEXT,
+            endpoint TEXT NOT NULL UNIQUE, subscription_json TEXT NOT NULL,
+            preferences_json TEXT NOT NULL DEFAULT '{}', active INTEGER NOT NULL DEFAULT 1,
+            created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+        )
+        """
+    )
+    connection.execute(f"""
+        CREATE TABLE IF NOT EXISTS betting_rate_events (
+            id {bet_event_id}, client_key TEXT NOT NULL, action TEXT NOT NULL,
+            occurred_at DOUBLE PRECISION NOT NULL
+        )
+    """)
+    add_columns(connection, "community_posts", (
+        ("parent_id", "TEXT"),
+        ("pinned", "INTEGER NOT NULL DEFAULT 0"),
+        ("edited_at", "TEXT"),
+        ("match_id", "TEXT"),
+        ("season_id", "TEXT"),
+    ))
+    connection.execute(
+        """
+        INSERT INTO betting_seasons (
+            id, title, status, starts_at, ends_at, initial_balance, rules_json,
+            created_by, created_at, updated_at, archived_at
+        ) VALUES ('legacy-current', 'Temporada atual', 'active', NULL, NULL, ?, ?,
+                  'system', ?, ?, NULL)
+        ON CONFLICT(id) DO NOTHING
+        """,
+        (BET_INITIAL_BALANCE, rules_json, now, now),
+    )
+    active_rows = connection.execute(
+        "SELECT id FROM betting_seasons WHERE status = 'active' ORDER BY created_at DESC"
+    ).fetchall()
+    for duplicate in active_rows[1:]:
+        connection.execute(
+            "UPDATE betting_seasons SET status = 'archived', archived_at = COALESCE(archived_at, ?), updated_at = ? WHERE id = ?",
+            (now, now, duplicate["id"]),
+        )
+    connection.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_betting_seasons_one_active ON betting_seasons(status) WHERE status = 'active'"
+    )
+    connection.execute(
+        """
+        UPDATE bets SET season_id = COALESCE(season_id, 'legacy-current'),
+            accepted_odds = COALESCE(accepted_odds, 2.0),
+            potential_return = COALESCE(potential_return, stake * 2),
+            rules_snapshot_json = COALESCE(rules_snapshot_json, ?),
+            settlement_status = COALESCE(settlement_status, 'pending'),
+            settlement_delta = COALESCE(settlement_delta, 0)
+        """,
+        (rules_json,),
+    )
+    connection.execute("CREATE INDEX IF NOT EXISTS idx_bets_season_status ON bets(season_id, settlement_status)")
+    connection.execute("CREATE INDEX IF NOT EXISTS idx_bet_events_bet ON bet_events(bet_id, created_at)")
+    connection.execute("CREATE INDEX IF NOT EXISTS idx_live_match ON match_live_events(match_kind, match_id, created_at)")
+    connection.execute("CREATE INDEX IF NOT EXISTS idx_balance_bettor ON bettor_balance_events(bettor_id, season_id, created_at)")
+    connection.execute("CREATE INDEX IF NOT EXISTS idx_betting_rate ON betting_rate_events(client_key, action, occurred_at)")
+    if marker is None:
+        rows = connection.execute("SELECT id, bettor_id, created_at FROM bets").fetchall()
+        for row in rows:
+            connection.execute(
+                """
+                INSERT INTO bet_events
+                    (bet_id, bettor_id, event_type, detail_json, actor_type, actor_id, created_at)
+                VALUES (?, ?, 'created', ?, 'system', 'betting_v2', ?)
+                """,
+                (row["id"], row["bettor_id"], '{"migration":true}', row["created_at"]),
+            )
+        connection.execute(
+            "INSERT INTO schema_migrations (migration_id, applied_at) VALUES (?, ?)",
+            (BETTING_V2_MIGRATION, now),
+        )
+    if state is None:
+        state_query = "SELECT data FROM app_state WHERE id = 1"
+        if IS_POSTGRES:
+            state_query += " FOR UPDATE"
+        state_row = connection.execute(state_query).fetchone()
+        state = json_object(state_row["data"]) if state_row else None
+    if isinstance(state, dict) and state:
+        normalize_state_contract(state)
+        sync_bet_settlements(connection, state, "betting_v2")
+        grant_achievements(connection, "legacy-current")
+    return marker is None
 
 
 def initialize_database() -> None:
@@ -596,6 +946,7 @@ def initialize_database() -> None:
         connection.execute("CREATE INDEX IF NOT EXISTS idx_audit_created ON admin_audit_log(created_at)")
         connection.execute("CREATE INDEX IF NOT EXISTS idx_social_rate ON social_rate_events(visitor_id, action, occurred_at)")
         migrate_bettor_initial_balance(connection)
+        migrate_betting_v2(connection)
         connection.execute(
             """
             INSERT INTO schema_migrations (migration_id, applied_at)
@@ -1225,6 +1576,13 @@ def save_state(
                 },
                 username,
             )
+        settled_count = sync_bet_settlements(connection, state, username)
+        if settled_count:
+            audit_record(
+                connection, "bets.settled", "bet", None,
+                {"count": settled_count, "revision": revision}, username,
+            )
+        grant_achievements(connection)
         connection.commit()
         if not IS_POSTGRES:
             write_backup(state, revision, updated_at)
@@ -2464,6 +2822,11 @@ def community_record(row: object, include_hidden: bool) -> dict[str, object]:
         "author": row["author"],
         "body": row["body"],
         "status": row["status"],
+        "parentId": row["parent_id"],
+        "pinned": bool(row["pinned"]),
+        "editedAt": row["edited_at"],
+        "matchId": row["match_id"],
+        "seasonId": row["season_id"],
         "createdAt": row["created_at"],
     }
     if include_hidden:
@@ -2493,7 +2856,7 @@ def list_community(
         parameters.append("published")
     if clauses:
         query += " WHERE " + " AND ".join(clauses)
-    query += " ORDER BY created_at DESC LIMIT 200"
+    query += " ORDER BY pinned DESC, created_at DESC LIMIT 200"
     with connect_database() as connection:
         rows = connection.execute(query, parameters).fetchall()
     return [community_record(row, include_hidden) for row in rows]
@@ -2511,6 +2874,7 @@ def save_community_post(payload: dict[str, object], visitor_value: object) -> di
         raise ValueError("A mensagem deve ter entre 2 e 800 caracteres.")
     content_type = clean_short_text(payload.get("contentType") or "community", 30)
     content_id = clean_short_text(payload.get("contentId"), 120)
+    parent_id = clean_short_text(payload.get("parentId"), 120) or None
     if content_type == "community":
         content_id = ""
     elif content_type not in {"match", "news"} or not content_id or not content_exists(content_type, content_id):
@@ -2519,6 +2883,16 @@ def save_community_post(payload: dict[str, object], visitor_value: object) -> di
     now = datetime.now(timezone.utc).isoformat(timespec="microseconds")
     post_id = f"community-{uuid.uuid4()}"
     with DB_LOCK, connect_database() as connection:
+        if parent_id:
+            parent = connection.execute(
+                "SELECT parent_id, content_type, content_id FROM community_posts WHERE id = ? AND status = 'published'",
+                (parent_id,),
+            ).fetchone()
+            if parent is None:
+                raise ValueError("Mensagem respondida não foi encontrada.")
+            if parent["parent_id"]:
+                raise ValueError("As respostas aceitam somente um nível de profundidade.")
+            content_type, content_id = parent["content_type"], parent["content_id"]
         enforce_social_rate_limit(connection, visitor_id, "community_post", 3)
         recent = connection.execute(
             "SELECT COUNT(*) AS total FROM community_posts WHERE visitor_id = ? AND created_at >= ?",
@@ -2530,10 +2904,14 @@ def save_community_post(payload: dict[str, object], visitor_value: object) -> di
             """
             INSERT INTO community_posts (
                 id, visitor_id, content_type, content_id, author, body, status, report_count,
-                created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, 'published', 0, ?, ?)
+                parent_id, pinned, match_id, season_id, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, 'published', 0, ?, 0, ?, ?, ?, ?)
             """,
-            (post_id, visitor_id, content_type, content_id, author, body, now, now),
+            (
+                post_id, visitor_id, content_type, content_id, author, body, parent_id,
+                clean_short_text(payload.get("matchId"), 120) or (content_id if content_type == "match" else None),
+                clean_short_text(payload.get("seasonId"), 120) or None, now, now,
+            ),
         )
         connection.commit()
         row = connection.execute("SELECT * FROM community_posts WHERE id = ?", (post_id,)).fetchone()
@@ -2730,6 +3108,24 @@ def token_digest(token: str) -> str:
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
 
 
+def enforce_betting_rate_limit(client_key: str, action: str, limit: int, window_seconds: int = 60) -> None:
+    now = time.time()
+    cutoff = now - window_seconds
+    with DB_LOCK, connect_database() as connection:
+        connection.execute("DELETE FROM betting_rate_events WHERE occurred_at < ?", (cutoff - 300,))
+        recent = connection.execute(
+            "SELECT COUNT(*) AS total FROM betting_rate_events WHERE client_key = ? AND action = ? AND occurred_at >= ?",
+            (client_key, action, cutoff),
+        ).fetchone()
+        if int(recent["total"] or 0) >= limit:
+            raise RuntimeError("rate_limit")
+        connection.execute(
+            "INSERT INTO betting_rate_events (client_key, action, occurred_at) VALUES (?, ?, ?)",
+            (client_key, action, now),
+        )
+        connection.commit()
+
+
 def issue_bettor_token(connection: object, bettor_id: str) -> str:
     token = secrets.token_urlsafe(36)
     connection.execute(
@@ -2920,7 +3316,291 @@ def collect_bettable_matches(state: dict[str, object]) -> dict[tuple[str, str], 
     return matches
 
 
+def json_object(value: object, fallback: dict[str, object] | None = None) -> dict[str, object]:
+    if isinstance(value, dict):
+        return value
+    try:
+        parsed = json.loads(str(value or ""))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return dict(fallback or {})
+    return parsed if isinstance(parsed, dict) else dict(fallback or {})
+
+
+def active_betting_season(connection: object) -> object:
+    row = connection.execute(
+        "SELECT * FROM betting_seasons WHERE status = 'active' ORDER BY created_at DESC LIMIT 1"
+    ).fetchone()
+    if row is None:
+        raise ValueError("Não há temporada ativa no bolão.")
+    return row
+
+
+def current_betting_rules(connection: object | None = None) -> dict[str, object]:
+    if connection is not None:
+        season = connection.execute(
+            """
+            SELECT * FROM betting_seasons
+            ORDER BY CASE status WHEN 'active' THEN 0 WHEN 'archived' THEN 1 ELSE 2 END,
+                     created_at DESC LIMIT 1
+            """
+        ).fetchone()
+        if season is None:
+            return normalize_betting_rules(DEFAULT_BETTING_RULES)
+        rules = normalize_betting_rules(json_object(season["rules_json"]))
+        rules["bettingOpen"] = season["status"] == "active"
+        return rules
+    with connect_database() as own_connection:
+        return current_betting_rules(own_connection)
+
+
+def match_programming(state: dict[str, object], match_id: str) -> dict[str, object]:
+    league = state.get("league") if isinstance(state.get("league"), dict) else {}
+    programming = league.get("programming") if isinstance(league.get("programming"), dict) else {}
+    entries = programming.get("matches") if isinstance(programming.get("matches"), dict) else {}
+    return entries.get(match_id) if isinstance(entries.get(match_id), dict) else {}
+
+
+def betting_control(connection: object, match_kind: str, match_id: str) -> object | None:
+    return connection.execute(
+        "SELECT * FROM match_betting_controls WHERE match_kind = ? AND match_id = ?",
+        (match_kind, match_id),
+    ).fetchone()
+
+
+def match_lock_state(
+    connection: object,
+    state: dict[str, object],
+    match: dict[str, object],
+    rules: dict[str, object],
+) -> dict[str, object]:
+    now = datetime.now(timezone.utc)
+    control = betting_control(connection, str(match["matchKind"]), str(match["matchId"]))
+    control_status = str(control["betting_status"]) if control else "inherit"
+    lock_at = str(control["lock_at"] or "") if control else ""
+    reason = ""
+    if rules.get("bettingOpen") is False:
+        reason = "season_closed"
+    elif match.get("winnerId"):
+        reason = "result_recorded"
+    elif match.get("inProgress"):
+        reason = "match_started"
+    elif control_status == "disabled":
+        reason = "disabled"
+    elif control_status == "locked":
+        reason = "manual_lock"
+    if control_status == "open" and not match.get("inProgress") and not match.get("winnerId"):
+        reason = ""
+    policy = str(rules["closePolicy"])
+    scheduled_at = ""
+    if match["matchKind"] == "league":
+        scheduled_at = str(match_programming(state, str(match["matchId"])).get("scheduledAt") or "")
+    if not lock_at and scheduled_at and policy == "scheduled_or_started":
+        try:
+            scheduled = datetime.fromisoformat(scheduled_at.replace("Z", "+00:00"))
+            lock_time = scheduled - timedelta(minutes=int(rules["lockMinutesBefore"]))
+            lock_at = lock_time.isoformat()
+        except ValueError:
+            lock_at = ""
+    if not reason and lock_at and policy != "started_only":
+        try:
+            if now >= datetime.fromisoformat(lock_at.replace("Z", "+00:00")).astimezone(timezone.utc):
+                reason = "scheduled_lock"
+        except ValueError:
+            pass
+    return {
+        "open": not bool(reason),
+        "reason": reason,
+        "lockAt": lock_at or None,
+        "bettingStatus": control_status,
+    }
+
+
+def accepted_odds(
+    connection: object,
+    match_kind: str,
+    match_id: str,
+    winner_id: str,
+    rules: dict[str, object],
+    season_id: str,
+    excluded_bettor_id: str | None = None,
+) -> float:
+    if rules["oddsMode"] != "crowd":
+        return float(rules["fixedOdds"])
+    query = """
+        SELECT predicted_winner_id, SUM(stake) AS total
+        FROM bets WHERE match_kind = ? AND match_id = ? AND season_id = ?
+          AND settlement_status = 'pending'
+    """
+    parameters: list[object] = [match_kind, match_id, season_id]
+    if excluded_bettor_id:
+        query += " AND bettor_id <> ?"
+        parameters.append(excluded_bettor_id)
+    query += " GROUP BY predicted_winner_id"
+    totals = {
+        str(row["predicted_winner_id"]): int(row["total"] or 0)
+        for row in connection.execute(query, parameters).fetchall()
+    }
+    overall = sum(totals.values())
+    selected = totals.get(winner_id, 0)
+    if overall < int(rules["minimumCrowdStake"]) or selected <= 0:
+        return float(rules["fixedOdds"])
+    raw = overall / selected
+    return round(max(float(rules["minimumOdds"]), min(float(rules["maximumOdds"]), raw)), 2)
+
+
+def settlement_for(row: object, match: dict[str, object] | None) -> tuple[str, int, str]:
+    stake = int(row["stake"])
+    if row["void_reason"] in {"bettor_cancelled", "season_archived", "admin_void"}:
+        return "void", 0, str(row["void_reason"])
+    if (
+        match is None
+        or match.get("playerAId") != row["player_a_id"]
+        or match.get("playerBId") != row["player_b_id"]
+    ):
+        return "void", 0, "participants_changed_or_match_removed"
+    winner_id = match.get("winnerId")
+    if not winner_id:
+        return "pending", 0, ""
+    rules = normalize_betting_rules(json_object(row["rules_snapshot_json"], DEFAULT_BETTING_RULES))
+    if winner_id == row["predicted_winner_id"]:
+        delta = max(0, int(stake * (float(row["accepted_odds"] or 2.0) - 1)))
+        return "won", delta, "official_result"
+    refund_percent = float(rules["lossRefundPercent"])
+    refunded = int(stake * refund_percent / 100)
+    delta = refunded - stake
+    return "lost", delta, "official_result"
+
+
+def record_bet_event(
+    connection: object,
+    row: object,
+    event_type: str,
+    detail: dict[str, object],
+    actor_type: str,
+    actor_id: str | None,
+) -> None:
+    connection.execute(
+        """
+        INSERT INTO bet_events
+            (bet_id, bettor_id, event_type, detail_json, actor_type, actor_id, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            row["id"], row["bettor_id"], event_type,
+            json.dumps(detail, ensure_ascii=False, separators=(",", ":")),
+            actor_type, actor_id, utc_now(),
+        ),
+    )
+
+
+def sync_bet_settlements(connection: object, state: dict[str, object], username: str = "system") -> int:
+    matches = collect_bettable_matches(state)
+    changed = 0
+    for row in connection.execute("SELECT * FROM bets").fetchall():
+        match = matches.get((row["match_kind"], row["match_id"]))
+        if row["settlement_status"] == "pending" and match is not None:
+            rules = normalize_betting_rules(json_object(row["rules_snapshot_json"], DEFAULT_BETTING_RULES))
+            lock = match_lock_state(connection, state, match, rules)
+            if not lock["open"] and not row["locked_at"]:
+                locked_at = utc_now()
+                connection.execute("UPDATE bets SET locked_at = ? WHERE id = ?", (locked_at, row["id"]))
+                locked_row = connection.execute("SELECT * FROM bets WHERE id = ?", (row["id"],)).fetchone()
+                record_bet_event(
+                    connection, locked_row, "locked",
+                    {"reason": lock["reason"], "lockAt": lock["lockAt"] or locked_at},
+                    "system", "betting-lock",
+                )
+                row = locked_row
+        status, delta, reason = settlement_for(
+            row, match
+        )
+        previous = str(row["settlement_status"] or "pending")
+        if status == previous and int(row["settlement_delta"] or 0) == delta:
+            continue
+        now = utc_now()
+        event_type = "resettled" if previous in {"won", "lost", "void"} else (
+            "voided" if status == "void" else "settled"
+        )
+        connection.execute(
+            """
+            UPDATE bets SET settlement_status = ?, settlement_delta = ?,
+                settlement_reason = ?, void_reason = ?, settled_at = ?,
+                locked_at = COALESCE(locked_at, ?)
+            WHERE id = ?
+            """,
+            (
+                status, delta, reason or None, reason if status == "void" else None,
+                now if status != "pending" else None,
+                now if status != "pending" else None, row["id"],
+            ),
+        )
+        updated = connection.execute("SELECT * FROM bets WHERE id = ?", (row["id"],)).fetchone()
+        record_bet_event(
+            connection, updated, event_type,
+            {"previousStatus": previous, "status": status, "delta": delta, "reason": reason},
+            "admin" if username != "system" else "system", username,
+        )
+        changed += 1
+    return changed
+
+
+def grant_achievements(connection: object, season_id: str | None = None) -> int:
+    awarded = 0
+    bettors = connection.execute("SELECT id FROM bettors WHERE active = 1").fetchall()
+    for bettor in bettors:
+        bettor_id = str(bettor["id"])
+        bets = connection.execute(
+            """
+            SELECT * FROM bets WHERE bettor_id = ? AND (? IS NULL OR season_id = ?)
+            ORDER BY COALESCE(settled_at, updated_at), id
+            """,
+            (bettor_id, season_id, season_id),
+        ).fetchall()
+        candidates: list[tuple[str, str, dict[str, object]]] = []
+        if bets:
+            candidates.append(("first_bet", "", {"betId": bets[0]["id"]}))
+        wins = [row for row in bets if row["settlement_status"] == "won"]
+        if wins:
+            candidates.append(("first_win", "", {"betId": wins[0]["id"]}))
+        streak = 0
+        maximum = 0
+        for row in bets:
+            if row["settlement_status"] == "won":
+                streak += 1
+                maximum = max(maximum, streak)
+            elif row["settlement_status"] == "lost":
+                streak = 0
+        if maximum >= 3:
+            candidates.append(("three_win_streak", "", {"streak": maximum}))
+        if maximum >= 5:
+            candidates.append(("five_win_streak", "", {"streak": maximum}))
+        for row in wins:
+            if float(row["accepted_odds"] or 0) >= 3:
+                candidates.append(("underdog_win", str(row["id"]), {"betId": row["id"]}))
+        for achievement_type, context, detail in candidates:
+            cursor = connection.execute(
+                """
+                INSERT INTO bettor_achievements (
+                    id, bettor_id, season_id, achievement_type, context_key, detail_json, earned_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(bettor_id, season_id, achievement_type, context_key) DO NOTHING
+                """,
+                (
+                    f"achievement-{uuid.uuid4()}", bettor_id, season_id or "legacy-current",
+                    achievement_type, context,
+                    json.dumps(detail, separators=(",", ":")), utc_now(),
+                ),
+            )
+            awarded += max(0, cursor.rowcount)
+    return awarded
+
+
 def bet_status(row: object, matches: dict[tuple[str, str], dict[str, object]]) -> tuple[str, int]:
+    persisted = str(row["settlement_status"] or "pending")
+    if persisted != "pending":
+        stake = int(row["stake"])
+        delta = int(row["settlement_delta"] or 0)
+        return persisted, stake + delta if persisted == "won" else (stake + delta if persisted == "lost" else stake)
     match = matches.get((row["match_kind"], row["match_id"]))
     if (
         match is None
@@ -2931,23 +3611,45 @@ def bet_status(row: object, matches: dict[tuple[str, str], dict[str, object]]) -
     winner_id = match.get("winnerId")
     if not winner_id:
         return "pending", 0
-    if winner_id == row["predicted_winner_id"]:
-        return "won", int(row["stake"]) * 2
-    return "lost", int(row["stake"])
+    status, delta, _ = settlement_for(row, match)
+    return status, int(row["stake"]) + delta if status in {"won", "lost"} else int(row["stake"])
 
 
-def betting_snapshot(token: str | None) -> dict[str, object]:
+def betting_snapshot(token: str | None, season_id: str | None = None) -> dict[str, object]:
     state_payload = read_state()
     state = state_payload.get("state") if isinstance(state_payload.get("state"), dict) else {}
     matches = collect_bettable_matches(state)
     bettor = bettor_from_token(token)
 
     with DB_LOCK, connect_database() as connection:
+        sync_bet_settlements(connection, state)
+        season = connection.execute(
+            "SELECT * FROM betting_seasons WHERE id = ?", (season_id,)
+        ).fetchone() if season_id else connection.execute(
+            """
+            SELECT * FROM betting_seasons
+            ORDER BY CASE status WHEN 'active' THEN 0 WHEN 'archived' THEN 1 ELSE 2 END,
+                     created_at DESC LIMIT 1
+            """
+        ).fetchone()
+        if season is None:
+            raise LookupError("Temporada do bolão não encontrada.")
+        rules = normalize_betting_rules(json_object(season["rules_json"]))
+        grant_achievements(connection, str(season["id"]))
         bettors = connection.execute(
-            "SELECT id, name, initial_balance, created_at FROM bettors WHERE active = 1 ORDER BY created_at"
+            "SELECT * FROM bettors WHERE active = 1 ORDER BY created_at"
         ).fetchall()
         all_bets = connection.execute(
-            "SELECT * FROM bets ORDER BY created_at"
+            "SELECT * FROM bets WHERE season_id = ? ORDER BY created_at", (season["id"],)
+        ).fetchall()
+        balance_rows = connection.execute(
+            "SELECT bettor_id, SUM(amount) AS total FROM bettor_balance_events WHERE season_id = ? GROUP BY bettor_id",
+            (season["id"],),
+        ).fetchall()
+        balance_adjustments = {str(row["bettor_id"]): int(row["total"] or 0) for row in balance_rows}
+        achievements = connection.execute(
+            "SELECT * FROM bettor_achievements WHERE season_id = ? ORDER BY earned_at DESC",
+            (season["id"],),
         ).fetchall()
 
     bets_by_bettor: dict[str, list[object]] = {}
@@ -2959,7 +3661,7 @@ def betting_snapshot(token: str | None) -> dict[str, object]:
     my_bets: list[dict[str, object]] = []
 
     for person in bettors:
-        initial = int(person["initial_balance"])
+        initial = int(season["initial_balance"]) + balance_adjustments.get(str(person["id"]), 0)
         profit = 0
         pending_stake = 0
         wins = losses = pending = voided = 0
@@ -2968,9 +3670,10 @@ def betting_snapshot(token: str | None) -> dict[str, object]:
             status, payout = bet_status(bet, matches)
             stake = int(bet["stake"])
             if status == "won":
-                profit += stake
+                profit += int(bet["settlement_delta"] or (stake * (float(bet["accepted_odds"] or 2) - 1)))
                 wins += 1
             elif status == "lost":
+                profit += int(bet["settlement_delta"] or 0)
                 losses += 1
             elif status == "pending":
                 pending_stake += stake
@@ -2987,6 +3690,14 @@ def betting_snapshot(token: str | None) -> dict[str, object]:
                     "stake": stake,
                     "status": status,
                     "payout": payout,
+                    "acceptedOdds": float(bet["accepted_odds"] or 2),
+                    "potentialReturn": int(bet["potential_return"] or stake * 2),
+                    "rulesSnapshot": json_object(bet["rules_snapshot_json"], DEFAULT_BETTING_RULES),
+                    "settlementDelta": int(bet["settlement_delta"] or 0),
+                    "settlementReason": bet["settlement_reason"],
+                    "seasonId": bet["season_id"],
+                    "lockedAt": bet["locked_at"],
+                    "settledAt": bet["settled_at"],
                     "createdAt": bet["created_at"],
                     "updatedAt": bet["updated_at"],
                 })
@@ -3009,7 +3720,21 @@ def betting_snapshot(token: str | None) -> dict[str, object]:
         }
         leaderboard.append(row)
         if bettor is not None and person["id"] == bettor["id"]:
-            profile = row | {"initialBalance": initial}
+            profile = row | {
+                "initialBalance": initial,
+                "publicProfileEnabled": bool(person["public_profile_enabled"]),
+                "bio": person["bio"] or "",
+                "favoritePlayerId": person["favorite_player_id"],
+                "achievements": [
+                    {
+                        "id": item["id"],
+                        "type": item["achievement_type"],
+                        "detail": json_object(item["detail_json"]),
+                        "earnedAt": item["earned_at"],
+                    }
+                    for item in achievements if item["bettor_id"] == person["id"]
+                ],
+            }
 
     leaderboard.sort(key=lambda item: (-int(item["settledBalance"]), -int(item["wins"]), str(item["name"]).casefold()))
     my_bets.sort(key=lambda item: str(item["updatedAt"]), reverse=True)
@@ -3017,12 +3742,8 @@ def betting_snapshot(token: str | None) -> dict[str, object]:
         "profile": profile,
         "leaderboard": leaderboard,
         "myBets": my_bets,
-        "settings": {
-            "initialBalance": BET_INITIAL_BALANCE,
-            "maxStake": BET_MAX_STAKE,
-            "payoutMultiplier": 2,
-            "virtualOnly": True,
-        },
+        "season": {"id": season["id"], "title": season["title"], "status": season["status"]},
+        "settings": rules | {"payoutMultiplier": float(rules["fixedOdds"])},
     }
 
 
@@ -3039,57 +3760,111 @@ def place_wager(token: str | None, body: dict[str, object]) -> dict[str, object]
         raise ValueError("A quantidade de fichas é inválida.") from error
     if match_kind != "league" or not match_id:
         raise ValueError("Partida inválida.")
-    if not (1 <= stake <= BET_MAX_STAKE):
-        raise ValueError(f"A aposta deve ser de 1 a {BET_MAX_STAKE} fichas.")
-
-    state_payload = read_state()
-    state = state_payload.get("state") if isinstance(state_payload.get("state"), dict) else {}
-    matches = collect_bettable_matches(state)
-    match = matches.get((match_kind, match_id))
-    if match is None or match.get("winnerId"):
-        raise ValueError("Essa partida não está disponível para apostas.")
-    if match.get("inProgress"):
-        raise ValueError("Essa partida já está em andamento e não aceita mais apostas.")
-    if predicted_winner_id not in {match.get("playerAId"), match.get("playerBId")}:
-        raise ValueError("Escolha um dos jogadores desta partida.")
-
-    snapshot = betting_snapshot(token)
-    profile = snapshot.get("profile")
-    if not isinstance(profile, dict):
-        raise PermissionError("Perfil do bolão não encontrado.")
-
     with DB_LOCK, connect_database() as connection:
+        if not IS_POSTGRES:
+            connection.execute("BEGIN IMMEDIATE")
+        state_query = "SELECT data FROM app_state WHERE id = 1"
+        if IS_POSTGRES:
+            state_query += " FOR UPDATE"
+        state_row = connection.execute(state_query).fetchone()
+        season_query = "SELECT * FROM betting_seasons WHERE status = 'active' ORDER BY created_at DESC LIMIT 1"
+        bettor_query = "SELECT * FROM bettors WHERE id = ? AND active = 1"
+        if IS_POSTGRES:
+            season_query += " FOR UPDATE"
+            bettor_query += " FOR UPDATE"
+        season = connection.execute(season_query).fetchone()
+        locked_bettor = connection.execute(bettor_query, (bettor["id"],)).fetchone()
+        if season is None:
+            raise ConflictError("Não há temporada ativa no bolão.")
+        if locked_bettor is None:
+            raise PermissionError("O participante está suspenso ou não existe.")
+        rules = normalize_betting_rules(json_object(season["rules_json"]))
+        state = json_object(state_row["data"] if state_row else None)
+        normalize_state_contract(state)
+        matches = collect_bettable_matches(state)
+        match = matches.get((match_kind, match_id))
+        if match is None or match.get("winnerId"):
+            raise ConflictError("Essa partida não está disponível para palpites.")
+        if predicted_winner_id not in {match.get("playerAId"), match.get("playerBId")}:
+            raise ValueError("Escolha um dos jogadores desta partida.")
+        if not (int(rules["minStake"]) <= stake <= int(rules["maxStake"])):
+            raise ValueError(f"O palpite deve ser de {rules['minStake']} a {rules['maxStake']} fichas.")
+        if not match_lock_state(connection, state, match, rules)["open"]:
+            raise ConflictError("Essa partida está fechada para palpites.")
+        sync_bet_settlements(connection, state)
         existing = connection.execute(
-            "SELECT * FROM bets WHERE bettor_id = ? AND match_kind = ? AND match_id = ?",
-            (bettor["id"], match_kind, match_id),
+            "SELECT * FROM bets WHERE bettor_id = ? AND match_kind = ? AND match_id = ? AND season_id = ?",
+            (bettor["id"], match_kind, match_id, season["id"]),
         ).fetchone()
         refundable = 0
         if existing is not None:
             status, _ = bet_status(existing, matches)
             if status not in {"pending", "void"}:
-                raise ValueError("Essa aposta já foi encerrada.")
+                raise ConflictError("Esse palpite já foi encerrado.")
             refundable = int(existing["stake"]) if status == "pending" else 0
-        available = int(profile.get("availableBalance") or 0) + refundable
+        balance = connection.execute(
+            """
+            SELECT ?
+                + COALESCE((SELECT SUM(amount) FROM bettor_balance_events e
+                            WHERE e.bettor_id = b.id AND e.season_id = ?), 0)
+                + COALESCE((SELECT SUM(settlement_delta) FROM bets x
+                            WHERE x.bettor_id = b.id AND x.season_id = ?
+                              AND x.settlement_status <> 'pending'), 0)
+                - COALESCE((SELECT SUM(stake) FROM bets p
+                            WHERE p.bettor_id = b.id AND p.season_id = ?
+                              AND p.settlement_status = 'pending'), 0)
+                AS available
+            FROM bettors b WHERE b.id = ?
+            """,
+            (int(season["initial_balance"]), season["id"], season["id"], season["id"], bettor["id"]),
+        ).fetchone()
+        available = int(balance["available"] or 0) + refundable
         if stake > available:
             raise ValueError(f"Saldo insuficiente. Você tem {available} fichas disponíveis.")
+        odds = accepted_odds(
+            connection, match_kind, match_id, predicted_winner_id, rules,
+            str(season["id"]), str(bettor["id"]),
+        )
+        potential_return = max(stake, int(stake * odds))
         now = utc_now()
         connection.execute(
             """
             INSERT INTO bets
-                (bettor_id, match_kind, match_id, player_a_id, player_b_id, predicted_winner_id, stake, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(bettor_id, match_kind, match_id) DO UPDATE SET
+                (bettor_id, match_kind, match_id, player_a_id, player_b_id,
+                 predicted_winner_id, stake, season_id, accepted_odds, potential_return,
+                 rules_snapshot_json, settlement_status, settlement_delta, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?)
+            ON CONFLICT(bettor_id, match_kind, match_id, season_id) DO UPDATE SET
                 player_a_id = excluded.player_a_id,
                 player_b_id = excluded.player_b_id,
                 predicted_winner_id = excluded.predicted_winner_id,
                 stake = excluded.stake,
+                season_id = excluded.season_id,
+                accepted_odds = excluded.accepted_odds,
+                potential_return = excluded.potential_return,
+                rules_snapshot_json = excluded.rules_snapshot_json,
+                settlement_status = 'pending',
+                settlement_delta = 0,
+                settlement_reason = NULL,
+                void_reason = NULL,
+                settled_at = NULL,
                 updated_at = excluded.updated_at
             """,
             (
                 bettor["id"], match_kind, match_id,
                 match["playerAId"], match["playerBId"], predicted_winner_id,
-                stake, now, now,
+                stake, season["id"], odds, potential_return,
+                json.dumps(rules, ensure_ascii=False, separators=(",", ":")), now, now,
             ),
+        )
+        saved = connection.execute(
+            "SELECT * FROM bets WHERE bettor_id = ? AND match_kind = ? AND match_id = ? AND season_id = ?",
+            (bettor["id"], match_kind, match_id, season["id"]),
+        ).fetchone()
+        record_bet_event(
+            connection, saved, "updated" if existing else "created",
+            {"stake": stake, "acceptedOdds": odds, "potentialReturn": potential_return},
+            "bettor", str(bettor["id"]),
         )
         connection.commit()
     return betting_snapshot(token)
@@ -3101,23 +3876,55 @@ def cancel_wager(token: str | None, body: dict[str, object]) -> dict[str, object
         raise PermissionError("Entre no bolão para cancelar uma aposta.")
     match_kind = str(body.get("matchKind") or "")
     match_id = str(body.get("matchId") or "")
-    state_payload = read_state()
-    state = state_payload.get("state") if isinstance(state_payload.get("state"), dict) else {}
-    matches = collect_bettable_matches(state)
-    match = matches.get((match_kind, match_id))
-    if match is not None and match.get("inProgress"):
-        raise ValueError("Essa partida está em andamento; a aposta não pode ser cancelada.")
     with DB_LOCK, connect_database() as connection:
+        if not IS_POSTGRES:
+            connection.execute("BEGIN IMMEDIATE")
+        state_query = "SELECT data FROM app_state WHERE id = 1"
+        if IS_POSTGRES:
+            state_query += " FOR UPDATE"
+        state_row = connection.execute(state_query).fetchone()
+        season_query = "SELECT * FROM betting_seasons WHERE status = 'active' ORDER BY created_at DESC LIMIT 1"
+        bettor_query = "SELECT * FROM bettors WHERE id = ? AND active = 1"
+        if IS_POSTGRES:
+            season_query += " FOR UPDATE"
+            bettor_query += " FOR UPDATE"
+        season = connection.execute(season_query).fetchone()
+        locked_bettor = connection.execute(bettor_query, (bettor["id"],)).fetchone()
+        if season is None:
+            raise ConflictError("Não há temporada ativa no bolão.")
+        if locked_bettor is None:
+            raise PermissionError("O participante está suspenso ou não existe.")
+        state = json_object(state_row["data"] if state_row else None)
+        normalize_state_contract(state)
+        matches = collect_bettable_matches(state)
+        match = matches.get((match_kind, match_id))
         existing = connection.execute(
-            "SELECT * FROM bets WHERE bettor_id = ? AND match_kind = ? AND match_id = ?",
-            (bettor["id"], match_kind, match_id),
+            "SELECT * FROM bets WHERE bettor_id = ? AND match_kind = ? AND match_id = ? AND season_id = ?",
+            (bettor["id"], match_kind, match_id, season["id"]),
         ).fetchone()
         if existing is None:
             raise ValueError("Aposta não encontrada.")
         status, _ = bet_status(existing, matches)
         if status not in {"pending", "void"}:
-            raise ValueError("Uma aposta encerrada não pode ser cancelada.")
-        connection.execute("DELETE FROM bets WHERE id = ?", (existing["id"],))
+            raise ConflictError("Um palpite encerrado não pode ser cancelado.")
+        rules = normalize_betting_rules(json_object(existing["rules_snapshot_json"], DEFAULT_BETTING_RULES))
+        if not rules["allowCancellation"]:
+            raise ValueError("As regras desta aposta não permitem cancelamento.")
+        if match is not None and not match_lock_state(connection, state, match, rules)["open"]:
+            raise ConflictError("A partida já fechou para alterações.")
+        record_bet_event(
+            connection, existing, "cancelled", {"stake": int(existing["stake"])},
+            "bettor", str(bettor["id"]),
+        )
+        now = utc_now()
+        connection.execute(
+            """
+            UPDATE bets SET settlement_status = 'void', settlement_delta = 0,
+                settlement_reason = 'bettor_cancelled', void_reason = 'bettor_cancelled',
+                settled_at = ?, updated_at = ? WHERE id = ?
+            """,
+            (now, now, existing["id"]),
+        )
         connection.commit()
     return betting_snapshot(token)
 
@@ -3127,6 +3934,494 @@ def reset_betting_pool() -> None:
         connection.execute("DELETE FROM bets")
         connection.execute("DELETE FROM bettors")
         connection.commit()
+
+
+def betting_matches_payload(token: str | None = None) -> dict[str, object]:
+    state = read_state().get("state") or {}
+    matches = collect_bettable_matches(state)
+    bettor = bettor_from_token(token)
+    with connect_database() as connection:
+        rules = current_betting_rules(connection)
+        season = connection.execute(
+            """
+            SELECT id, status FROM betting_seasons
+            ORDER BY CASE status WHEN 'active' THEN 0 WHEN 'archived' THEN 1 ELSE 2 END,
+                     created_at DESC LIMIT 1
+            """
+        ).fetchone()
+        own = {}
+        if bettor and season:
+            own = {
+                (row["match_kind"], row["match_id"]): row
+                for row in connection.execute(
+                    "SELECT * FROM bets WHERE bettor_id = ? AND season_id = ?",
+                    (bettor["id"], season["id"]),
+                ).fetchall()
+            }
+        items = []
+        for key, match in matches.items():
+            lock = match_lock_state(connection, state, match, rules)
+            wager = own.get(key)
+            items.append({
+                **match,
+                "open": lock["open"],
+                "closeReason": lock["reason"],
+                "lockAt": lock["lockAt"],
+                "bettingStatus": lock["bettingStatus"],
+                "myBet": {
+                    "predictedWinnerId": wager["predicted_winner_id"],
+                    "stake": int(wager["stake"]),
+                    "acceptedOdds": float(wager["accepted_odds"] or 2),
+                    "status": wager["settlement_status"],
+                } if wager else None,
+            })
+    return {
+        "matches": items, "rules": rules,
+        "season": {"id": season["id"], "status": season["status"]} if season else None,
+    }
+
+
+def wager_preview(token: str | None, match_id: str, winner_id: str, stake_value: object) -> dict[str, object]:
+    bettor = bettor_from_token(token)
+    try:
+        stake = int(stake_value)
+    except (TypeError, ValueError) as error:
+        raise ValueError("Quantidade de fichas inválida.") from error
+    state = read_state().get("state") or {}
+    match = collect_bettable_matches(state).get(("league", match_id))
+    if not match or winner_id not in {match["playerAId"], match["playerBId"]}:
+        raise ValueError("Partida ou jogador inválido.")
+    with connect_database() as connection:
+        rules = current_betting_rules(connection)
+        lock = match_lock_state(connection, state, match, rules)
+        season = active_betting_season(connection)
+        odds = accepted_odds(
+            connection, "league", match_id, winner_id, rules, str(season["id"]),
+            str(bettor["id"]) if bettor else None,
+        )
+    if not (int(rules["minStake"]) <= stake <= int(rules["maxStake"])):
+        raise ValueError("Quantidade fora dos limites atuais.")
+    return {
+        "matchId": match_id, "winnerId": winner_id, "stake": stake,
+        "acceptedOddsPreview": odds, "potentialReturn": int(stake * odds),
+        "potentialProfit": int(stake * (odds - 1)),
+        "lossPolicy": rules["lossPolicy"],
+        "lossRefundPercent": rules["lossRefundPercent"],
+        "open": lock["open"], "closeReason": lock["reason"], "lockAt": lock["lockAt"],
+    }
+
+
+def betting_history(token: str | None, status: str = "", cursor: str = "") -> dict[str, object]:
+    bettor = bettor_from_token(token)
+    if bettor is None:
+        raise PermissionError("Entre no bolão para ver seu histórico.")
+    clauses = ["b.bettor_id = ?"]
+    parameters: list[object] = [bettor["id"]]
+    if status in {"pending", "won", "lost", "void"}:
+        clauses.append("b.settlement_status = ?")
+        parameters.append(status)
+    if cursor:
+        clauses.append("b.updated_at < ?")
+        parameters.append(cursor)
+    query = "SELECT b.* FROM bets b WHERE " + " AND ".join(clauses) + " ORDER BY b.updated_at DESC LIMIT 51"
+    with connect_database() as connection:
+        rows = connection.execute(query, parameters).fetchall()
+        selected = rows[:50]
+        events = connection.execute(
+            "SELECT * FROM bet_events WHERE bettor_id = ? ORDER BY created_at",
+            (bettor["id"],),
+        ).fetchall()
+    by_bet: dict[int, list[dict[str, object]]] = {}
+    for event in events:
+        by_bet.setdefault(int(event["bet_id"]), []).append({
+            "id": event["id"], "type": event["event_type"],
+            "detail": json_object(event["detail_json"]), "actorType": event["actor_type"],
+            "createdAt": event["created_at"],
+        })
+    return {
+        "bets": [{
+            "id": row["id"], "matchKind": row["match_kind"], "matchId": row["match_id"],
+            "predictedWinnerId": row["predicted_winner_id"], "stake": row["stake"],
+            "acceptedOdds": row["accepted_odds"], "potentialReturn": row["potential_return"],
+            "status": row["settlement_status"], "settlementDelta": row["settlement_delta"],
+            "settlementReason": row["settlement_reason"], "createdAt": row["created_at"],
+            "updatedAt": row["updated_at"], "events": by_bet.get(int(row["id"]), []),
+        } for row in selected],
+        "nextCursor": selected[-1]["updated_at"] if len(rows) > 50 else None,
+    }
+
+
+def betting_leaderboard(
+    scope: str = "overall",
+    round_number: int | None = None,
+    season_id: str | None = None,
+) -> dict[str, object]:
+    if scope not in {"overall", "round", "month", "season", "streak", "underdog"}:
+        raise ValueError("Escopo de ranking inválido.")
+    snapshot = betting_snapshot(None, season_id)
+    effective_season_id = str(snapshot["season"]["id"])
+    rows = list(snapshot["leaderboard"])
+    if scope in {"month", "season", "round", "underdog", "streak"}:
+        state = read_state().get("state") or {}
+        round_match_ids: set[str] = set()
+        league = state.get("league") if isinstance(state.get("league"), dict) else {}
+        for item in league.get("rounds") or []:
+            if not isinstance(item, dict):
+                continue
+            if round_number is None or int(item.get("number") or 0) == round_number:
+                round_match_ids.update(
+                    str(match.get("id")) for match in item.get("matches") or []
+                    if isinstance(match, dict) and match.get("id")
+                )
+        with connect_database() as connection:
+            bets = connection.execute(
+                "SELECT * FROM bets WHERE season_id = ? ORDER BY settled_at, id",
+                (effective_season_id,),
+            ).fetchall()
+        now_month = utc_now()[:7]
+        stats: dict[str, dict[str, int]] = {}
+        for row in bets:
+            if scope == "month" and not str(row["settled_at"] or "").startswith(now_month):
+                continue
+            if scope == "round" and str(row["match_id"]) not in round_match_ids:
+                continue
+            entry = stats.setdefault(str(row["bettor_id"]), {"delta": 0, "wins": 0, "streak": 0, "maxStreak": 0, "underdog": 0})
+            entry["delta"] += int(row["settlement_delta"] or 0)
+            if row["settlement_status"] == "won":
+                entry["wins"] += 1
+                entry["streak"] += 1
+                entry["maxStreak"] = max(entry["maxStreak"], entry["streak"])
+                if float(row["accepted_odds"] or 0) >= 3:
+                    entry["underdog"] += 1
+            elif row["settlement_status"] == "lost":
+                entry["streak"] = 0
+        for item in rows:
+            extra = stats.get(str(item["id"]), {})
+            item["scopeDelta"] = extra.get("delta", 0)
+            item["streak"] = extra.get("maxStreak", 0)
+            item["underdogWins"] = extra.get("underdog", 0)
+        key = "underdogWins" if scope == "underdog" else ("streak" if scope == "streak" else "scopeDelta")
+        rows.sort(key=lambda item: (-int(item.get(key) or 0), str(item["name"]).casefold()))
+    return {
+        "scope": scope, "round": round_number, "seasonId": effective_season_id,
+        "leaderboard": rows,
+    }
+
+
+def update_betting_settings(payload: dict[str, object], username: str) -> dict[str, object]:
+    rules = normalize_betting_rules(payload.get("rules") if "rules" in payload else payload)
+    with DB_LOCK, connect_database() as connection:
+        season = active_betting_season(connection)
+        connection.execute(
+            "UPDATE betting_seasons SET rules_json = ?, updated_at = ? WHERE id = ?",
+            (json.dumps(rules, ensure_ascii=False, separators=(",", ":")), utc_now(), season["id"]),
+        )
+        audit_record(connection, "bets.settings_updated", "betting_season", season["id"], {"rules": rules}, username)
+        connection.commit()
+    return {"seasonId": season["id"], "rules": rules}
+
+
+def adjust_bettor_balance(payload: dict[str, object], username: str) -> dict[str, object]:
+    bettor_id = clean_short_text(payload.get("bettorId"), 120)
+    reason = str(payload.get("reason") or "").strip()
+    try:
+        amount = int(payload.get("amount"))
+    except (TypeError, ValueError) as error:
+        raise ValueError("Valor de ajuste inválido.") from error
+    if not bettor_id or not reason or amount == 0 or abs(amount) > 1_000_000:
+        raise ValueError("Participante, valor e motivo são obrigatórios.")
+    with DB_LOCK, connect_database() as connection:
+        if connection.execute("SELECT 1 FROM bettors WHERE id = ?", (bettor_id,)).fetchone() is None:
+            raise LookupError("Participante não encontrado.")
+        season = active_betting_season(connection)
+        connection.execute(
+            """
+            INSERT INTO bettor_balance_events
+                (bettor_id, season_id, event_type, amount, reason, created_by, created_at)
+            VALUES (?, ?, 'admin_adjustment', ?, ?, ?, ?)
+            """,
+            (bettor_id, season["id"], amount, reason[:500], username, utc_now()),
+        )
+        audit_record(connection, "bets.balance_adjusted", "bettor", bettor_id, {"amount": amount, "reason": reason}, username)
+        connection.commit()
+    return {"ok": True, "bettorId": bettor_id, "amount": amount}
+
+
+def update_bettor_profile(token: str | None, payload: dict[str, object]) -> dict[str, object]:
+    bettor = bettor_from_token(token)
+    if bettor is None:
+        raise PermissionError("Entre no bolão para editar seu perfil.")
+    bio = str(payload.get("bio") or "").strip()
+    if len(bio) > 500:
+        raise ValueError("A apresentação deve ter no máximo 500 caracteres.")
+    favorite_player_id = clean_short_text(payload.get("favoritePlayerId"), 120) or None
+    state = read_state().get("state") or {}
+    if favorite_player_id and favorite_player_id not in official_players(state):
+        raise ValueError("Jogador favorito inválido.")
+    public_enabled = 1 if payload.get("publicProfileEnabled") else 0
+    with DB_LOCK, connect_database() as connection:
+        if not IS_POSTGRES:
+            connection.execute("BEGIN IMMEDIATE")
+        else:
+            connection.execute("SELECT id FROM app_state WHERE id = 1 FOR UPDATE")
+        now = utc_now()
+        connection.execute(
+            """
+            UPDATE bettors SET public_profile_enabled = ?, bio = ?,
+                favorite_player_id = ?, last_seen_at = ?, updated_at = ? WHERE id = ?
+            """,
+            (public_enabled, bio, favorite_player_id, now, now, bettor["id"]),
+        )
+        connection.commit()
+    return {
+        "id": bettor["id"], "name": bettor["name"],
+        "publicProfileEnabled": bool(public_enabled), "bio": bio,
+        "favoritePlayerId": favorite_player_id,
+    }
+
+
+def set_match_betting_control(payload: dict[str, object], username: str, reopen: bool = False) -> dict[str, object]:
+    match_kind = clean_short_text(payload.get("matchKind") or "league", 30)
+    match_id = clean_short_text(payload.get("matchId"), 120)
+    status = "open" if reopen else str(payload.get("bettingStatus") or "locked")
+    if status not in BETTING_STATUSES or not match_id:
+        raise ValueError("Controle de partida inválido.")
+    lock_at = str(payload.get("lockAt") or "").strip() or None
+    if lock_at:
+        datetime.fromisoformat(lock_at.replace("Z", "+00:00"))
+    with DB_LOCK, connect_database() as connection:
+        if not IS_POSTGRES:
+            connection.execute("BEGIN IMMEDIATE")
+        else:
+            connection.execute("SELECT id FROM app_state WHERE id = 1 FOR UPDATE")
+        now = utc_now()
+        connection.execute(
+            """
+            INSERT INTO match_betting_controls
+                (match_kind, match_id, betting_status, lock_at, note, updated_by, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(match_kind, match_id) DO UPDATE SET
+                betting_status = excluded.betting_status, lock_at = excluded.lock_at,
+                note = excluded.note, updated_by = excluded.updated_by, updated_at = excluded.updated_at
+            """,
+            (match_kind, match_id, status, lock_at, str(payload.get("note") or "")[:500], username, now),
+        )
+        audit_record(connection, "bets.match_control", "match", match_id, {"status": status, "lockAt": lock_at}, username)
+        connection.commit()
+    return {"matchKind": match_kind, "matchId": match_id, "bettingStatus": status, "lockAt": lock_at}
+
+
+def create_betting_season(payload: dict[str, object], username: str) -> dict[str, object]:
+    title = " ".join(str(payload.get("title") or "").split())
+    if not title:
+        raise ValueError("Informe o nome da temporada.")
+    rules = normalize_betting_rules(payload.get("rules"))
+    status = str(payload.get("status") or "draft")
+    if status not in BET_SEASON_STATUSES:
+        raise ValueError("Status de temporada inválido.")
+    season_id = clean_short_text(payload.get("id"), 120) or f"bet-season-{uuid.uuid4()}"
+    with DB_LOCK, connect_database() as connection:
+        if status == "active" and connection.execute(
+            "SELECT 1 FROM betting_seasons WHERE status = 'active'"
+        ).fetchone():
+            raise ValueError("Já existe uma temporada ativa.")
+        now = utc_now()
+        try:
+            connection.execute(
+                """
+                INSERT INTO betting_seasons
+                    (id, title, status, starts_at, ends_at, initial_balance, rules_json,
+                     created_by, created_at, updated_at, archived_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
+                """,
+                (season_id, title[:120], status, payload.get("startsAt"), payload.get("endsAt"),
+                 int(rules["initialBalance"]), json.dumps(rules, separators=(",", ":")), username, now, now),
+            )
+        except Exception as error:
+            if is_integrity_error(error):
+                raise ValueError("Já existe uma temporada ativa ou este identificador está em uso.") from error
+            raise
+        audit_record(connection, "bets.season_created", "betting_season", season_id, {"status": status}, username)
+        connection.commit()
+    return {"id": season_id, "title": title, "status": status, "rules": rules}
+
+
+def archive_betting_season(payload: dict[str, object], username: str) -> dict[str, object]:
+    with DB_LOCK, connect_database() as connection:
+        season = active_betting_season(connection)
+        pending = connection.execute(
+            "SELECT COUNT(*) AS total FROM bets WHERE season_id = ? AND settlement_status = 'pending'",
+            (season["id"],),
+        ).fetchone()
+        pending_total = int(pending["total"] or 0)
+        if pending_total and not payload.get("voidPending"):
+            raise ValueError("Resolva os palpites pendentes ou confirme sua anulação explícita.")
+        now = utc_now()
+        if pending_total:
+            pending_rows = connection.execute(
+                "SELECT * FROM bets WHERE season_id = ? AND settlement_status = 'pending'",
+                (season["id"],),
+            ).fetchall()
+            for row in pending_rows:
+                connection.execute(
+                    """
+                    UPDATE bets SET settlement_status = 'void', settlement_delta = 0,
+                        settlement_reason = 'season_archived', void_reason = 'season_archived',
+                        locked_at = COALESCE(locked_at, ?), settled_at = ?, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (now, now, now, row["id"]),
+                )
+                record_bet_event(
+                    connection, row, "voided", {"reason": "season_archived"},
+                    "admin", username,
+                )
+        connection.execute(
+            "UPDATE betting_seasons SET status = 'archived', ends_at = ?, archived_at = ?, updated_at = ? WHERE id = ?",
+            (now, now, now, season["id"]),
+        )
+        grant_achievements(connection, str(season["id"]))
+        audit_record(connection, "bets.season_archived", "betting_season", season["id"], {"pending": pending["total"]}, username)
+        connection.commit()
+    snapshot = betting_snapshot(None, str(season["id"]))
+    with connect_database() as connection:
+        achievement_rows = connection.execute(
+            "SELECT * FROM bettor_achievements WHERE season_id = ? ORDER BY earned_at",
+            (season["id"],),
+        ).fetchall()
+    archived_snapshot = {
+        "leaderboard": snapshot["leaderboard"],
+        "season": snapshot["season"],
+        "achievements": [{
+            "id": item["id"], "bettorId": item["bettor_id"],
+            "type": item["achievement_type"], "detail": json_object(item["detail_json"]),
+            "earnedAt": item["earned_at"],
+        } for item in achievement_rows],
+        "archivedAt": now,
+    }
+    with DB_LOCK, connect_database() as connection:
+        connection.execute(
+            "UPDATE betting_seasons SET snapshot_json = ? WHERE id = ?",
+            (json.dumps(archived_snapshot, ensure_ascii=False, separators=(",", ":")), season["id"]),
+        )
+        connection.commit()
+    return {
+        "id": season["id"], "status": "archived", "archivedAt": now,
+        "snapshot": archived_snapshot,
+    }
+
+
+def live_payload(match_id: str = "") -> dict[str, object]:
+    state = read_state().get("state") or {}
+    matches = collect_bettable_matches(state)
+    selected = None
+    if match_id:
+        selected = next((item for (_, key), item in matches.items() if key == match_id), None)
+    if selected is None:
+        selected = next((item for item in matches.values() if item.get("inProgress")), None)
+    if selected is None:
+        return {"active": False, "match": None, "events": [], "predictionDistribution": None}
+    with connect_database() as connection:
+        events = connection.execute(
+            "SELECT * FROM match_live_events WHERE match_kind = ? AND match_id = ? ORDER BY created_at, id",
+            (selected["matchKind"], selected["matchId"]),
+        ).fetchall()
+        rules = current_betting_rules(connection)
+        season = connection.execute(
+            """
+            SELECT id, status FROM betting_seasons
+            ORDER BY CASE status WHEN 'active' THEN 0 WHEN 'archived' THEN 1 ELSE 2 END,
+                     created_at DESC LIMIT 1
+            """
+        ).fetchone()
+        lock = match_lock_state(connection, state, selected, rules)
+        visible = rules["predictionVisibility"] == "always" or (
+            rules["predictionVisibility"] == "after_lock" and not lock["open"]
+        )
+        distribution = None
+        if visible and season:
+            rows = connection.execute(
+                """
+                SELECT predicted_winner_id, COUNT(*) AS participants, SUM(stake) AS stake
+                FROM bets WHERE match_kind = ? AND match_id = ? AND season_id = ?
+                GROUP BY predicted_winner_id
+                """,
+                (selected["matchKind"], selected["matchId"], season["id"]),
+            ).fetchall()
+            distribution = [{"playerId": row["predicted_winner_id"], "participants": row["participants"], "stake": row["stake"]} for row in rows]
+    def public_live_event(row: object) -> dict[str, object]:
+        payload = json_object(row["payload_json"])
+        for key in ("internalNote", "adminNote", "createdBy", "updatedBy", "moderation"):
+            payload.pop(key, None)
+        return {
+            "id": row["id"], "type": row["event_type"],
+            "payload": payload, "createdAt": row["created_at"],
+        }
+
+    return {
+        "active": bool(selected.get("inProgress")), "match": selected,
+        "betting": lock, "predictionDistribution": distribution,
+        "season": {"id": season["id"], "status": season["status"]} if season else None,
+        "events": [public_live_event(row) for row in events],
+    }
+
+
+def save_live_event(payload: dict[str, object], username: str) -> dict[str, object]:
+    event_type = str(payload.get("eventType") or "")
+    match_kind = clean_short_text(payload.get("matchKind") or "league", 30)
+    match_id = clean_short_text(payload.get("matchId"), 120)
+    if event_type not in LIVE_EVENT_TYPES or not match_id:
+        raise ValueError("Evento ao vivo inválido.")
+    event_id = f"live-{uuid.uuid4()}"
+    event_payload = payload.get("payload") if isinstance(payload.get("payload"), dict) else {}
+    with DB_LOCK, connect_database() as connection:
+        if not IS_POSTGRES:
+            connection.execute("BEGIN IMMEDIATE")
+        else:
+            connection.execute("SELECT id FROM app_state WHERE id = 1 FOR UPDATE")
+        connection.execute(
+            "INSERT INTO match_live_events (id, match_kind, match_id, event_type, payload_json, created_by, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (event_id, match_kind, match_id, event_type, json.dumps(event_payload, ensure_ascii=False), username, utc_now()),
+        )
+        if event_type == "started":
+            set_status = "locked"
+            connection.execute(
+                """
+                INSERT INTO match_betting_controls
+                    (match_kind, match_id, betting_status, lock_at, note, updated_by, updated_at)
+                VALUES (?, ?, ?, ?, 'Fechado pelo início da partida', ?, ?)
+                ON CONFLICT(match_kind, match_id) DO UPDATE SET betting_status = excluded.betting_status,
+                    lock_at = excluded.lock_at, updated_by = excluded.updated_by, updated_at = excluded.updated_at
+                """,
+                (match_kind, match_id, set_status, utc_now(), username, utc_now()),
+            )
+        audit_record(connection, "live.event_created", "match", match_id, {"eventId": event_id, "type": event_type}, username)
+        connection.commit()
+    return {"id": event_id, "matchKind": match_kind, "matchId": match_id, "eventType": event_type, "payload": event_payload}
+
+
+def save_notification_subscription(payload: dict[str, object], visitor_id: str, bettor_id: str | None) -> dict[str, object]:
+    endpoint = str(payload.get("endpoint") or "").strip()
+    subscription = payload.get("subscription") if isinstance(payload.get("subscription"), dict) else payload
+    preferences = payload.get("preferences") if isinstance(payload.get("preferences"), dict) else {}
+    if not endpoint or len(endpoint) > 2000:
+        raise ValueError("Assinatura de notificação inválida.")
+    now = utc_now()
+    with DB_LOCK, connect_database() as connection:
+        subscription_id = f"notification-{uuid.uuid4()}"
+        connection.execute(
+            """
+            INSERT INTO notification_subscriptions
+                (id, visitor_id, bettor_id, endpoint, subscription_json, preferences_json, active, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?)
+            ON CONFLICT(endpoint) DO UPDATE SET visitor_id = excluded.visitor_id,
+                bettor_id = excluded.bettor_id, subscription_json = excluded.subscription_json,
+                preferences_json = excluded.preferences_json, active = 1, updated_at = excluded.updated_at
+            """,
+            (subscription_id, visitor_id, bettor_id, endpoint, json.dumps(subscription), json.dumps(preferences), now, now),
+        )
+        connection.commit()
+    return {"ok": True, "endpoint": endpoint, "preferences": preferences, "active": True}
 
 
 def verify_admin_credentials(username: str, password: str) -> bool:
@@ -3481,8 +4776,130 @@ class TournamentHandler(SimpleHTTPRequestHandler):
             except Exception as error:  # pragma: no cover
                 self.send_json(
                     HTTPStatus.INTERNAL_SERVER_ERROR,
-                    {"error": "Não foi possível carregar o bolão.", "detail": str(error)},
+                    {"error": "Não foi possível carregar o bolão."},
                 )
+            return
+        if path == "/api/bets/me":
+            try:
+                bettor = bettor_from_token(self.bettor_token())
+                if bettor is None:
+                    raise PermissionError("Entre no bolão para continuar.")
+                snapshot = betting_snapshot(self.bettor_token())
+                self.send_json(HTTPStatus.OK, {"profile": snapshot["profile"], "myBets": snapshot["myBets"], "season": snapshot["season"]})
+            except PermissionError as error:
+                self.send_json(HTTPStatus.UNAUTHORIZED, {"error": str(error)})
+            return
+        if path == "/api/bets/matches":
+            self.send_json(HTTPStatus.OK, betting_matches_payload(self.bettor_token()))
+            return
+        if path == "/api/bets/rules":
+            self.send_json(HTTPStatus.OK, {"rules": current_betting_rules()})
+            return
+        if path == "/api/bets/leaderboard":
+            try:
+                round_value = query.get("round", [""])[0]
+                round_number = int(round_value) if round_value else None
+                self.send_json(HTTPStatus.OK, betting_leaderboard(
+                    query.get("scope", ["overall"])[0],
+                    round_number,
+                    query.get("seasonId", [""])[0] or None,
+                ))
+            except ValueError as error:
+                self.send_json(HTTPStatus.BAD_REQUEST, {"error": str(error)})
+            return
+        if path == "/api/bets/history":
+            try:
+                self.send_json(HTTPStatus.OK, betting_history(
+                    self.bettor_token(), query.get("status", [""])[0], query.get("cursor", [""])[0]
+                ))
+            except PermissionError as error:
+                self.send_json(HTTPStatus.UNAUTHORIZED, {"error": str(error)})
+            return
+        if path == "/api/bets/preview":
+            try:
+                self.send_json(HTTPStatus.OK, wager_preview(
+                    self.bettor_token(), query.get("matchId", [""])[0],
+                    query.get("winnerId", [""])[0], query.get("stake", ["0"])[0],
+                ))
+            except ValueError as error:
+                self.send_json(HTTPStatus.BAD_REQUEST, {"error": str(error)})
+            return
+        if path == "/api/admin/bets/settings":
+            if not self.require_authentication():
+                return
+            with connect_database() as connection:
+                season = connection.execute(
+                    """
+                    SELECT * FROM betting_seasons
+                    ORDER BY CASE status WHEN 'active' THEN 0 WHEN 'archived' THEN 1 ELSE 2 END,
+                             created_at DESC LIMIT 1
+                    """
+                ).fetchone()
+                if season is None:
+                    self.send_json(HTTPStatus.NOT_FOUND, {"error": "Temporada não encontrada."})
+                    return
+                self.send_json(HTTPStatus.OK, {"season": {
+                    "id": season["id"], "title": season["title"], "status": season["status"],
+                    "rules": normalize_betting_rules(json_object(season["rules_json"])),
+                }})
+            return
+        if path == "/api/admin/bets/participants":
+            if not self.require_authentication():
+                return
+            snapshot = betting_snapshot(None)
+            by_id = {str(item["id"]): item for item in snapshot["leaderboard"]}
+            with connect_database() as connection:
+                bettor_rows = connection.execute("SELECT id, name, active, created_at FROM bettors ORDER BY created_at").fetchall()
+            self.send_json(HTTPStatus.OK, {"participants": [{
+                **by_id.get(str(row["id"]), {
+                    "id": row["id"], "name": row["name"], "settledBalance": 0,
+                    "availableBalance": 0, "pendingStake": 0, "profit": 0,
+                    "wins": 0, "losses": 0, "pending": 0, "voided": 0,
+                    "accuracy": 0, "betCount": 0,
+                }),
+                "active": bool(row["active"]), "createdAt": row["created_at"],
+            } for row in bettor_rows]})
+            return
+        if path == "/api/admin/bets/events":
+            if not self.require_authentication():
+                return
+            try:
+                limit = max(1, min(500, int(query.get("limit", ["100"])[0])))
+            except ValueError:
+                limit = 100
+            with connect_database() as connection:
+                rows = connection.execute("SELECT * FROM bet_events ORDER BY created_at DESC, id DESC LIMIT ?", (limit,)).fetchall()
+            self.send_json(HTTPStatus.OK, {"events": [{
+                "id": row["id"], "betId": row["bet_id"], "bettorId": row["bettor_id"],
+                "type": row["event_type"], "detail": json_object(row["detail_json"]),
+                "actorType": row["actor_type"], "actorId": row["actor_id"], "createdAt": row["created_at"],
+            } for row in rows]})
+            return
+        if path == "/api/admin/bets/seasons":
+            if not self.require_authentication():
+                return
+            with connect_database() as connection:
+                rows = connection.execute(
+                    "SELECT * FROM betting_seasons ORDER BY created_at DESC"
+                ).fetchall()
+            self.send_json(HTTPStatus.OK, {"seasons": [{
+                "id": row["id"], "title": row["title"], "status": row["status"],
+                "startsAt": row["starts_at"], "endsAt": row["ends_at"],
+                "initialBalance": row["initial_balance"],
+                "rules": json_object(row["rules_json"]),
+                "snapshot": json_object(row["snapshot_json"]) if row["snapshot_json"] else None,
+                "createdAt": row["created_at"], "archivedAt": row["archived_at"],
+            } for row in rows]})
+            return
+        if path == "/api/live":
+            self.send_json(HTTPStatus.OK, live_payload(query.get("matchId", [""])[0]))
+            return
+        if path == "/api/home":
+            state = public_state_payload()
+            self.send_json(HTTPStatus.OK, {
+                "state": state, "live": live_payload(),
+                "betting": {"leaderboard": betting_leaderboard("overall")["leaderboard"][:5]},
+            })
             return
 
         if path == "/api/auth":
@@ -3528,6 +4945,67 @@ class TournamentHandler(SimpleHTTPRequestHandler):
 
     def do_PUT(self) -> None:  # noqa: N802
         path = self.request_path()
+        if path == "/api/bettors/profile":
+            try:
+                enforce_betting_rate_limit(self.client_origin_key(), "profile", 10, 60)
+                self.send_json(HTTPStatus.OK, {"profile": update_bettor_profile(
+                    self.bettor_token(), self.read_json_body()
+                )})
+            except PermissionError as error:
+                self.send_json(HTTPStatus.UNAUTHORIZED, {"error": str(error)})
+            except ValueError as error:
+                self.send_json(HTTPStatus.BAD_REQUEST, {"error": str(error)})
+            except RuntimeError:
+                self.send_json(HTTPStatus.TOO_MANY_REQUESTS, {"error": "Muitas alterações em pouco tempo."})
+            return
+        if path == "/api/admin/bets/settings":
+            if not self.require_authentication():
+                return
+            try:
+                result = update_betting_settings(
+                    self.read_json_body(), session_username(self.session_token()) or ADMIN_USERNAME
+                )
+                self.send_json(HTTPStatus.OK, result)
+            except ValueError as error:
+                self.send_json(HTTPStatus.BAD_REQUEST, {"error": str(error)})
+            return
+        if path == "/api/admin/bets/participants":
+            if not self.require_authentication():
+                return
+            try:
+                body = self.read_json_body()
+                bettor_id = clean_short_text(body.get("bettorId"), 120)
+                active = 1 if body.get("active", True) else 0
+                with DB_LOCK, connect_database() as connection:
+                    cursor = connection.execute(
+                        "UPDATE bettors SET active = ?, updated_at = ? WHERE id = ?",
+                        (active, utc_now(), bettor_id),
+                    )
+                    if not cursor.rowcount:
+                        raise LookupError("Participante não encontrado.")
+                    audit_record(connection, "bets.participant_updated", "bettor", bettor_id, {"active": bool(active)}, session_username(self.session_token()) or ADMIN_USERNAME)
+                    connection.commit()
+                self.send_json(HTTPStatus.OK, {"ok": True, "bettorId": bettor_id, "active": bool(active)})
+            except LookupError as error:
+                self.send_json(HTTPStatus.NOT_FOUND, {"error": str(error)})
+            return
+        if path == "/api/notifications/preferences":
+            try:
+                body = self.read_json_body()
+                endpoint = str(body.get("endpoint") or "").strip()
+                preferences = body.get("preferences") if isinstance(body.get("preferences"), dict) else {}
+                with DB_LOCK, connect_database() as connection:
+                    cursor = connection.execute(
+                        "UPDATE notification_subscriptions SET preferences_json = ?, updated_at = ? WHERE endpoint = ? AND visitor_id = ?",
+                        (json.dumps(preferences), utc_now(), endpoint, self.visitor_id()),
+                    )
+                    connection.commit()
+                if not cursor.rowcount:
+                    raise LookupError("Assinatura não encontrada.")
+                self.send_json(HTTPStatus.OK, {"ok": True, "preferences": preferences})
+            except LookupError as error:
+                self.send_json(HTTPStatus.NOT_FOUND, {"error": str(error)})
+            return
         if path != "/api/state":
             self.send_error(HTTPStatus.NOT_FOUND)
             return
@@ -3765,8 +5243,110 @@ class TournamentHandler(SimpleHTTPRequestHandler):
         if path == "/api/bets/cancel":
             self.handle_cancel_wager()
             return
+        if path == "/api/admin/bets/adjust-balance":
+            if not self.require_authentication():
+                return
+            try:
+                self.send_json(HTTPStatus.OK, adjust_bettor_balance(
+                    self.read_json_body(), session_username(self.session_token()) or ADMIN_USERNAME
+                ))
+            except ValueError as error:
+                self.send_json(HTTPStatus.BAD_REQUEST, {"error": str(error)})
+            except LookupError as error:
+                self.send_json(HTTPStatus.NOT_FOUND, {"error": str(error)})
+            return
+        if path in {"/api/admin/bets/lock-match", "/api/admin/bets/reopen-match"}:
+            if not self.require_authentication():
+                return
+            try:
+                self.send_json(HTTPStatus.OK, set_match_betting_control(
+                    self.read_json_body(), session_username(self.session_token()) or ADMIN_USERNAME,
+                    reopen=path.endswith("reopen-match"),
+                ))
+            except ValueError as error:
+                self.send_json(HTTPStatus.BAD_REQUEST, {"error": str(error)})
+            return
+        if path == "/api/admin/bets/settle-preview":
+            if not self.require_authentication():
+                return
+            state = read_state().get("state") or {}
+            matches = collect_bettable_matches(state)
+            with connect_database() as connection:
+                rows = connection.execute("SELECT * FROM bets").fetchall()
+            self.send_json(HTTPStatus.OK, {"settlements": [{
+                "betId": row["id"], "previousStatus": row["settlement_status"],
+                "status": settlement_for(row, matches.get((row["match_kind"], row["match_id"])))[0],
+                "delta": settlement_for(row, matches.get((row["match_kind"], row["match_id"])))[1],
+            } for row in rows]})
+            return
+        if path == "/api/admin/bets/reprocess":
+            if not self.require_authentication():
+                return
+            state = read_state().get("state") or {}
+            with DB_LOCK, connect_database() as connection:
+                count = sync_bet_settlements(connection, state, session_username(self.session_token()) or ADMIN_USERNAME)
+                grant_achievements(connection)
+                connection.commit()
+            self.send_json(HTTPStatus.OK, {"ok": True, "reprocessed": count})
+            return
+        if path == "/api/admin/bets/seasons":
+            if not self.require_authentication():
+                return
+            try:
+                self.send_json(HTTPStatus.CREATED, {"season": create_betting_season(
+                    self.read_json_body(), session_username(self.session_token()) or ADMIN_USERNAME
+                )})
+            except ValueError as error:
+                self.send_json(HTTPStatus.BAD_REQUEST, {"error": str(error)})
+            return
+        if path == "/api/admin/bets/seasons/archive":
+            if not self.require_authentication():
+                return
+            try:
+                with BET_ACTION_LOCK:
+                    season = archive_betting_season(
+                        self.read_json_body(), session_username(self.session_token()) or ADMIN_USERNAME
+                    )
+                self.send_json(HTTPStatus.OK, {"season": season})
+            except ValueError as error:
+                self.send_json(HTTPStatus.BAD_REQUEST, {"error": str(error)})
+            return
+        if path == "/api/admin/live/events":
+            if not self.require_authentication():
+                return
+            try:
+                self.send_json(HTTPStatus.CREATED, {"event": save_live_event(
+                    self.read_json_body(), session_username(self.session_token()) or ADMIN_USERNAME
+                )})
+            except ValueError as error:
+                self.send_json(HTTPStatus.BAD_REQUEST, {"error": str(error)})
+            return
+        if path == "/api/notifications/subscribe":
+            try:
+                body = self.read_json_body()
+                bettor = bettor_from_token(self.bettor_token())
+                self.send_json(HTTPStatus.CREATED, save_notification_subscription(
+                    body, self.visitor_id(), str(bettor["id"]) if bettor else None
+                ))
+            except ValueError as error:
+                self.send_json(HTTPStatus.BAD_REQUEST, {"error": str(error)})
+            return
+        if path == "/api/admin/notifications/test":
+            if not self.require_authentication():
+                return
+            with connect_database() as connection:
+                total = connection.execute("SELECT COUNT(*) AS total FROM notification_subscriptions WHERE active = 1").fetchone()
+            self.send_json(HTTPStatus.OK, {"ok": True, "queued": int(total["total"] or 0), "delivery": "local-preview-only"})
+            return
         if path == "/api/bets/reset":
             if not self.require_authentication():
+                return
+            if os.environ.get("SINUCA_ENABLE_BET_RESET") != "1":
+                self.send_json(HTTPStatus.GONE, {"error": "A redefinição destrutiva está desativada. Use temporadas."})
+                return
+            body = self.read_json_body()
+            if body.get("confirmation") != "ZERAR BOLAO" or not body.get("backupConfirmed"):
+                self.send_json(HTTPStatus.BAD_REQUEST, {"error": "Confirmação reforçada e backup são obrigatórios."})
                 return
             reset_betting_pool()
             self.send_json(HTTPStatus.OK, {"ok": True})
@@ -3784,6 +5364,36 @@ class TournamentHandler(SimpleHTTPRequestHandler):
 
     def do_DELETE(self) -> None:  # noqa: N802
         path = self.request_path()
+        if path == "/api/notifications/subscribe":
+            try:
+                body = self.read_json_body()
+                endpoint = str(body.get("endpoint") or "").strip()
+                with DB_LOCK, connect_database() as connection:
+                    cursor = connection.execute(
+                        "UPDATE notification_subscriptions SET active = 0, updated_at = ? WHERE endpoint = ? AND visitor_id = ?",
+                        (utc_now(), endpoint, self.visitor_id()),
+                    )
+                    connection.commit()
+                self.send_json(HTTPStatus.OK, {"ok": bool(cursor.rowcount)})
+            except ValueError as error:
+                self.send_json(HTTPStatus.BAD_REQUEST, {"error": str(error)})
+            return
+        if path == "/api/admin/live/events":
+            if not self.require_authentication():
+                return
+            event_id = parse_qs(urlparse(self.path).query).get("id", [""])[0]
+            username = session_username(self.session_token()) or ADMIN_USERNAME
+            with DB_LOCK, connect_database() as connection:
+                row = connection.execute("SELECT * FROM match_live_events WHERE id = ?", (event_id,)).fetchone()
+                if row:
+                    connection.execute("DELETE FROM match_live_events WHERE id = ?", (event_id,))
+                    audit_record(connection, "live.event_deleted", "match", row["match_id"], {"eventId": event_id, "type": row["event_type"]}, username)
+                    connection.commit()
+            if not row:
+                self.send_json(HTTPStatus.NOT_FOUND, {"error": "Evento não encontrado."})
+            else:
+                self.send_json(HTTPStatus.OK, {"ok": True})
+            return
         if path not in {"/api/news", "/api/news/comments", "/api/polls", "/api/community", "/api/awards"}:
             self.send_error(HTTPStatus.NOT_FOUND)
             return
@@ -3895,50 +5505,78 @@ class TournamentHandler(SimpleHTTPRequestHandler):
 
     def handle_bettor_register(self) -> None:
         try:
+            enforce_betting_rate_limit(self.client_origin_key(), "register", 5, 600)
             body = self.read_json_body()
             result = register_bettor(body.get("name"), body.get("pin"))
             self.send_json(HTTPStatus.CREATED, {"ok": True, **result})
         except ValueError as error:
             status = HTTPStatus.CONFLICT if "já está" in str(error) else HTTPStatus.BAD_REQUEST
             self.send_json(status, {"error": str(error)})
+        except RuntimeError as error:
+            if str(error) == "rate_limit":
+                self.send_json(HTTPStatus.TOO_MANY_REQUESTS, {"error": "Muitas tentativas. Aguarde antes de tentar novamente."})
+                return
+            raise
         except Exception as error:  # pragma: no cover
-            self.send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": "Não foi possível criar o perfil.", "detail": str(error)})
+            self.send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": "Não foi possível criar o perfil."})
 
     def handle_bettor_login(self) -> None:
         try:
+            enforce_betting_rate_limit(self.client_origin_key(), "bettor_login", 10, 300)
             body = self.read_json_body()
             result = login_bettor(body.get("name"), body.get("pin"))
             self.send_json(HTTPStatus.OK, {"ok": True, **result})
         except (ValueError, PermissionError) as error:
             self.send_json(HTTPStatus.UNAUTHORIZED, {"error": str(error)})
+        except RuntimeError as error:
+            if str(error) == "rate_limit":
+                self.send_json(HTTPStatus.TOO_MANY_REQUESTS, {"error": "Muitas tentativas. Aguarde antes de tentar novamente."})
+                return
+            raise
         except Exception as error:  # pragma: no cover
-            self.send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": "Não foi possível entrar no bolão.", "detail": str(error)})
+            self.send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": "Não foi possível entrar no bolão."})
 
     def handle_wager(self) -> None:
         try:
+            enforce_betting_rate_limit(self.client_origin_key(), "wager", 20, 60)
             body = self.read_json_body()
             with BET_ACTION_LOCK:
                 snapshot = place_wager(self.bettor_token(), body)
             self.send_json(HTTPStatus.OK, snapshot)
         except PermissionError as error:
             self.send_json(HTTPStatus.UNAUTHORIZED, {"error": str(error)})
+        except ConflictError as error:
+            self.send_json(HTTPStatus.CONFLICT, {"error": str(error), "conflict": True})
         except ValueError as error:
             self.send_json(HTTPStatus.BAD_REQUEST, {"error": str(error)})
+        except RuntimeError as error:
+            if str(error) == "rate_limit":
+                self.send_json(HTTPStatus.TOO_MANY_REQUESTS, {"error": "Muitas alterações em pouco tempo."})
+                return
+            raise
         except Exception as error:  # pragma: no cover
-            self.send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": "Não foi possível salvar a aposta.", "detail": str(error)})
+            self.send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": "Não foi possível salvar a aposta."})
 
     def handle_cancel_wager(self) -> None:
         try:
+            enforce_betting_rate_limit(self.client_origin_key(), "cancel", 20, 60)
             body = self.read_json_body()
             with BET_ACTION_LOCK:
                 snapshot = cancel_wager(self.bettor_token(), body)
             self.send_json(HTTPStatus.OK, snapshot)
         except PermissionError as error:
             self.send_json(HTTPStatus.UNAUTHORIZED, {"error": str(error)})
+        except ConflictError as error:
+            self.send_json(HTTPStatus.CONFLICT, {"error": str(error), "conflict": True})
         except ValueError as error:
             self.send_json(HTTPStatus.BAD_REQUEST, {"error": str(error)})
+        except RuntimeError as error:
+            if str(error) == "rate_limit":
+                self.send_json(HTTPStatus.TOO_MANY_REQUESTS, {"error": "Muitas alterações em pouco tempo."})
+                return
+            raise
         except Exception as error:  # pragma: no cover
-            self.send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": "Não foi possível cancelar a aposta.", "detail": str(error)})
+            self.send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": "Não foi possível cancelar a aposta."})
 
     def handle_login(self) -> None:
         client_key = self.client_origin_key()

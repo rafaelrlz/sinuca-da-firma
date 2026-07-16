@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-labelledby="title">
+  <title id="title">Sinuca da Firma</title>
+  <rect width="512" height="512" rx="96" fill="#062c21"/>
+  <circle cx="256" cy="256" r="172" fill="#fff"/>
+  <circle cx="256" cy="256" r="82" fill="#17231d"/>
+  <text x="256" y="294" text-anchor="middle" font-family="Arial, sans-serif" font-size="112" font-weight="800" fill="#fff">8</text>
+</svg>

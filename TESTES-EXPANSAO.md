@@ -61,12 +61,27 @@ Este roteiro valida a migração e as funcionalidades do `SDD-EXPANSAO-DO-SITE.m
 python -m py_compile server.py database.py api/index.py scripts/test_expansion_api.py
 python scripts/test_expansion_api.py
 python scripts/test_betting_balance_migration.py
+python scripts/test_betting_v2.py
 node scripts/test_expansion_domain.js
+node scripts/test_betting_domain.js
 node scripts/test_league_bye_expansion.js
 node --check app.js
 node --check bolao.js
 node --check expansion-domain.js
 node --check league-schedule.js
 node --check login.js
+node --check betting-domain.js
+node --check sw.js
 git diff --check
 ```
+
+## Gate do Campeonato Vivo e Bolão 2.0
+
+- iniciar duas vezes uma cópia do banco e confirmar os markers `betting_v2` e `betting_v2_season_key`;
+- comparar contagens de `app_state`, `bettors`, `bets`, notícias e comunidade antes/depois;
+- executar `PRAGMA integrity_check`;
+- testar corrida entre início/bloqueio e envio do palpite, esperando HTTP `409`;
+- cancelar e refazer palpite sem perder a timeline;
+- arquivar uma temporada com anulação explícita das pendências e criar a próxima separadamente;
+- validar `/`, `/#live`, `/#betting-admin` e `/bolao` em 320, 390, 768 e 1440 px;
+- conferir no Cache Storage que nenhuma URL `/api/` foi armazenada.

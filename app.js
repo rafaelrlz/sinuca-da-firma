@@ -6,6 +6,8 @@
   const NEWS_VISITOR_STORAGE_KEY = "sinuca-news-visitor-v1";
   const APP_VERSION = 5;
   const SYNC_INTERVAL_MS = 4000;
+  const LIVE_SYNC_INTERVAL_MS = 12000;
+  const LIVE_BACKGROUND_SYNC_INTERVAL_MS = 45000;
   const MAX_PLAYERS = 32;
   const MAX_BALLS_PER_PLAYER = 8;
   const BALANCE_BALLS_PER_PLAYER = 8;
@@ -14,6 +16,7 @@
   const HIDDEN_VIEWS = new Set(["draw", "matches", "ranking"]);
   const PUBLIC_VIEWS = new Set([
     "dashboard",
+    "live",
     "league",
     "league-ranking",
     "schedule",
@@ -71,12 +74,25 @@
     "prepare-card",
     "generate-match-news",
     "download-card",
+    "publish-live-event",
+    "delete-live-event",
+    "refresh-betting-admin",
+    "toggle-bettor-active",
+    "lock-betting-match",
+    "reopen-betting-match",
+    "reprocess-bets",
+    "archive-betting-season",
+    "focus-balance-adjustment",
   ]);
 
   const VIEW_META = {
     dashboard: {
       title: "Visão geral",
       subtitle: "Acompanhe o andamento do campeonato.",
+    },
+    live: {
+      title: "Central ao Vivo",
+      subtitle: "Acompanhe a partida em andamento, lance a lance.",
     },
     players: {
       title: "Jogadores",
@@ -154,6 +170,10 @@
       title: "Configurações",
       subtitle: "Personalize regras, pontuação e dados persistentes.",
     },
+    "betting-admin": {
+      title: "Gestão do bolão",
+      subtitle: "Configure regras, participantes, partidas e temporadas com auditoria.",
+    },
   };
 
   const dom = {
@@ -197,6 +217,9 @@
     storageStatusDot: document.querySelector("#storage-status-dot"),
     storageStatusText: document.querySelector("#storage-status-text"),
     storageStatusSubtext: document.querySelector("#storage-status-subtext"),
+    connectionBanner: document.querySelector("#connection-banner"),
+    connectionBannerTitle: document.querySelector("#connection-banner-title"),
+    connectionBannerText: document.querySelector("#connection-banner-text"),
   };
 
   const ui = {
@@ -209,11 +232,22 @@
     scheduleRoundFilter: "all",
     scheduleStatusFilter: "all",
     scheduleAvailabilityFilter: "all",
+    scheduleView: "list",
+    scheduleCursor: new Date().toISOString().slice(0, 10),
     selectedPlayerId: null,
     selectedMatchId: null,
     selectedSeasonId: null,
     comparePlayerAId: "",
     comparePlayerBId: "",
+    comparePlayerCId: "",
+    statisticsSeason: "current",
+    statisticsPeriod: "all",
+    statisticsOpponent: "all",
+    newsSearch: "",
+    newsCategory: "all",
+    communityScope: "all",
+    communityReplyTo: null,
+    liveDisplayMode: false,
     cardType: "next",
     cardFormat: "square",
     newsDraft: null,
@@ -236,6 +270,20 @@
   let awards = [];
   let communityPosts = [];
   let contentReactions = {};
+  let liveSnapshot = null;
+  let liveError = "";
+  let liveLastUpdatedAt = 0;
+  let homeSnapshot = null;
+  let notificationPreferences = null;
+  let deferredInstallPrompt = null;
+  let serviceWorkerRegistration = null;
+  let bettingAdmin = {
+    loading: false,
+    error: "",
+    season: null,
+    participants: [],
+    events: [],
+  };
   let expansionLoading = true;
   let expansionError = "";
   let auth = { authenticated: false, username: null };
@@ -610,6 +658,225 @@
     expansionLoading = false;
   }
 
+  async function readBettingAdminData() {
+    if (!isAdmin()) return;
+    bettingAdmin.loading = true;
+    bettingAdmin.error = "";
+    try {
+      const [settings, participants, events] = await Promise.all([
+        fetchOptionalJSON("/api/admin/bets/settings"),
+        fetchOptionalJSON("/api/admin/bets/participants"),
+        fetchOptionalJSON("/api/admin/bets/events?limit=80"),
+      ]);
+      bettingAdmin = {
+        loading: false,
+        error: "",
+        season: settings.season || null,
+        participants: Array.isArray(participants.participants) ? participants.participants : [],
+        events: Array.isArray(events.events) ? events.events : [],
+      };
+    } catch (error) {
+      bettingAdmin.loading = false;
+      bettingAdmin.error = error.message || "Não foi possível carregar a gestão do bolão.";
+    }
+  }
+
+  function fallbackLiveSnapshot() {
+    const matches = [...leagueMatchMap().values()];
+    const match = matches.find((item) => item.inProgress)
+      || matches.find((item) => Boolean(state.league?.inProgress?.[item.id]))
+      || null;
+    if (!match) return { active: false, match: null, events: [], betting: null, source: "state" };
+    const entry = programmingEntry(match.id);
+    return {
+      active: true,
+      match: {
+        id: match.id,
+        matchId: match.id,
+        matchKind: "league",
+        roundNumber: match.roundNumber,
+        playerAId: match.playerAId,
+        playerBId: match.playerBId,
+        playerAName: playerName(match.playerAId),
+        playerBName: playerName(match.playerBId),
+        scoreA: Number(match.liveScore?.scoreA ?? match.scoreA ?? 0),
+        scoreB: Number(match.liveScore?.scoreB ?? match.scoreB ?? 0),
+        status: match.result ? "finished" : "in_progress",
+        scheduledAt: entry.scheduledAt || "",
+        location: entry.location || "",
+        result: match.result || null,
+      },
+      events: [],
+      betting: null,
+      source: "state",
+    };
+  }
+
+  function normalizeLiveSnapshot(payload) {
+    const source = payload?.live || payload || {};
+    const rawMatch = source.match || source.currentMatch || source.current_match || null;
+    if (!rawMatch) return { ...fallbackLiveSnapshot(), events: source.events || [] };
+    const matchId = String(rawMatch.id || rawMatch.matchId || rawMatch.match_id || "");
+    const official = leagueMatchMap().get(matchId);
+    const entry = programmingEntry(matchId);
+    const result = rawMatch.result || official?.result || null;
+    const distribution = source.predictionDistribution || source.prediction_distribution || null;
+    const betting = distribution
+      ? {
+        ...(source.betting || {}),
+        options: distribution,
+        participants: distribution.reduce((sum, option) => sum + (Number(option.participants) || 0), 0),
+        totalStake: distribution.reduce((sum, option) => sum + (Number(option.stake) || 0), 0),
+        visible: true,
+      }
+      : source.betting
+        ? { ...source.betting, visible: false }
+        : source.pool || source.predictions || null;
+    return {
+      active: source.active !== false && !["finished", "cancelled"].includes(String(rawMatch.status || source.status || "").toLowerCase()),
+      match: {
+        ...rawMatch,
+        id: matchId,
+        matchId,
+        matchKind: rawMatch.matchKind || rawMatch.match_kind || "league",
+        roundNumber: Number(rawMatch.roundNumber || rawMatch.round_number || official?.roundNumber || String(rawMatch.roundName || "").match(/\d+/)?.[0]) || 0,
+        playerAId: String(rawMatch.playerAId || rawMatch.player_a_id || official?.playerAId || ""),
+        playerBId: String(rawMatch.playerBId || rawMatch.player_b_id || official?.playerBId || ""),
+        playerAName: rawMatch.playerAName || rawMatch.player_a_name || playerName(rawMatch.playerAId || rawMatch.player_a_id || official?.playerAId),
+        playerBName: rawMatch.playerBName || rawMatch.player_b_name || playerName(rawMatch.playerBId || rawMatch.player_b_id || official?.playerBId),
+        scoreA: Number(rawMatch.scoreA ?? rawMatch.score_a ?? rawMatch.score?.a ?? result?.scoreA ?? 0),
+        scoreB: Number(rawMatch.scoreB ?? rawMatch.score_b ?? rawMatch.score?.b ?? result?.scoreB ?? 0),
+        scheduledAt: rawMatch.scheduledAt || rawMatch.scheduled_at || entry.scheduledAt || "",
+        location: rawMatch.location || entry.location || "",
+        status: rawMatch.status || source.status || (source.active ? "in_progress" : "finished"),
+        result,
+      },
+      events: Array.isArray(source.events) ? source.events : [],
+      betting,
+      reactions: source.reactions || null,
+      updatedAt: source.updatedAt || source.updated_at || new Date().toISOString(),
+      source: "api",
+    };
+  }
+
+  async function readLiveData({ silent = false } = {}) {
+    try {
+      const payload = await fetchOptionalJSON("/api/live");
+      liveSnapshot = normalizeLiveSnapshot(payload);
+      liveError = "";
+      liveLastUpdatedAt = Date.now();
+      return liveSnapshot;
+    } catch (error) {
+      liveSnapshot = fallbackLiveSnapshot();
+      liveError = navigator.onLine ? "A atualização ao vivo está temporariamente indisponível." : "Sem conexão. Exibindo o último estado disponível.";
+      if (!silent) console.warn("Central ao Vivo em modo compatível.", error);
+      return liveSnapshot;
+    }
+  }
+
+  async function readHomeData() {
+    try {
+      homeSnapshot = await fetchOptionalJSON("/api/home");
+      if (homeSnapshot?.live && (!liveSnapshot || liveSnapshot.source === "state")) {
+        liveSnapshot = normalizeLiveSnapshot(homeSnapshot.live);
+        liveLastUpdatedAt = Date.now();
+      }
+    } catch (error) {
+      homeSnapshot = null;
+    }
+    return homeSnapshot;
+  }
+
+  function updateConnectionBanner() {
+    if (!dom.connectionBanner) return;
+    const offline = !navigator.onLine;
+    dom.connectionBanner.hidden = !offline;
+    if (offline) {
+      dom.connectionBannerTitle.textContent = "Você está offline";
+      dom.connectionBannerText.textContent = "Mostrando a última versão pública disponível neste aparelho.";
+    }
+  }
+
+  async function registerProgressiveWebApp() {
+    updateConnectionBanner();
+    if (!("serviceWorker" in navigator) || !window.isSecureContext) return;
+    try {
+      serviceWorkerRegistration = await navigator.serviceWorker.register("/sw.js", { scope: "/" });
+    } catch (error) {
+      console.warn("O modo offline não pôde ser ativado.", error);
+    }
+  }
+
+  function notificationPreferenceState() {
+    if (notificationPreferences) return notificationPreferences;
+    try {
+      notificationPreferences = JSON.parse(localStorage.getItem("sinuca-notification-preferences-v1") || "null");
+    } catch (error) {
+      notificationPreferences = null;
+    }
+    return notificationPreferences || {
+      enabled: false,
+      closing: true,
+      started: true,
+      result: true,
+    };
+  }
+
+  async function saveNotificationPreferences(form) {
+    const values = new FormData(form);
+    const next = {
+      enabled: values.get("enabled") === "on",
+      closing: values.get("closing") === "on",
+      started: values.get("started") === "on",
+      result: values.get("result") === "on",
+    };
+    let subscription = serviceWorkerRegistration
+      ? await serviceWorkerRegistration.pushManager?.getSubscription().catch(() => null)
+      : null;
+    if (next.enabled && "Notification" in window) {
+      const permission = await Notification.requestPermission();
+      if (permission !== "granted") {
+        next.enabled = false;
+        showToast("As notificações não foram autorizadas neste navegador.", "error");
+      }
+    }
+    if (next.enabled && !subscription && serviceWorkerRegistration?.pushManager) {
+      try {
+        subscription = await serviceWorkerRegistration.pushManager.subscribe({ userVisibleOnly: true });
+      } catch (error) {
+        next.enabled = false;
+        showToast("Este navegador precisa de uma chave de notificações configurada pelo administrador.", "error");
+      }
+    }
+    notificationPreferences = next;
+    localStorage.setItem("sinuca-notification-preferences-v1", JSON.stringify(next));
+    try {
+      if (next.enabled && subscription) {
+        const serialized = subscription.toJSON();
+        await fetchOptionalJSON("/api/notifications/subscribe", {
+          method: "POST",
+          headers: { "Content-Type": "application/json", "X-Visitor-ID": newsVisitorId() },
+          body: JSON.stringify({ endpoint: subscription.endpoint, subscription: serialized, preferences: next }),
+        });
+      } else if (subscription) {
+        await fetchOptionalJSON("/api/notifications/subscribe", {
+          method: "DELETE",
+          headers: { "Content-Type": "application/json", "X-Visitor-ID": newsVisitorId() },
+          body: JSON.stringify({ endpoint: subscription.endpoint }),
+        });
+        await subscription.unsubscribe();
+      }
+    } catch (error) {
+      next.enabled = false;
+      notificationPreferences = next;
+      localStorage.setItem("sinuca-notification-preferences-v1", JSON.stringify(next));
+      showToast("Não foi possível registrar os avisos no servidor.", "error");
+    }
+    if (next.enabled) showToast("Preferências de avisos salvas.");
+    else if (!("Notification" in window) || Notification.permission !== "denied") showToast("Avisos desativados.");
+    render();
+  }
+
   function decodeRoutePart(value) {
     try {
       return decodeURIComponent(value || "");
@@ -665,6 +932,9 @@
     const stateRequest = readStateFromServer();
     const newsRequest = readNewsFromServer();
     const expansionRequest = readExpansionData();
+    const liveRequest = readLiveData({ silent: true });
+    const homeRequest = readHomeData();
+    registerProgressiveWebApp();
 
     try {
       const authPayload = await authRequest;
@@ -709,7 +979,10 @@
       expansionLoading = false;
       expansionError = "Os recursos ampliados estão temporariamente indisponíveis.";
     }
-    if (isAdmin()) await readExpansionData().catch(() => undefined);
+    await Promise.allSettled([liveRequest, homeRequest]);
+    if (isAdmin()) {
+      await Promise.allSettled([readExpansionData(), readBettingAdminData()]);
+    }
 
     const requestedRoute = readRoute();
     const requestedView = requestedRoute.view;
@@ -733,6 +1006,12 @@
         reloadCommunity("match", ui.selectedMatchId),
       ]);
     }
+    if (requestedView === "live" && liveMatch()?.id) {
+      await Promise.allSettled([
+        loadReactions("match", liveMatch().id),
+        reloadCommunity("match", liveMatch().id),
+      ]);
+    }
     if (VIEW_META[requestedView] && !HIDDEN_VIEWS.has(requestedView) && (isAdmin() || PUBLIC_VIEWS.has(requestedView))) {
       ui.currentView = requestedView;
     } else if (HIDDEN_VIEWS.has(requestedView)) {
@@ -745,6 +1024,13 @@
       window.requestAnimationFrame(() => document.querySelector("#public-league-ranking")?.scrollIntoView({ block: "start" }));
     }
     window.setInterval(syncFromServer, SYNC_INTERVAL_MS);
+    window.setInterval(async () => {
+      const interval = document.hidden ? LIVE_BACKGROUND_SYNC_INTERVAL_MS : LIVE_SYNC_INTERVAL_MS;
+      if (Date.now() - liveLastUpdatedAt < interval) return;
+      const before = JSON.stringify(liveSnapshot);
+      await readLiveData({ silent: true });
+      if (ui.currentView === "live" && before !== JSON.stringify(liveSnapshot)) render();
+    }, LIVE_SYNC_INTERVAL_MS);
   }
 
   async function syncFromServer() {
@@ -774,6 +1060,12 @@
       if (ui.currentView === "news") await readNewsFromServer();
       if (["players", "player", "match", "seasons", "hall", "season", "awards", "community"].includes(ui.currentView)) {
         await readExpansionData();
+      }
+      if (ui.currentView === "betting-admin" && isAdmin()) {
+        await readBettingAdminData();
+      }
+      if (["dashboard", "live", "match"].includes(ui.currentView)) {
+        await Promise.allSettled([readLiveData({ silent: true }), readHomeData()]);
       }
     } catch (error) {
       console.warn("Sincronização temporariamente indisponível.", error);
@@ -1047,14 +1339,22 @@
   function openMenu() {
     menuReturnFocus = document.activeElement;
     document.body.classList.add("menu-open");
+    updateSidebarInert();
     dom.menuButton.setAttribute("aria-expanded", "true");
     window.requestAnimationFrame(() => dom.sidebar?.querySelector(".nav-item")?.focus());
   }
 
   function closeMenu({ restoreFocus = false } = {}) {
     document.body.classList.remove("menu-open");
+    updateSidebarInert();
     dom.menuButton.setAttribute("aria-expanded", "false");
     if (restoreFocus && menuReturnFocus instanceof HTMLElement) menuReturnFocus.focus();
+  }
+
+  function updateSidebarInert() {
+    if (!dom.sidebar) return;
+    dom.sidebar.inert = window.matchMedia("(max-width: 840px)").matches
+      && !document.body.classList.contains("menu-open");
   }
 
   function render() {
@@ -1073,6 +1373,7 @@
 
       const renderers = {
         dashboard: renderDashboard,
+        live: renderLive,
         players: renderPlayers,
         league: renderLeague,
         "league-ranking": renderLeagueRanking,
@@ -1087,6 +1388,7 @@
         season: renderSeasonDetail,
         awards: renderAwards,
         community: renderCommunity,
+        "betting-admin": renderBettingAdmin,
         news: renderNews,
         draw: renderDraw,
         matches: renderMatches,
@@ -2077,6 +2379,138 @@
     };
   }
 
+  function liveMatch() {
+    return liveSnapshot?.match || fallbackLiveSnapshot().match;
+  }
+
+  function liveEventLabel(event) {
+    const type = String(event.eventType || event.event_type || event.type || "note");
+    return {
+      started: "Partida iniciada",
+      score_updated: "Placar atualizado",
+      note: "Nota da organização",
+      paused: "Partida pausada",
+      resumed: "Partida retomada",
+      finished: "Resultado confirmado",
+      corrected: "Informação corrigida",
+    }[type] || "Atualização da partida";
+  }
+
+  function renderLiveTimeline(events) {
+    if (!events.length) {
+      return `<div class="live-empty-timeline"><span aria-hidden="true">●</span><p><strong>A partida está em andamento.</strong> As atualizações da organização aparecerão aqui.</p></div>`;
+    }
+    return `<ol class="live-timeline">${[...events].reverse().map((event) => {
+      const payload = event.payload || event.payloadJson || event.payload_json || {};
+      const detail = payload.note || payload.text || payload.detail || event.note || event.detail || "";
+      const createdAt = event.createdAt || event.created_at || event.at || "";
+      return `<li>
+        <span aria-hidden="true"></span>
+        <div><strong>${escapeHTML(liveEventLabel(event))}</strong>${detail ? `<p>${escapeHTML(detail)}</p>` : ""}<time datetime="${escapeHTML(createdAt)}">${escapeHTML(formatDateTime(createdAt))}</time></div>
+        ${isAdmin() && event.id ? `<button class="icon-button" data-action="delete-live-event" data-event-id="${escapeHTML(event.id)}" aria-label="Remover atualização: ${escapeHTML(liveEventLabel(event))}">×</button>` : ""}
+      </li>`;
+    }).join("")}</ol>`;
+  }
+
+  function renderLiveBettingDistribution(betting, match) {
+    if (!betting || betting.visible === false || betting.visibility === "admin_only") {
+      return `<div class="live-private-data"><span aria-hidden="true">◉</span><div><strong>Palpites protegidos</strong><p>A distribuição será mostrada quando a regra de visibilidade permitir.</p></div></div>`;
+    }
+    const options = betting.options || betting.distribution || betting.players || [];
+    const normalized = Array.isArray(options)
+      ? options.map((option) => ({
+        playerId: String(option.playerId || option.player_id || option.id || ""),
+        name: option.name || option.playerName || playerName(option.playerId || option.player_id || option.id),
+        stake: Number(option.stake || option.totalStake || option.total_stake || option.chips || 0),
+        percent: Number(option.percent || option.percentage || option.share || 0),
+      }))
+      : Object.entries(options).map(([playerId, option]) => ({
+        playerId,
+        name: option.name || playerName(playerId),
+        stake: Number(option.stake || option.chips || option || 0),
+        percent: Number(option.percent || option.percentage || 0),
+      }));
+    const totalStake = Number(betting.totalStake || betting.total_stake || normalized.reduce((sum, item) => sum + item.stake, 0));
+    normalized.forEach((item) => {
+      if (!item.percent && totalStake) item.percent = Math.round((item.stake / totalStake) * 100);
+    });
+    if (!normalized.length) return `<p class="live-no-bets">Nenhum palpite público para este confronto.</p>`;
+    return `<div class="live-betting">
+      <div class="live-betting-summary"><span><strong>${Number(betting.participants || betting.participantCount || betting.participant_count) || 0}</strong> participantes</span><span><strong>${totalStake}</strong> fichas virtuais</span></div>
+      ${normalized.slice(0, 2).map((item) => `<div class="live-betting-row"><span><strong>${escapeHTML(item.name)}</strong><small>${item.stake} fichas</small></span><div role="img" aria-label="${escapeHTML(item.name)} recebeu ${Math.round(item.percent)}% dos palpites"><i style="width:${Math.max(0, Math.min(100, item.percent))}%"></i></div><b>${Math.round(item.percent)}%</b></div>`).join("")}
+      <p>Distribuição fechada e exibida conforme as regras vigentes do bolão.</p>
+    </div>`;
+  }
+
+  function renderLiveAdmin(match) {
+    if (!isAdmin()) return "";
+    return `<section class="card live-admin-panel">
+      <div class="card-header"><div><h2>Operação ao vivo</h2><p>Publique apenas fatos confirmados. Toda correção permanece auditável no servidor.</p></div></div>
+      <form id="live-event-form" class="live-event-form">
+        <input type="hidden" name="matchId" value="${escapeHTML(match.id)}">
+        <input type="hidden" name="matchKind" value="${escapeHTML(match.matchKind || "league")}">
+        <label><span>Tipo de atualização</span><select name="eventType"><option value="score_updated">Atualizar placar</option><option value="note">Nota</option><option value="paused">Pausar</option><option value="resumed">Retomar</option><option value="finished">Finalizar</option><option value="corrected">Correção</option></select></label>
+        <label><span>Placar ${escapeHTML(match.playerAName)}</span><input name="scoreA" type="number" min="0" max="99" value="${match.scoreA}" inputmode="numeric"></label>
+        <label><span>Placar ${escapeHTML(match.playerBName)}</span><input name="scoreB" type="number" min="0" max="99" value="${match.scoreB}" inputmode="numeric"></label>
+        <label class="live-event-note"><span>Nota pública</span><input name="note" maxlength="300" placeholder="Ex.: intervalo técnico de cinco minutos"></label>
+        <button class="button button-primary" type="submit">Publicar atualização</button>
+        <span class="live-event-status" role="status"></span>
+      </form>
+    </section>`;
+  }
+
+  function renderLive() {
+    const snapshot = liveSnapshot || fallbackLiveSnapshot();
+    const match = snapshot.match;
+    if (!match) {
+      const next = findNextLeagueMatch();
+      return `<div class="${isAdmin() ? "workspace-page live-page" : "public-view live-page"}">
+        ${isAdmin()
+          ? renderWorkspaceHeader("Central ao Vivo", "A tela ativa automaticamente quando uma partida oficial entra em andamento.", "Nenhuma partida ao vivo")
+          : renderPublicViewHeader("Central ao Vivo", "A mesa está em silêncio agora.", "Quando uma partida começar, placar, contexto e resenha aparecem aqui em tempo real.")}
+        <div class="${isAdmin() ? "" : "public-view-content"}">
+          <section class="live-waiting">
+            <span class="live-orbit" aria-hidden="true">8</span>
+            <div><h2>${next ? "A próxima partida já está definida." : "Nenhuma partida em andamento."}</h2><p>${next ? `${escapeHTML(playerName(next.playerAId))} enfrenta ${escapeHTML(playerName(next.playerBId))}. A Central será ativada assim que a organização iniciar o confronto.` : "Consulte a Agenda para acompanhar os próximos confrontos."}</p></div>
+            <div class="live-waiting-actions"><button class="button button-primary" data-action="navigate" data-view="schedule">Abrir Agenda</button>${next ? `<button class="button button-secondary" data-action="open-match" data-match-id="${escapeHTML(next.id)}">Ver confronto</button>` : ""}</div>
+          </section>
+          ${isAdmin() && next ? `<section class="card live-admin-standby"><div><h2>Pronto para começar</h2><p>Iniciar a partida fecha os palpites e ativa a experiência pública.</p></div><button class="button button-primary" data-action="toggle-match-live" data-match-id="${escapeHTML(next.id)}">Iniciar partida</button></section>` : ""}
+        </div>
+      </div>`;
+    }
+    const official = leagueMatchMap().get(String(match.id));
+    const statsA = playerStats(match.playerAId);
+    const statsB = playerStats(match.playerBId);
+    const direct = headToHead(match.playerAId, match.playerBId);
+    const final = match.result || String(match.status).toLowerCase() === "finished";
+    return `<div class="${isAdmin() ? "workspace-page live-page" : "public-view live-page"} ${ui.liveDisplayMode ? "is-display-mode" : ""}">
+      <section class="live-scoreboard" aria-labelledby="live-score-title" aria-live="polite">
+        <div class="live-score-topline"><span class="live-state ${final ? "is-final" : ""}"><i aria-hidden="true"></i>${final ? "Resultado final" : "Ao vivo agora"}</span><span>Rodada ${match.roundNumber || "—"}${match.location ? ` · ${escapeHTML(match.location)}` : ""}</span></div>
+        <div class="live-score-main">
+          <button data-action="open-player" data-player-id="${escapeHTML(match.playerAId)}">${renderPlayerAvatar(match.playerAId, "is-live")}<strong>${escapeHTML(match.playerAName)}</strong><small>Forma ${statsA.form.slice(-5).join(" ") || "—"}</small></button>
+          <div><h1 id="live-score-title"><span>${match.scoreA}</span><b aria-label="a">×</b><span>${match.scoreB}</span></h1><p>${final ? "Placar oficial confirmado" : "Placar atual"}</p></div>
+          <button data-action="open-player" data-player-id="${escapeHTML(match.playerBId)}">${renderPlayerAvatar(match.playerBId, "is-live")}<strong>${escapeHTML(match.playerBName)}</strong><small>Forma ${statsB.form.slice(-5).join(" ") || "—"}</small></button>
+        </div>
+        <div class="live-score-actions"><button class="button button-secondary" data-action="open-match" data-match-id="${escapeHTML(match.id)}">Confronto completo</button><button class="button button-ghost" data-action="refresh-live">Atualizar</button><button class="button button-ghost" data-action="toggle-live-display">${ui.liveDisplayMode ? "Sair do telão" : "Modo telão"}</button></div>
+        <p class="sr-only">${escapeHTML(match.playerAName)} tem ${match.scoreA}; ${escapeHTML(match.playerBName)} tem ${match.scoreB}. ${final ? "Partida encerrada." : "Partida em andamento."}</p>
+      </section>
+      <div class="${isAdmin() ? "live-admin-layout" : "public-view-content live-public-content"}">
+        <section class="live-context-strip" aria-label="Contexto da partida">
+          <div><span>Retrospecto</span><strong>${direct.wins[match.playerAId] || 0} × ${direct.wins[match.playerBId] || 0}</strong><small>${direct.games} encontro(s)</small></div>
+          <div><span>Ranking atual</span><strong>${statsA.standing?.position || "—"}º / ${statsB.standing?.position || "—"}º</strong><small>${statsA.standing?.points || 0} e ${statsB.standing?.points || 0} pontos</small></div>
+          <div><span>Atualização</span><strong>${escapeHTML(formatRelativeTime(snapshot.updatedAt || new Date())) || "agora"}</strong><small>${liveError ? "modo compatível" : "dados sincronizados"}</small></div>
+        </section>
+        ${liveError ? `<div class="inline-warning live-warning" role="status"><strong>Conexão instável</strong><span>${escapeHTML(liveError)}</span></div>` : ""}
+        <div class="live-detail-grid">
+          <section class="live-timeline-section"><div class="public-block-title"><div><span class="public-overline">Linha do tempo</span><h2>O que aconteceu</h2></div></div>${renderLiveTimeline(snapshot.events || [])}</section>
+          <section class="live-betting-section"><div class="public-block-title"><div><span class="public-overline">Bolão virtual</span><h2>Como ficaram os palpites</h2></div><a href="/bolao">Meu bolão →</a></div>${renderLiveBettingDistribution(snapshot.betting, match)}</section>
+        </div>
+        <section class="live-community-section"><div class="public-block-title"><div><span class="public-overline">Resenha</span><h2>Mural da partida</h2></div></div>${renderReactionBar("match", match.id)}${renderCommunityForm("match", match.id)}${renderCommunityPosts(communityPosts.filter((post) => post.contentType === "match" && post.contentId === match.id), true)}</section>
+        ${renderLiveAdmin(match)}
+      </div>
+    </div>`;
+  }
+
   function renderDashboard() {
     return isAdmin() ? renderAdminDashboard() : renderPublicDashboard();
   }
@@ -2092,6 +2526,8 @@
       .filter((match, index, items) => match && items.findIndex((item) => item?.id === match.id) === index)
       .slice(0, 3);
     const leader = standings[0] || null;
+    const activeLive = (liveSnapshot || fallbackLiveSnapshot()).active ? liveMatch() : null;
+    const preferences = notificationPreferenceState();
     const title = escapeHTML(state.settings.title || "Sinuca da Firma");
     const statusLabel = leagueStats.isComplete
       ? "Temporada concluída"
@@ -2121,6 +2557,10 @@
         </section>
 
         <section class="public-panorama" id="panorama">
+          ${activeLive ? `<section class="home-live-callout" aria-label="Partida ao vivo">
+            <div><span><i aria-hidden="true"></i>Ao vivo agora</span><h2>${escapeHTML(activeLive.playerAName)} <b>${activeLive.scoreA} × ${activeLive.scoreB}</b> ${escapeHTML(activeLive.playerBName)}</h2><p>A Central reúne placar, retrospecto, palpites fechados e a resenha da partida.</p></div>
+            <button class="button public-button-light" data-action="navigate" data-view="live">Acompanhar ao vivo →</button>
+          </section>` : ""}
           <div class="public-section-heading reveal">
             <span class="public-kicker public-kicker-dark">Panorama da liga</span>
             <h2>A mesa muda<br>a cada rodada.</h2>
@@ -2165,6 +2605,19 @@
           <section class="public-pool-cta reveal">
             <div><span class="public-kicker">Palpite também entra em jogo</span><h2>Tem ficha virtual<br>na mesa.</h2></div>
             <div><p>Escolha um confronto, confie no seu favorito e acompanhe o ranking do bolão sem gastar nada.</p><a class="button public-button-light" href="/bolao">Abrir o bolão <span aria-hidden="true">↗</span></a></div>
+          </section>
+          <section class="home-return-panel reveal">
+            <div><h2>Leve o campeonato com você.</h2><p>Instale o atalho e escolha se deseja receber avisos. Nada é ativado sem sua confirmação.</p></div>
+            <div class="home-return-actions">
+              <button class="button button-secondary" data-action="install-app" ${deferredInstallPrompt ? "" : "disabled"}>${deferredInstallPrompt ? "Instalar aplicativo" : "Instalação disponível pelo navegador"}</button>
+              <form id="notification-preferences-form" class="notification-preferences">
+                <label><input type="checkbox" name="enabled" ${preferences.enabled ? "checked" : ""}><span>Ativar avisos</span></label>
+                <label><input type="checkbox" name="closing" ${preferences.closing ? "checked" : ""}><span>Próximo fechamento</span></label>
+                <label><input type="checkbox" name="started" ${preferences.started ? "checked" : ""}><span>Início de partida</span></label>
+                <label><input type="checkbox" name="result" ${preferences.result ? "checked" : ""}><span>Resultado oficial</span></label>
+                <button class="button button-ghost" type="submit">Salvar preferências</button>
+              </form>
+            </div>
           </section>
         </section>
 
@@ -2234,6 +2687,7 @@
     const nextMatch = findNextLeagueMatch();
     const title = escapeHTML(state.settings.title || "Sinuca da Firma");
     const champion = leagueStats.isComplete ? standings[0] : null;
+    const activeLive = (liveSnapshot || fallbackLiveSnapshot()).active ? liveMatch() : null;
 
     let heroTitle = "Liga todos contra todos";
     let heroText = `Gere a tabela para que os ${state.players.length} jogadores se enfrentem uma vez cada.`;
@@ -2254,6 +2708,7 @@
     return `
       <div class="page-grid dashboard-grid workspace-page admin-dashboard-workspace">
         ${renderWorkspaceHeader("Sala de controle", "Acompanhe o campeonato e chegue rapidamente às ações que precisam de atenção.", `Revisão ${serverRevision} · ${state.players.length} jogadores`, `<button class="button button-primary" data-action="navigate" data-view="league">Abrir liga</button>`)}
+        ${activeLive ? `<section class="admin-live-banner col-12"><div><span><i></i>Partida em andamento</span><strong>${escapeHTML(activeLive.playerAName)} ${activeLive.scoreA} × ${activeLive.scoreB} ${escapeHTML(activeLive.playerBName)}</strong><small>Palpites fechados · Central pública ativa</small></div><button class="button button-primary" data-action="navigate" data-view="live">Operar Central ao Vivo</button></section>` : ""}
         <section class="card col-12 admin-season-brief">
           <div class="hero-content">
             <div>
@@ -3188,7 +3643,13 @@
       `;
     }
     const featured = newsItems.find((article) => article.featured) || newsItems[0];
-    const latest = newsItems;
+    const categories = [...new Set(newsItems.map((article) => article.category).filter(Boolean))].sort((a, b) => a.localeCompare(b, "pt-BR"));
+    const query = ui.newsSearch.trim().toLocaleLowerCase("pt-BR");
+    const latest = newsItems.filter((article) => {
+      const categoryMatches = ui.newsCategory === "all" || article.category === ui.newsCategory;
+      const queryMatches = !query || `${article.title} ${article.summary} ${article.author}`.toLocaleLowerCase("pt-BR").includes(query);
+      return categoryMatches && queryMatches;
+    });
     return `
       <div class="public-view news-public">
         <section class="news-masthead">
@@ -3207,7 +3668,8 @@
         </section>
         <section class="news-index">
           <div class="news-index-heading"><div><h2>Últimas notícias</h2><p>Informação oficial para ninguém perder uma tacada.</p></div><span>${newsItems.length} ${newsItems.length === 1 ? "publicação" : "publicações"}</span></div>
-          <div class="news-grid news-latest-grid">${latest.map((article) => `
+          <div class="news-public-filters"><label><span>Buscar no arquivo</span><input id="news-search" type="search" value="${escapeHTML(ui.newsSearch)}" placeholder="Título, resumo ou autoria"></label><label><span>Categoria</span><select id="news-category-filter"><option value="all">Todas</option>${categories.map((category) => `<option value="${escapeHTML(category)}" ${ui.newsCategory === category ? "selected" : ""}>${escapeHTML(category)}</option>`).join("")}</select></label></div>
+          <div class="news-grid news-latest-grid">${latest.length ? latest.map((article) => `
             <article class="news-card">
               <button class="news-card-media" data-action="open-news" data-news-id="${escapeHTML(article.id)}" aria-label="Abrir: ${escapeHTML(article.title)}">${renderNewsImage(article)}</button>
               <div class="news-card-copy">
@@ -3216,7 +3678,7 @@
                 ${renderNewsSignals(article)}
                 <button class="news-read-link" data-action="open-news" data-news-id="${escapeHTML(article.id)}">Continuar lendo <span aria-hidden="true">→</span></button>
               </div>
-            </article>`).join("")}</div>
+            </article>`).join("") : `<div class="news-filter-empty"><strong>Nenhuma notícia encontrada.</strong><p>Limpe a busca ou escolha outra categoria.</p></div>`}</div>
         </section>
       </div>
     `;
@@ -3509,6 +3971,82 @@
     `;
   }
 
+  function scheduleDateKey(value) {
+    const date = new Date(value);
+    if (Number.isNaN(date.getTime())) return "";
+    return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")}`;
+  }
+
+  function scheduleCursorDate() {
+    const date = new Date(`${ui.scheduleCursor}T12:00:00`);
+    return Number.isNaN(date.getTime()) ? new Date() : date;
+  }
+
+  function shiftScheduleCursor(amount) {
+    const date = scheduleCursorDate();
+    if (ui.scheduleView === "month") date.setMonth(date.getMonth() + amount);
+    else date.setDate(date.getDate() + amount * 7);
+    ui.scheduleCursor = scheduleDateKey(date);
+  }
+
+  function publicScheduleMatches() {
+    const query = ui.scheduleSearch.trim().toLocaleLowerCase("pt-BR");
+    return orderedAgendaMatches({ includeCompleted: true, includeCancelled: true }).filter((match) => {
+      const entry = programmingEntry(match.id);
+      const status = match.result ? "completed" : match.inProgress ? "in_progress" : entry.status;
+      const searchMatches = !query || `${playerName(match.playerAId)} ${playerName(match.playerBId)} ${entry.location}`.toLocaleLowerCase("pt-BR").includes(query);
+      const roundMatches = ui.scheduleRoundFilter === "all" || String(match.roundNumber) === ui.scheduleRoundFilter;
+      const statusMatches = ui.scheduleStatusFilter === "all" || status === ui.scheduleStatusFilter;
+      return searchMatches && roundMatches && statusMatches;
+    });
+  }
+
+  function renderScheduleCalendar(matches) {
+    const cursor = scheduleCursorDate();
+    const start = new Date(cursor);
+    const days = [];
+    if (ui.scheduleView === "week") {
+      start.setDate(start.getDate() - ((start.getDay() + 6) % 7));
+      for (let index = 0; index < 7; index += 1) {
+        const date = new Date(start);
+        date.setDate(start.getDate() + index);
+        days.push(date);
+      }
+    } else {
+      start.setDate(1);
+      const leading = (start.getDay() + 6) % 7;
+      start.setDate(start.getDate() - leading);
+      for (let index = 0; index < 42; index += 1) {
+        const date = new Date(start);
+        date.setDate(start.getDate() + index);
+        days.push(date);
+      }
+    }
+    const byDay = new Map();
+    matches.forEach((match) => {
+      const key = scheduleDateKey(programmingEntry(match.id).scheduledAt || match.result?.playedAt);
+      if (!key) return;
+      if (!byDay.has(key)) byDay.set(key, []);
+      byDay.get(key).push(match);
+    });
+    const month = cursor.getMonth();
+    return `<div class="schedule-calendar ${ui.scheduleView === "week" ? "is-week" : "is-month"}" role="grid" aria-label="${ui.scheduleView === "week" ? "Agenda semanal" : "Agenda mensal"}">
+      <div class="schedule-weekdays" aria-hidden="true">${["Seg", "Ter", "Qua", "Qui", "Sex", "Sáb", "Dom"].map((day) => `<span>${day}</span>`).join("")}</div>
+      <div class="schedule-calendar-days">${days.map((date) => {
+        const key = scheduleDateKey(date);
+        const items = byDay.get(key) || [];
+        const today = key === scheduleDateKey(new Date());
+        return `<section class="schedule-calendar-day ${date.getMonth() !== month && ui.scheduleView === "month" ? "is-outside" : ""} ${today ? "is-today" : ""}" role="gridcell" aria-label="${escapeHTML(new Intl.DateTimeFormat("pt-BR", { dateStyle: "full" }).format(date))}">
+          <time datetime="${key}">${date.getDate()}<span>${today ? "Hoje" : ""}</span></time>
+          <div>${items.map((match) => {
+            const entry = programmingEntry(match.id);
+            return `<button data-action="open-match" data-match-id="${escapeHTML(match.id)}"><span>${entry.scheduledAt ? new Intl.DateTimeFormat("pt-BR", { hour: "2-digit", minute: "2-digit" }).format(new Date(entry.scheduledAt)) : "Resultado"}</span><strong>${escapeHTML(playerName(match.playerAId))} × ${escapeHTML(playerName(match.playerBId))}</strong>${match.inProgress ? "<i>Ao vivo</i>" : match.result ? `<i>${match.result.scoreA} × ${match.result.scoreB}</i>` : ""}</button>`;
+          }).join("") || "<p>Livre</p>"}</div>
+        </section>`;
+      }).join("")}</div>
+    </div>`;
+  }
+
   function renderPublicSchedule() {
     if (!state.league) {
       return `
@@ -3531,6 +4069,11 @@
       .sort((a, b) => new Date(b.result.playedAt || 0) - new Date(a.result.playedAt || 0))
       .slice(0, 5);
     const listed = pending.filter((match) => match.id !== nextMatch?.id);
+    const filtered = publicScheduleMatches();
+    const cursor = scheduleCursorDate();
+    const periodLabel = ui.scheduleView === "month"
+      ? new Intl.DateTimeFormat("pt-BR", { month: "long", year: "numeric" }).format(cursor)
+      : `Semana de ${new Intl.DateTimeFormat("pt-BR", { day: "2-digit", month: "short" }).format(cursor)}`;
 
     return `
       <div class="public-view agenda-public-page">
@@ -3545,6 +4088,21 @@
           ],
         )}
         <div class="public-view-content">
+          <section class="schedule-view-controls" aria-label="Visualização e filtros da agenda">
+            <div class="schedule-view-tabs" role="group" aria-label="Modo da agenda">
+              <button data-action="set-schedule-view" data-schedule-view="list" aria-pressed="${ui.scheduleView === "list"}">Lista</button>
+              <button data-action="set-schedule-view" data-schedule-view="week" aria-pressed="${ui.scheduleView === "week"}">Semana</button>
+              <button data-action="set-schedule-view" data-schedule-view="month" aria-pressed="${ui.scheduleView === "month"}">Mês</button>
+            </div>
+            <div class="schedule-period-control" ${ui.scheduleView === "list" ? "hidden" : ""}><button data-action="shift-schedule-period" data-direction="-1" aria-label="Período anterior">←</button><strong>${escapeHTML(periodLabel)}</strong><button data-action="shift-schedule-period" data-direction="1" aria-label="Próximo período">→</button><button data-action="schedule-today">Hoje</button></div>
+            <div class="schedule-public-filters">
+              <label><span>Buscar</span><input id="schedule-search" type="search" value="${escapeHTML(ui.scheduleSearch)}" placeholder="Jogador ou local"></label>
+              <label><span>Rodada</span><select id="schedule-round-filter"><option value="all">Todas</option>${state.league.rounds.map((round, index) => `<option value="${Number(round.number) || index + 1}" ${ui.scheduleRoundFilter === String(Number(round.number) || index + 1) ? "selected" : ""}>Rodada ${Number(round.number) || index + 1}</option>`).join("")}</select></label>
+              <label><span>Situação</span><select id="schedule-status-filter"><option value="all">Todas</option><option value="scheduled" ${ui.scheduleStatusFilter === "scheduled" ? "selected" : ""}>Agendadas</option><option value="unscheduled" ${ui.scheduleStatusFilter === "unscheduled" ? "selected" : ""}>Sem data</option><option value="in_progress" ${ui.scheduleStatusFilter === "in_progress" ? "selected" : ""}>Ao vivo</option><option value="completed" ${ui.scheduleStatusFilter === "completed" ? "selected" : ""}>Concluídas</option><option value="postponed" ${ui.scheduleStatusFilter === "postponed" ? "selected" : ""}>Adiadas</option></select></label>
+            </div>
+          </section>
+          ${ui.scheduleView !== "list" ? `<section class="public-view-section schedule-calendar-section">${renderScheduleCalendar(filtered)}</section>` : ""}
+          <div ${ui.scheduleView === "list" ? "" : "hidden"}>
           ${nextMatch
             ? `<section class="agenda-next-section" aria-labelledby="agenda-next-title"><div class="public-block-title"><div><span class="public-overline">Escolha oficial</span><h2 id="agenda-next-title">Próximo jogo</h2></div></div>${renderPublicScheduleMatch(nextMatch, "agenda-next-card")}</section>`
             : `<section class="agenda-next-empty"><h2>Próximo jogo ainda não definido</h2><p>A organização escolherá manualmente qualquer confronto pendente quando os jogadores estiverem alinhados.</p></section>`}
@@ -3553,6 +4111,7 @@
             <div class="agenda-public-list">${listed.length ? listed.map((match) => renderPublicScheduleMatch(match)).join("") : `<div class="public-view-empty"><div><h2>Agenda concluída</h2><p>Todos os confrontos da temporada já possuem resultado.</p></div></div>`}</div>
           </section>
           ${recent.length ? `<section class="public-view-section"><div class="public-block-title"><div><span class="public-overline">Arquivo recente</span><h2>Últimos resultados</h2></div></div><div class="agenda-history-list">${recent.map((match) => `<button data-action="open-match" data-match-id="${escapeHTML(match.id)}"><span>Rodada ${match.roundNumber}</span><strong>${escapeHTML(playerName(match.playerAId))} ${match.result.scoreA} × ${match.result.scoreB} ${escapeHTML(playerName(match.playerBId))}</strong></button>`).join("")}</div></section>` : ""}
+          </div>
         </div>
       </div>
     `;
@@ -3636,6 +4195,25 @@
     `;
   }
 
+  function suggestedScheduleSlots(match) {
+    if (!match) return [];
+    const slots = [];
+    const base = new Date();
+    base.setSeconds(0, 0);
+    for (let offset = 1; offset <= 14 && slots.length < 3; offset += 1) {
+      for (const hour of [12, 17, 18]) {
+        const candidate = new Date(base);
+        candidate.setDate(base.getDate() + offset);
+        candidate.setHours(hour, 0, 0, 0);
+        if ([0, 6].includes(candidate.getDay())) continue;
+        const conflict = availabilityConflict(match, candidate.toISOString());
+        if (!conflict.hasConflict) slots.push(candidate.toISOString());
+        if (slots.length >= 3) break;
+      }
+    }
+    return slots;
+  }
+
   function renderScheduleAdmin() {
     if (!state.league) {
       return `<div class="workspace-page">${renderWorkspaceHeader("Agenda da competição", "Gere a liga antes de programar os confrontos.", "Nenhuma tabela ativa")}<section class="card">${renderEmptyState("◷", "A agenda precisa da tabela", "Crie os confrontos da liga; depois qualquer partida pendente poderá ser escolhida.", "Gerar liga", "league")}</section></div>`;
@@ -3655,6 +4233,7 @@
       return searchMatches && roundMatches && statusMatches && availabilityMatches;
     });
     const nextMatch = findNextLeagueMatch();
+    const suggestedSlots = suggestedScheduleSlots(nextMatch);
     const pendingTask = state.adminTasks.find((task) => task.type === "choose-next-match" && task.status !== "done");
     return `
       <div class="workspace-page schedule-workspace">
@@ -3669,6 +4248,7 @@
           <div><span class="public-overline">Próximo jogo oficial</span><h2>${nextMatch ? `${escapeHTML(playerName(nextMatch.playerAId))} × ${escapeHTML(playerName(nextMatch.playerBId))}` : "Nenhum confronto selecionado"}</h2><p>${nextMatch ? `${matchScheduleStatus(nextMatch)} · rodada ${nextMatch.roundNumber}` : "A conclusão de um jogo nunca seleciona outro automaticamente."}</p></div>
           <div class="schedule-summary-stats"><span><strong>${state.league.programming.featuredMatchIds.length}/3</strong> destaques</span><span><strong>${allPending.filter((match) => programmingEntry(match.id).scheduledAt).length}</strong> com data</span></div>
         </section>
+        ${nextMatch ? `<section class="schedule-suggestion-card"><div><span aria-hidden="true">◇</span><p><strong>Sugestões não bloqueantes</strong><small>Horários sem conflito conhecido na disponibilidade informada. Confirme com os jogadores antes de salvar.</small></p></div><div>${suggestedSlots.length ? suggestedSlots.map((slot) => `<button class="button button-ghost" data-action="apply-schedule-suggestion" data-match-id="${escapeHTML(nextMatch.id)}" data-scheduled-at="${escapeHTML(slot)}">${escapeHTML(formatDateTime(slot))}</button>`).join("") : "<span>Nenhuma janela clara nos próximos dias.</span>"}</div></section>` : ""}
         <section class="card schedule-list-card" id="schedule-match-list">
           <div class="card-header"><div><h2>Todos os confrontos pendentes</h2><p>Partidas de qualquer rodada estão disponíveis para programação.</p></div></div>
           <div class="schedule-filters">
@@ -3734,6 +4314,17 @@
     );
     if (!scheduled) return null;
     return scheduled.playerAId === playerId ? scheduled.playerBId : scheduled.playerAId;
+  }
+
+  function playerMilestones(stats) {
+    const standing = stats.standing || {};
+    return [
+      standing.played ? { label: "Estreia registrada", detail: `${standing.played} partida(s) oficial(is)` } : null,
+      standing.wins >= 1 ? { label: "Primeira vitória", detail: `${standing.wins} vitória(s) na carreira` } : null,
+      stats.maxWinStreak >= 3 ? { label: "Trinca de vitórias", detail: `Melhor sequência: ${stats.maxWinStreak}` } : null,
+      standing.ballsMade >= 50 ? { label: "50 bolas matadas", detail: `${standing.ballsMade} no total` } : null,
+      standing.position === 1 ? { label: "Liderança da liga", detail: `${standing.points} pontos` } : null,
+    ].filter(Boolean);
   }
 
   function renderPlayerAvatar(playerId, className = "") {
@@ -3804,10 +4395,11 @@
     const standing = stats.standing || {};
     const nextOpponentId = nextOpponentForPlayer(player.id);
     const relatedNews = newsItems.filter((article) => Array.isArray(article.playerIds) && article.playerIds.includes(player.id)).slice(0, 3);
+    const milestones = playerMilestones(stats);
     const opponents = state.players.filter((item) => item.id !== player.id).map((opponent) => ({
       opponent,
       h2h: headToHead(player.id, opponent.id),
-    })).filter((item) => item.h2h.games);
+    })).filter((item) => item.h2h.games).sort((a, b) => b.h2h.games - a.h2h.games);
     return `
       <div class="${isAdmin() ? "workspace-page profile-admin-page" : "public-view player-profile-page"}">
         <section class="player-profile-hero">
@@ -3829,6 +4421,8 @@
             <article><h2>Próximo adversário</h2>${nextOpponentId ? `<div class="profile-next-opponent">${renderPlayerAvatar(nextOpponentId)}<div><strong>${escapeHTML(playerName(nextOpponentId))}</strong><span>${escapeHTML(matchScheduleStatus(orderedAgendaMatches().find((match) => [match.playerAId, match.playerBId].includes(player.id) && [match.playerAId, match.playerBId].includes(nextOpponentId)) || {}))}</span></div></div>` : "<p>Nenhuma partida futura programada.</p>"}${profile?.favoriteShot ? `<p><strong>Jogada favorita:</strong> ${escapeHTML(profile.favoriteShot)}</p>` : ""}</article>
             <article><h2>Retrospecto</h2>${opponents.length ? opponents.map(({ opponent, h2h }) => `<button class="profile-h2h-row" data-action="open-compare-pair" data-player-a-id="${escapeHTML(player.id)}" data-player-b-id="${escapeHTML(opponent.id)}"><span>${escapeHTML(opponent.name)}</span><strong>${h2h.wins[player.id] || 0} × ${h2h.wins[opponent.id] || 0}</strong></button>`).join("") : "<p>O primeiro confronto direto ainda será disputado.</p>"}</article>
             <article><h2>Notícias relacionadas</h2>${relatedNews.length ? relatedNews.map((article) => `<button class="profile-news-row" data-action="open-news" data-news-id="${escapeHTML(article.id)}"><span>${escapeHTML(formatNewsDate(article.publishedAt))}</span><strong>${escapeHTML(article.title)}</strong></button>`).join("") : "<p>Nenhuma notícia vinculada a este jogador.</p>"}</article>
+            <article class="profile-timeline"><h2>Linha do tempo</h2>${stats.allMatches?.length ? [...stats.allMatches].reverse().slice(0, 8).map((item) => `<button data-action="open-match" data-match-id="${escapeHTML(item.matchId)}"><time>${escapeHTML(item.playedAt ? formatNewsDate(item.playedAt) : `Rodada ${item.roundNumber}`)}</time><strong>${item.won ? "Vitória" : "Derrota"} contra ${escapeHTML(item.opponentName)}</strong><small>${item.scoreFor ?? "—"} × ${item.scoreAgainst ?? "—"}</small></button>`).join("") : "<p>Os resultados oficiais formarão esta linha do tempo.</p>"}</article>
+            <article class="profile-milestones"><h2>Marcos e conquistas</h2>${milestones.length ? milestones.map((milestone) => `<div><span aria-hidden="true">◆</span><p><strong>${escapeHTML(milestone.label)}</strong><small>${escapeHTML(milestone.detail)}</small></p></div>`).join("") : "<p>O primeiro marco será liberado com a estreia oficial.</p>"}</article>
           </section>
           ${renderProfileEditor(player, profile)}
         </div>
@@ -4230,14 +4824,35 @@
     `;
   }
 
-  function renderCommunityForm(contentType = "community", contentId = "") {
-    return `<form class="community-form" data-content-type="${escapeHTML(contentType)}" data-content-id="${escapeHTML(contentId)}"><div class="community-rules"><strong>Resenha com respeito</strong><p>Sem ataques, discriminação, exposição de dados pessoais ou conteúdo ofensivo. Mensagens podem ser denunciadas e moderadas.</p></div><label><span>Seu nome</span><input name="author" maxlength="80" placeholder="Anônimo"></label><label class="community-body"><span>Mensagem</span><textarea name="body" minlength="2" maxlength="800" required placeholder="${contentType === "match" ? "Comente a partida" : "Puxe a conversa do campeonato"}"></textarea></label><label class="honeypot" aria-hidden="true">Site<input name="website" tabindex="-1" autocomplete="off"></label><button class="button button-primary" type="submit">Publicar mensagem</button><span class="community-form-status" role="status"></span></form>`;
+  function renderCommunityForm(contentType = "community", contentId = "", parentId = "") {
+    const replying = Boolean(parentId);
+    return `<form class="community-form ${replying ? "is-reply" : ""}" data-content-type="${escapeHTML(contentType)}" data-content-id="${escapeHTML(contentId)}"><input type="hidden" name="parentId" value="${escapeHTML(parentId)}">${replying ? `<div class="community-reply-heading"><strong>Responder mensagem</strong><button type="button" data-action="cancel-community-reply">Cancelar</button></div>` : `<div class="community-rules"><strong>Resenha com respeito</strong><p>Sem ataques, discriminação, exposição de dados pessoais ou conteúdo ofensivo. Mensagens podem ser denunciadas e moderadas.</p></div>`}<label><span>Seu nome</span><input name="author" maxlength="80" placeholder="Anônimo"></label><label class="community-body"><span>Mensagem</span><textarea name="body" minlength="2" maxlength="800" required placeholder="${replying ? "Escreva uma resposta curta" : contentType === "match" ? "Comente a partida" : "Puxe a conversa do campeonato"}"></textarea></label><label class="honeypot" aria-hidden="true">Site<input name="website" tabindex="-1" autocomplete="off"></label><button class="button button-primary" type="submit">${replying ? "Publicar resposta" : "Publicar mensagem"}</button><span class="community-form-status" role="status"></span></form>`;
   }
 
   function renderCommunityPosts(posts = communityPosts, compact = false) {
     const visible = posts.filter((post) => post.status === "published" || (isAdmin() && post.status !== "deleted"));
     if (!visible.length) return `<div class="empty-state compact"><div class="empty-state-icon">☵</div><h3>A resenha começa aqui</h3><p>Publique a primeira mensagem respeitando as regras de convivência.</p></div>`;
-    return `<div class="community-post-list ${compact ? "is-compact" : ""}">${visible.map((post) => `<article class="${post.status !== "published" ? "is-hidden" : ""}"><header><strong>${escapeHTML(post.author || "Anônimo")}</strong><time datetime="${escapeHTML(post.createdAt)}">${escapeHTML(formatRelativeTime(post.createdAt))}</time></header><p>${escapeHTML(post.body)}</p><footer><button data-action="report-community" data-post-id="${escapeHTML(post.id)}">Denunciar</button>${Number(post.reportCount) ? `<span>${Number(post.reportCount)} denúncia(s)</span>` : ""}${isAdmin() ? `<button data-action="moderate-community" data-post-id="${escapeHTML(post.id)}" data-status="${post.status === "published" ? "hidden" : "published"}">${post.status === "published" ? "Ocultar" : "Republicar"}</button><button data-action="moderate-community" data-post-id="${escapeHTML(post.id)}" data-status="deleted">Excluir</button>` : ""}</footer></article>`).join("")}</div>`;
+    const children = new Map();
+    visible.forEach((post) => {
+      const parentId = post.parentId || post.parent_id || "";
+      if (!children.has(parentId)) children.set(parentId, []);
+      children.get(parentId).push(post);
+    });
+    const renderPost = (post, depth = 0) => {
+      const replies = depth < 1 ? (children.get(post.id) || []) : [];
+      const contentType = post.contentType || post.content_type || "community";
+      const contentId = post.contentId || post.content_id || "";
+      return `<article class="${post.status !== "published" ? "is-hidden" : ""} ${post.pinned ? "is-pinned" : ""}" data-depth="${depth}">
+        <header><strong>${post.pinned ? '<span aria-label="Mensagem fixada">◆</span>' : ""}${escapeHTML(post.author || "Anônimo")}</strong><time datetime="${escapeHTML(post.createdAt || post.created_at)}">${escapeHTML(formatRelativeTime(post.createdAt || post.created_at))}</time></header>
+        <p>${escapeHTML(post.body)}</p>
+        ${post.editedAt || post.edited_at ? '<small class="community-edited">Editada pela pessoa autora</small>' : ""}
+        <footer><button data-action="report-community" data-post-id="${escapeHTML(post.id)}">Denunciar</button>${depth < 1 ? `<button data-action="reply-community" data-post-id="${escapeHTML(post.id)}">Responder</button>` : ""}${Number(post.reportCount) ? `<span>${Number(post.reportCount)} denúncia(s)</span>` : ""}${isAdmin() ? `<button data-action="moderate-community" data-post-id="${escapeHTML(post.id)}" data-status="${post.status === "published" ? "hidden" : "published"}">${post.status === "published" ? "Ocultar" : "Republicar"}</button><button data-action="moderate-community" data-post-id="${escapeHTML(post.id)}" data-status="deleted">Excluir</button>` : ""}</footer>
+        ${ui.communityReplyTo === post.id ? renderCommunityForm(contentType, contentId, post.id) : ""}
+        ${replies.length ? `<div class="community-replies">${replies.map((reply) => renderPost(reply, depth + 1)).join("")}</div>` : ""}
+      </article>`;
+    };
+    const roots = (children.get("") || visible.filter((post) => !(post.parentId || post.parent_id))).sort((a, b) => Number(Boolean(b.pinned)) - Number(Boolean(a.pinned)));
+    return `<div class="community-post-list ${compact ? "is-compact" : ""}">${roots.map((post) => renderPost(post)).join("")}</div>`;
   }
 
   function renderCommunity() {
@@ -4317,6 +4932,190 @@
 
       </div>
     `;
+  }
+
+  function bettingRuleLabel(rules = {}) {
+    const loss = rules.lossPolicy === "forfeit"
+      ? "Erros perdem as fichas"
+      : rules.lossPolicy === "partial"
+        ? `Erros devolvem ${Number(rules.lossRefundPercent) || 0}%`
+        : "Erros devolvem as fichas";
+    const odds = rules.oddsMode === "crowd"
+      ? "Multiplicador pela distribuição"
+      : `Multiplicador fixo ${Number(rules.fixedOdds || 2).toLocaleString("pt-BR")}×`;
+    return `${loss} · ${odds}`;
+  }
+
+  function renderBettingAdmin() {
+    if (!isAdmin()) return renderEmptyState("🔒", "Acesso administrativo necessário", "Entre para configurar o bolão.", "Ir para o login", "navigate");
+    if (bettingAdmin.loading && !bettingAdmin.season) {
+      return `<section class="workspace-page betting-admin-page"><div class="app-loading-shell" aria-label="Carregando gestão do bolão" aria-busy="true"><div class="loading-hero"></div><div class="loading-grid"><span></span><span></span><span></span></div></div></section>`;
+    }
+    if (bettingAdmin.error && !bettingAdmin.season) {
+      return `<section class="workspace-page betting-admin-page">${renderWorkspaceHeader("Gestão do bolão", "Operação auditável das fichas virtuais.", "Participação e conteúdo", `<button class="button button-primary" data-action="refresh-betting-admin">Tentar novamente</button>`)}<div class="card workspace-empty-card">${renderEmptyState("!", "Gestão indisponível", bettingAdmin.error, "Tentar novamente", "refresh-betting-admin")}</div></section>`;
+    }
+    const season = bettingAdmin.season || {};
+    const rules = season.rules || {};
+    const participants = bettingAdmin.participants || [];
+    const matches = orderedAgendaMatches().filter((match) => !match.result && match.playerAId && match.playerBId);
+    const events = bettingAdmin.events || [];
+    return `
+      <section class="workspace-page betting-admin-page">
+        ${renderWorkspaceHeader(
+          "Gestão do bolão",
+          "Regras, participantes e fechamentos com histórico auditável.",
+          "Participação e conteúdo",
+          `<a class="button button-ghost" href="/bolao">Abrir página pública</a><button class="button button-primary" data-action="refresh-betting-admin">Atualizar</button>`,
+        )}
+        <section class="card betting-admin-summary">
+          <div class="card-header"><div><h2>${escapeHTML(season.title || "Temporada ativa")}</h2><p>${escapeHTML(bettingRuleLabel(rules))}</p></div><span class="status-pill success">${escapeHTML(season.status || "active")}</span></div>
+          <div class="card-body betting-admin-score">
+            <div><strong>${participants.length}</strong><span>participantes</span></div>
+            <div><strong>${matches.length}</strong><span>partidas pendentes</span></div>
+            <div><strong>${events.length}</strong><span>eventos recentes</span></div>
+          </div>
+        </section>
+        <div class="betting-admin-grid">
+          <section class="card">
+            <div class="card-header"><div><h2>Regras vigentes</h2><p>As alterações valem somente para palpites novos ou novamente confirmados.</p></div></div>
+            <div class="card-body">
+              <form id="betting-rules-form" class="form-grid">
+                <label class="field col-6"><span>Modo de perda</span><select name="lossPolicy"><option value="refund" ${rules.lossPolicy === "refund" ? "selected" : ""}>Recreativo · devolve tudo</option><option value="partial" ${rules.lossPolicy === "partial" ? "selected" : ""}>Devolução parcial</option><option value="forfeit" ${rules.lossPolicy === "forfeit" ? "selected" : ""}>Competitivo · perde tudo</option></select></label>
+                <label class="field col-6"><span>Percentual devolvido no parcial</span><input name="lossRefundPercent" type="number" min="0" max="100" value="${Number(rules.lossRefundPercent ?? 100)}"></label>
+                <label class="field col-6"><span>Modo de multiplicador</span><select name="oddsMode"><option value="fixed" ${rules.oddsMode !== "crowd" ? "selected" : ""}>Fixo</option><option value="crowd" ${rules.oddsMode === "crowd" ? "selected" : ""}>Distribuição da turma</option></select></label>
+                <label class="field col-6"><span>Multiplicador fixo</span><input name="fixedOdds" type="number" min="1" max="20" step="0.05" value="${Number(rules.fixedOdds || 2)}"></label>
+                <label class="field col-4"><span>Palpite mínimo</span><input name="minStake" type="number" min="1" value="${Number(rules.minStake || 1)}"></label>
+                <label class="field col-4"><span>Palpite máximo</span><input name="maxStake" type="number" min="1" value="${Number(rules.maxStake || 500)}"></label>
+                <label class="field col-4"><span>Minutos antes</span><input name="lockMinutesBefore" type="number" min="0" max="10080" value="${Number(rules.lockMinutesBefore || 0)}"></label>
+                <label class="field col-6"><span>Fechamento</span><select name="closePolicy"><option value="scheduled_or_started" ${rules.closePolicy === "scheduled_or_started" ? "selected" : ""}>Horário ou início</option><option value="started_only" ${rules.closePolicy === "started_only" ? "selected" : ""}>Somente ao iniciar</option><option value="manual_or_started" ${rules.closePolicy === "manual_or_started" ? "selected" : ""}>Manual ou início</option></select></label>
+                <label class="field col-6"><span>Visibilidade</span><select name="predictionVisibility"><option value="after_lock" ${rules.predictionVisibility === "after_lock" ? "selected" : ""}>Após fechar</option><option value="always" ${rules.predictionVisibility === "always" ? "selected" : ""}>Sempre</option><option value="admin_only" ${rules.predictionVisibility === "admin_only" ? "selected" : ""}>Somente administração</option></select></label>
+                <div class="col-12 form-actions"><span class="field-help">O bolão permanece exclusivamente virtual, sem dinheiro, pagamento ou saque.</span><button class="button button-primary" type="submit">Revisar e salvar regras</button></div>
+              </form>
+            </div>
+          </section>
+          <section class="card">
+            <div class="card-header"><div><h2>Controle de partidas</h2><p>O início oficial sempre fecha os palpites.</p></div></div>
+            <div class="card-body betting-match-controls">
+              ${matches.length ? matches.slice(0, 12).map((match) => `<article>
+                <div><strong>${escapeHTML(playerName(match.playerAId))} × ${escapeHTML(playerName(match.playerBId))}</strong><small>Rodada ${match.roundNumber || "—"} · ${escapeHTML(formatDateTime(programmingEntry(match.id).scheduledAt))}</small></div>
+                <div><button class="button button-ghost" data-action="reopen-betting-match" data-match-id="${escapeHTML(match.id)}">Reabrir</button><button class="button button-secondary" data-action="lock-betting-match" data-match-id="${escapeHTML(match.id)}">Fechar</button></div>
+              </article>`).join("") : `<div class="empty-state compact"><div class="empty-state-icon">✓</div><h3>Nenhuma partida pendente</h3><p>Os controles aparecerão quando houver confrontos abertos.</p></div>`}
+              <button class="button button-ghost betting-reprocess-button" data-action="reprocess-bets">Prévia e reprocessar apuração</button>
+            </div>
+          </section>
+        </div>
+        <section class="card">
+          <div class="card-header"><div><h2>Participantes</h2><p>Suspender preserva perfil, saldo e histórico. Ajustes exigem motivo.</p></div></div>
+          <div class="card-body table-wrap">
+            ${participants.length ? `<table><thead><tr><th>Participante</th><th>Saldo</th><th>Reservado</th><th>Estado</th><th>Ações</th></tr></thead><tbody>${participants.map((participant) => `<tr>
+              <td><strong>${escapeHTML(participant.name || "Participante")}</strong></td>
+              <td>${Number(participant.balance ?? participant.settledBalance ?? 0).toLocaleString("pt-BR")}</td>
+              <td>${Number(participant.pendingStake ?? participant.reservedStake ?? 0).toLocaleString("pt-BR")}</td>
+              <td><span class="status-pill ${participant.active === false ? "danger" : "success"}">${participant.active === false ? "Suspenso" : "Ativo"}</span></td>
+              <td><div class="table-actions"><button class="button button-ghost" data-action="toggle-bettor-active" data-bettor-id="${escapeHTML(participant.id)}" data-active="${participant.active === false}">${participant.active === false ? "Reativar" : "Suspender"}</button><button class="button button-ghost" data-action="focus-balance-adjustment" data-bettor-id="${escapeHTML(participant.id)}">Ajustar saldo</button></div></td>
+            </tr>`).join("")}</tbody></table>` : `<div class="empty-state compact"><div class="empty-state-icon">◎</div><h3>Nenhum participante</h3><p>Os perfis criados na página do bolão aparecerão aqui.</p></div>`}
+          </div>
+        </section>
+        <div class="betting-admin-grid">
+          <section class="card">
+            <div class="card-header"><div><h2>Ajuste auditável</h2><p>Use bônus ou penalidade somente com justificativa objetiva.</p></div></div>
+            <div class="card-body">
+              <form id="betting-balance-form" class="form-grid">
+                <label class="field col-12"><span>Participante</span><select name="bettorId" id="betting-adjust-bettor" required><option value="">Selecione</option>${participants.map((participant) => `<option value="${escapeHTML(participant.id)}">${escapeHTML(participant.name)}</option>`).join("")}</select></label>
+                <label class="field col-4"><span>Valor</span><input name="amount" type="number" step="1" required placeholder="+100 ou -50"></label>
+                <label class="field col-8"><span>Motivo</span><input name="reason" maxlength="500" required placeholder="Explique o ajuste para a auditoria"></label>
+                <div class="col-12 form-actions"><button class="button button-primary" type="submit">Registrar ajuste</button></div>
+              </form>
+            </div>
+          </section>
+          <section class="card">
+            <div class="card-header"><div><h2>Temporada do bolão</h2><p>Arquivar preserva apostas e ranking. A próxima temporada é criada separadamente.</p></div></div>
+            <div class="card-body">
+              <form id="betting-season-form" class="form-grid">
+                <label class="field col-12"><span>Nome da próxima temporada</span><input name="title" maxlength="120" placeholder="Ex.: Bolão 2027"></label>
+                <div class="col-12 form-actions"><button class="button button-ghost" type="button" data-action="archive-betting-season">Arquivar temporada atual</button><button class="button button-primary" type="submit">Criar temporada ativa</button></div>
+              </form>
+            </div>
+          </section>
+        </div>
+        <section class="card">
+          <div class="card-header"><div><h2>Eventos recentes</h2><p>Linha do tempo imutável de palpites, bloqueios e apurações.</p></div></div>
+          <div class="card-body betting-event-list">${events.length ? events.map((event) => `<article><span>${escapeHTML(event.type || "evento")}</span><div><strong>Palpite ${escapeHTML(event.betId ?? "—")}</strong><small>${escapeHTML(event.actorType || "system")} · ${escapeHTML(formatDateTime(event.createdAt))}</small></div></article>`).join("") : `<div class="empty-state compact"><div class="empty-state-icon">◎</div><h3>Sem eventos ainda</h3><p>A linha do tempo será preenchida com as operações do bolão.</p></div>`}</div>
+        </section>
+      </section>
+    `;
+  }
+
+  async function saveBettingRules(form) {
+    const values = new FormData(form);
+    const rules = {
+      ...(bettingAdmin.season?.rules || {}),
+      lossPolicy: String(values.get("lossPolicy") || "refund"),
+      lossRefundPercent: Number(values.get("lossRefundPercent")),
+      oddsMode: String(values.get("oddsMode") || "fixed"),
+      fixedOdds: Number(values.get("fixedOdds")),
+      minStake: Number(values.get("minStake")),
+      maxStake: Number(values.get("maxStake")),
+      lockMinutesBefore: Number(values.get("lockMinutesBefore")),
+      closePolicy: String(values.get("closePolicy") || "scheduled_or_started"),
+      predictionVisibility: String(values.get("predictionVisibility") || "after_lock"),
+      virtualOnly: true,
+    };
+    const confirmed = await askConfirm("Salvar novas regras?", `${bettingRuleLabel(rules)}. Apostas encerradas manterão seus snapshots.`, "Salvar regras", "primary");
+    if (!confirmed) return;
+    try {
+      await fetchOptionalJSON("/api/admin/bets/settings", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ rules }),
+      });
+      await readBettingAdminData();
+      showToast("Regras do bolão atualizadas.");
+      render();
+    } catch (error) {
+      showToast(error.message, "error");
+    }
+  }
+
+  async function adjustBettingBalance(form) {
+    const values = new FormData(form);
+    try {
+      await fetchOptionalJSON("/api/admin/bets/adjust-balance", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          bettorId: String(values.get("bettorId") || ""),
+          amount: Number(values.get("amount")),
+          reason: String(values.get("reason") || "").trim(),
+        }),
+      });
+      form.reset();
+      await readBettingAdminData();
+      showToast("Ajuste registrado na auditoria.");
+      render();
+    } catch (error) {
+      showToast(error.message, "error");
+    }
+  }
+
+  async function createBettingSeason(form) {
+    const title = String(new FormData(form).get("title") || "").trim();
+    if (!title) {
+      showToast("Informe o nome da próxima temporada.", "error");
+      return;
+    }
+    try {
+      await fetchOptionalJSON("/api/admin/bets/seasons", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ title, status: "active", rules: bettingAdmin.season?.rules || {} }),
+      });
+      await readBettingAdminData();
+      showToast("Nova temporada do bolão criada.");
+      render();
+    } catch (error) {
+      showToast(error.message, "error");
+    }
   }
 
   function renderNumberField(label, name, value, column, rawName = false) {
@@ -4629,14 +5428,80 @@
     if (!confirmed) return;
     if (isLive) delete state.league.inProgress[matchId];
     else state.league.inProgress[matchId] = true;
+    try {
+      await fetchOptionalJSON("/api/admin/live/events", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          matchKind: "league",
+          matchId,
+          eventType: isLive ? "paused" : "started",
+          payload: { note: isLive ? "Partida retirada de andamento." : "Partida iniciada." },
+        }),
+      });
+    } catch (error) {
+      console.warn("Evento ao vivo será refletido pelo estado compatível.", error);
+    }
     logActivity(
       "match",
       isLive ? "Partida retirada de andamento" : "Partida em andamento",
       `${playerName(match.playerAId)} × ${playerName(match.playerBId)}`,
     );
     saveState();
+    await readLiveData({ silent: true });
     showToast(isLive ? "Partida reaberta para apostas." : "Partida iniciada; apostas bloqueadas.");
     render();
+  }
+
+  async function publishLiveEvent(form) {
+    if (!requireAdmin()) return;
+    const values = new FormData(form);
+    const button = form.querySelector('button[type="submit"]');
+    const status = form.querySelector(".live-event-status");
+    button.disabled = true;
+    status.textContent = "Publicando...";
+    const payload = {
+      matchKind: String(values.get("matchKind") || "league"),
+      matchId: String(values.get("matchId") || ""),
+      eventType: String(values.get("eventType") || "note"),
+      payload: {
+        scoreA: Number(values.get("scoreA")) || 0,
+        scoreB: Number(values.get("scoreB")) || 0,
+        note: String(values.get("note") || "").trim(),
+      },
+    };
+    try {
+      await fetchOptionalJSON("/api/admin/live/events", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+      await readLiveData();
+      showToast("Atualização publicada na Central ao Vivo.");
+      render();
+    } catch (error) {
+      status.textContent = error.message;
+      showToast(error.message, "error");
+      button.disabled = false;
+    }
+  }
+
+  async function deleteLiveEvent(eventId) {
+    if (!requireAdmin() || !eventId) return;
+    const confirmed = await askConfirm(
+      "Remover esta atualização?",
+      "Use somente para corrigir um lançamento indevido. A operação permanece registrada na auditoria.",
+      "Remover atualização",
+    );
+    if (!confirmed) return;
+    try {
+      await fetchOptionalJSON(`/api/admin/live/events?id=${encodeURIComponent(eventId)}`, { method: "DELETE" });
+      await readLiveData();
+      showToast("Atualização removida da linha do tempo.");
+      render();
+    } catch (error) {
+      showToast(error.message, "error");
+    }
   }
 
   function askConfirm(title, message, actionLabel = "Confirmar", actionKind = "danger") {
@@ -5521,12 +6386,14 @@
         body: JSON.stringify({
           contentType,
           contentId,
+          parentId: String(values.get("parentId") || ""),
           author: String(values.get("author") || "").trim(),
           body: String(values.get("body") || "").trim(),
           website: String(values.get("website") || ""),
         }),
       });
       await reloadCommunity(contentType, contentId);
+      ui.communityReplyTo = null;
       showToast("Mensagem publicada.");
       render();
     } catch (error) {
@@ -5782,6 +6649,178 @@
       case "navigate-public-ranking":
         navigateToPublicLeagueRanking();
         break;
+      case "refresh-live":
+        await readLiveData();
+        render();
+        showToast("Central ao Vivo atualizada.");
+        break;
+      case "toggle-live-display":
+        ui.liveDisplayMode = !ui.liveDisplayMode;
+        document.body.classList.toggle("live-display-active", ui.liveDisplayMode);
+        render();
+        break;
+      case "delete-live-event":
+        await deleteLiveEvent(button.dataset.eventId);
+        break;
+      case "set-schedule-view":
+        ui.scheduleView = button.dataset.scheduleView || "list";
+        render();
+        break;
+      case "shift-schedule-period":
+        shiftScheduleCursor(Number(button.dataset.direction) || 1);
+        render();
+        break;
+      case "schedule-today":
+        ui.scheduleCursor = scheduleDateKey(new Date());
+        render();
+        break;
+      case "apply-schedule-suggestion": {
+        const form = document.querySelector(`.schedule-inline-form[data-match-id="${CSS.escape(button.dataset.matchId)}"]`);
+        const input = form?.querySelector('[name="scheduledAt"]');
+        const status = form?.querySelector('[name="status"]');
+        if (input) input.value = localDateTimeInputValue(button.dataset.scheduledAt);
+        if (status) status.value = "scheduled";
+        form?.scrollIntoView({ behavior: window.matchMedia("(prefers-reduced-motion: reduce)").matches ? "auto" : "smooth", block: "center" });
+        input?.focus();
+        showToast("Sugestão preenchida. Revise e salve para confirmar.");
+        break;
+      }
+      case "install-app":
+        if (deferredInstallPrompt) {
+          deferredInstallPrompt.prompt();
+          await deferredInstallPrompt.userChoice;
+          deferredInstallPrompt = null;
+          render();
+        }
+        break;
+      case "retry-connection":
+        await Promise.allSettled([syncFromServer(), readLiveData(), readHomeData()]);
+        updateConnectionBanner();
+        render();
+        break;
+      case "refresh-betting-admin":
+        await readBettingAdminData();
+        render();
+        break;
+      case "focus-balance-adjustment": {
+        const select = document.querySelector("#betting-adjust-bettor");
+        if (select) {
+          select.value = button.dataset.bettorId || "";
+          select.scrollIntoView({ behavior: window.matchMedia("(prefers-reduced-motion: reduce)").matches ? "auto" : "smooth", block: "center" });
+          select.focus();
+        }
+        break;
+      }
+      case "toggle-bettor-active":
+        try {
+          await fetchOptionalJSON("/api/admin/bets/participants", {
+            method: "PUT",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              bettorId: button.dataset.bettorId,
+              active: button.dataset.active === "true",
+            }),
+          });
+          await readBettingAdminData();
+          showToast(button.dataset.active === "true" ? "Participante reativado." : "Participante suspenso sem apagar o histórico.");
+          render();
+        } catch (error) {
+          showToast(error.message, "error");
+        }
+        break;
+      case "lock-betting-match":
+      case "reopen-betting-match": {
+        const reopening = action === "reopen-betting-match";
+        const confirmed = await askConfirm(
+          reopening ? "Reabrir palpites desta partida?" : "Fechar palpites desta partida?",
+          reopening
+            ? "A reabertura ficará registrada e só será aceita se a partida ainda não começou."
+            : "Nenhuma alteração ou cancelamento será aceito depois do bloqueio.",
+          reopening ? "Reabrir palpites" : "Fechar palpites",
+          reopening ? "primary" : "danger",
+        );
+        if (!confirmed) break;
+        try {
+          await fetchOptionalJSON(`/api/admin/bets/${reopening ? "reopen-match" : "lock-match"}`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ matchKind: "league", matchId: button.dataset.matchId }),
+          });
+          await readBettingAdminData();
+          showToast(reopening ? "Palpites reabertos com auditoria." : "Palpites fechados.");
+          render();
+        } catch (error) {
+          showToast(error.message, "error");
+        }
+        break;
+      }
+      case "reprocess-bets":
+        try {
+          const preview = await fetchOptionalJSON("/api/admin/bets/settle-preview", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: "{}",
+          });
+          const changes = (preview.settlements || []).filter((item) => item.status !== item.previousStatus);
+          const confirmed = await askConfirm(
+            "Reprocessar a apuração oficial?",
+            changes.length
+              ? `${changes.length} palpite(s) terão o estado recalculado a partir dos resultados oficiais.`
+              : "Nenhuma divergência foi encontrada. A operação idempotente apenas confirmará o estado atual.",
+            "Reprocessar",
+            "primary",
+          );
+          if (!confirmed) break;
+          await fetchOptionalJSON("/api/admin/bets/reprocess", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: "{}",
+          });
+          await readBettingAdminData();
+          showToast("Apuração reprocessada com auditoria.");
+          render();
+        } catch (error) {
+          showToast(error.message, "error");
+        }
+        break;
+      case "archive-betting-season": {
+        const confirmed = await askConfirm(
+          "Arquivar a temporada do bolão?",
+          "O histórico e o ranking serão preservados. Pendências precisam estar resolvidas antes do arquivamento.",
+          "Arquivar temporada",
+          "danger",
+        );
+        if (!confirmed) break;
+        try {
+          try {
+            await fetchOptionalJSON("/api/admin/bets/seasons/archive", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ voidPending: false }),
+            });
+          } catch (error) {
+            if (!String(error.message || "").includes("pendente")) throw error;
+            const voidConfirmed = await askConfirm(
+              "Anular palpites pendentes?",
+              "Os palpites ainda abertos serão encerrados como anulados, sem ganho ou perda. Essa decisão ficará na auditoria.",
+              "Anular e arquivar",
+              "danger",
+            );
+            if (!voidConfirmed) break;
+            await fetchOptionalJSON("/api/admin/bets/seasons/archive", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ voidPending: true }),
+            });
+          }
+          await readBettingAdminData();
+          showToast("Temporada do bolão arquivada.");
+          render();
+        } catch (error) {
+          showToast(error.message, "error");
+        }
+        break;
+      }
       case "generate-league":
         await generateLeague();
         break;
@@ -5880,6 +6919,15 @@
         break;
       case "report-community":
         await reportCommunity(button.dataset.postId);
+        break;
+      case "reply-community":
+        ui.communityReplyTo = button.dataset.postId;
+        render();
+        window.requestAnimationFrame(() => document.querySelector(`article [name="parentId"][value="${CSS.escape(button.dataset.postId)}"]`)?.closest("form")?.querySelector("textarea")?.focus());
+        break;
+      case "cancel-community-reply":
+        ui.communityReplyTo = null;
+        render();
         break;
       case "moderate-community":
         await moderateCommunity(button.dataset.postId, button.dataset.status);
@@ -6067,6 +7115,26 @@
       event.preventDefault();
       if (requireAdmin()) archiveSeason(event.target);
     }
+    if (event.target.matches("#live-event-form")) {
+      event.preventDefault();
+      if (requireAdmin()) publishLiveEvent(event.target);
+    }
+    if (event.target.matches("#notification-preferences-form")) {
+      event.preventDefault();
+      saveNotificationPreferences(event.target);
+    }
+    if (event.target.matches("#betting-rules-form")) {
+      event.preventDefault();
+      if (requireAdmin()) saveBettingRules(event.target);
+    }
+    if (event.target.matches("#betting-balance-form")) {
+      event.preventDefault();
+      if (requireAdmin()) adjustBettingBalance(event.target);
+    }
+    if (event.target.matches("#betting-season-form")) {
+      event.preventDefault();
+      if (requireAdmin()) createBettingSeason(event.target);
+    }
   });
 
   dom.content.addEventListener("input", (event) => {
@@ -6083,6 +7151,14 @@
       const position = event.target.selectionStart;
       render();
       const refreshed = document.querySelector("#schedule-search");
+      refreshed?.focus();
+      refreshed?.setSelectionRange(position, position);
+    }
+    if (event.target.matches("#news-search")) {
+      ui.newsSearch = event.target.value;
+      const position = event.target.selectionStart;
+      render();
+      const refreshed = document.querySelector("#news-search");
       refreshed?.focus();
       refreshed?.setSelectionRange(position, position);
     }
@@ -6115,6 +7191,10 @@
     }
     if (event.target.matches("#schedule-availability-filter")) {
       ui.scheduleAvailabilityFilter = event.target.value;
+      render();
+    }
+    if (event.target.matches("#news-category-filter")) {
+      ui.newsCategory = event.target.value;
       render();
     }
     if (event.target.matches("#card-type")) {
@@ -6211,6 +7291,9 @@
         reloadCommunity("match", ui.selectedMatchId),
       ]);
     }
+    if (ui.currentView === "live") {
+      await readLiveData({ silent: true });
+    }
     render();
     if (ui.selectedNewsId) {
       await Promise.allSettled([
@@ -6221,5 +7304,23 @@
     window.scrollTo({ top: 0, behavior: "auto" });
   });
 
+  window.addEventListener("online", async () => {
+    updateConnectionBanner();
+    await Promise.allSettled([syncFromServer(), readLiveData({ silent: true })]);
+    if (["dashboard", "live"].includes(ui.currentView)) render();
+  });
+  window.addEventListener("offline", updateConnectionBanner);
+  window.addEventListener("resize", updateSidebarInert);
+  window.addEventListener("beforeinstallprompt", (event) => {
+    event.preventDefault();
+    deferredInstallPrompt = event;
+    if (ui.currentView === "dashboard") render();
+  });
+  window.addEventListener("appinstalled", () => {
+    deferredInstallPrompt = null;
+    showToast("Sinuca da Firma instalada neste aparelho.");
+  });
+
+  updateSidebarInert();
   initializeApp();
 })();
