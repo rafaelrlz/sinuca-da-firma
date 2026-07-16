@@ -462,6 +462,12 @@
   async function logoutAdmin() {
     try {
       await fetch("/api/logout", { method: "POST" });
+      const payload = await readStateFromServer();
+      if (payload.state) {
+        state = normalizeLoadedState(payload.state, createDefaultState());
+        serverRevision = Number(payload.revision) || serverRevision;
+        cacheState(state);
+      }
     } catch (error) {
       console.warn("Falha ao encerrar a sessão no servidor.", error);
     }
@@ -3515,8 +3521,10 @@
     const pending = orderedAgendaMatches();
     const nextMatch = findNextLeagueMatch();
     const today = pending.filter((match) => {
-      const value = programmingEntry(match.id).scheduledAt;
-      return value && new Date(value).toDateString() === new Date().toDateString();
+      const entry = programmingEntry(match.id);
+      return entry.status === "scheduled"
+        && entry.scheduledAt
+        && new Date(entry.scheduledAt).toDateString() === new Date().toDateString();
     });
     const recent = orderedAgendaMatches({ includeCompleted: true })
       .filter((match) => match.result)
@@ -4202,7 +4210,10 @@
   }
 
   function renderPoll(poll) {
-    const isOpen = poll.status === "open";
+    const now = Date.now();
+    const startsAt = poll.startsAt ? new Date(poll.startsAt).getTime() : Number.NEGATIVE_INFINITY;
+    const endsAt = poll.endsAt ? new Date(poll.endsAt).getTime() : Number.POSITIVE_INFINITY;
+    const isOpen = poll.status === "open" && startsAt <= now && endsAt > now;
     return `<article class="poll-card"><div><span class="badge ${isOpen ? "badge-green" : ""}">${isOpen ? "Votação aberta" : poll.status === "closed" ? "Encerrada" : "Rascunho"}</span><h2>${escapeHTML(poll.title)}</h2><p>${escapeHTML(poll.description || "")}</p></div><div class="poll-options">${(poll.options || []).map((option) => `<button data-action="vote-poll" data-poll-id="${escapeHTML(poll.id)}" data-option-id="${escapeHTML(option.id)}" aria-pressed="${poll.userOptionId === option.id}" ${isOpen ? "" : "disabled"}><span>${escapeHTML(option.label || playerName(option.playerId))}</span><strong>${Number(option.voteCount) || 0}</strong></button>`).join("")}</div><p>${Number(poll.totalVotes) || 0} voto(s)</p>${isAdmin() ? `<div class="poll-admin-actions">${poll.status !== "closed" ? `<button class="button button-secondary" data-action="close-poll" data-poll-id="${escapeHTML(poll.id)}">Encerrar e premiar</button>` : ""}<button class="button button-danger button-ghost" data-action="delete-poll" data-poll-id="${escapeHTML(poll.id)}">Excluir</button></div>` : ""}</article>`;
   }
 

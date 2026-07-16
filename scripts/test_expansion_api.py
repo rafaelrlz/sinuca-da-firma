@@ -369,9 +369,9 @@ def run() -> None:
             "POST",
             "/api/polls/vote",
             {"pollId": poll_id, "optionId": option_id},
-            {"X-Visitor-ID": visitor_one},
+            {"X-Visitor-ID": "visitor-rotated-0002"},
         )
-        assert_true(status == 409, "Segundo voto do visitante não foi bloqueado.")
+        assert_true(status == 409, "Rotação do identificador permitiu segundo voto da mesma origem.")
         poll_payload = {
             **poll_saved["poll"],
             "status": "closed",
@@ -414,20 +414,36 @@ def run() -> None:
         assert_true(status == 200 and not general["posts"], "Comentário de confronto vazou no mural geral.")
         status, match_posts = public.request("GET", "/api/community?contentType=match&contentId=m2")
         assert_true(status == 200 and len(match_posts["posts"]) == 1, "Filtro de comentários do confronto falhou.")
+        report_results = []
         for index in range(2, 5):
-            status, _ = public.request(
+            status, report = public.request(
                 "POST",
                 "/api/community/report",
                 {"postId": post_id},
                 {"X-Visitor-ID": f"visitor-000000000{index}"},
             )
             assert_true(status == 200, "Denúncia do mural falhou.")
-        status, hidden = public.request("GET", "/api/community?contentType=match&contentId=m2")
-        assert_true(not hidden["posts"], "Conteúdo com três denúncias não foi ocultado.")
+            report_results.append(report)
+        assert_true(
+            report_results[1]["alreadyReported"] and report_results[2]["alreadyReported"],
+            "Rotação do identificador criou denúncias duplicadas para a mesma origem.",
+        )
+        status, visible = public.request("GET", "/api/community?contentType=match&contentId=m2")
+        assert_true(len(visible["posts"]) == 1, "Denúncia ocultou conteúdo automaticamente.")
         status, admin_posts = admin_two.request("GET", "/api/community?contentType=match&contentId=m2")
-        assert_true(admin_posts["posts"][0]["status"] == "hidden", "Moderação não recebeu conteúdo oculto.")
+        assert_true(
+            admin_posts["posts"][0]["status"] == "published"
+            and admin_posts["posts"][0]["reportCount"] == 1,
+            "Fila de moderação não consolidou denúncias pela origem.",
+        )
         status, all_posts = admin_two.request("GET", "/api/community?contentType=all")
         assert_true(status == 200 and all_posts["posts"][0]["id"] == post_id, "Fila geral de moderação falhou.")
+        status, _ = admin_two.request(
+            "POST", "/api/community/moderate", {"postId": post_id, "status": "hidden"}
+        )
+        assert_true(status == 200, "Ocultação administrativa do post falhou.")
+        status, hidden = public.request("GET", "/api/community?contentType=match&contentId=m2")
+        assert_true(not hidden["posts"], "Conteúdo ocultado pelo administrador permaneceu público.")
         status, _ = admin_two.request(
             "POST", "/api/community/moderate", {"postId": post_id, "status": "published"}
         )
@@ -474,6 +490,20 @@ def run() -> None:
         status, audit = admin_one.request("GET", "/api/admin/audit")
         actors = {entry["adminUsername"] for entry in audit["entries"]}
         assert_true({"admin-one", "admin-two"} <= actors, "Auditoria não registrou múltiplos administradores.")
+        login_probe = ApiClient(base_url)
+        login_statuses = []
+        for index in range(6):
+            status, _ = login_probe.request(
+                "POST",
+                "/api/login",
+                {"username": "inexistente", "password": "incorreta"},
+                {"X-Forwarded-For": f"198.51.100.{index + 1}"},
+            )
+            login_statuses.append(status)
+        assert_true(
+            login_statuses[:5] == [401] * 5 and login_statuses[5] == 429,
+            "Rotação de X-Forwarded-For contornou o limite de login local.",
+        )
         assert_true((TEMP_DIR / "backup-latest.json").is_file(), "Backup temporário não foi atualizado.")
         assert_true(not (ROOT / "data" / "test.db").exists(), "Teste tocou um caminho de dados do projeto.")
         print("OK: APIs de expansão validadas com banco temporário.")

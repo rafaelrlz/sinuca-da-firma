@@ -7,6 +7,7 @@ __pycache__/
 artifacts-*.png
 validation-*.png
 detector-*.json
+.impeccable/critique/
 # Dados reais do campeonato, backups e relatórios de migração.
 data/*
 !data/LEIA-ME.txt

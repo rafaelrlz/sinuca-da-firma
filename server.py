@@ -13,6 +13,7 @@ import hashlib
 import hmac
 import base64
 import binascii
+import ipaddress
 import json
 import mimetypes
 import os
@@ -61,6 +62,7 @@ SESSION_COOKIE = "sinuca_admin_session"
 SESSION_DURATION = timedelta(hours=12)
 LOGIN_WINDOW_SECONDS = 5 * 60
 LOGIN_MAX_FAILURES = 5
+TRUST_PROXY_HEADERS = bool(os.environ.get("VERCEL")) or os.environ.get("SINUCA_TRUST_PROXY") == "1"
 
 
 def configured_admin_accounts() -> list[tuple[str, str | None]]:
@@ -2574,11 +2576,10 @@ def report_community_post(post_id: object, visitor_value: object) -> dict[str, o
             total = int(count["total"] or 0)
             connection.execute(
                 """
-                UPDATE community_posts SET report_count = ?,
-                    status = CASE WHEN ? >= 3 THEN 'hidden' ELSE status END,
-                    updated_at = ? WHERE id = ?
+                UPDATE community_posts SET report_count = ?, updated_at = ?
+                WHERE id = ?
                 """,
-                (total, total, utc_now(), post_key),
+                (total, utc_now(), post_key),
             )
             connection.commit()
     return {"ok": True, "alreadyReported": existing is not None}
@@ -3871,7 +3872,22 @@ class TournamentHandler(SimpleHTTPRequestHandler):
         value = self.headers.get(VISITOR_HEADER) or self.headers.get(NEWS_VISITOR_HEADER)
         if not value and not required:
             return None
-        return generic_visitor(value)
+        generic_visitor(value)
+        origin = self.client_origin_key()
+        digest = hashlib.sha256(f"sinuca-social-v1:{origin}".encode("utf-8")).hexdigest()
+        return f"origin-{digest}"
+
+    def client_origin_key(self) -> str:
+        candidate = str(self.client_address[0] or "").strip()
+        if TRUST_PROXY_HEADERS:
+            forwarded = self.headers.get("X-Forwarded-For", "")
+            forwarded_candidates = [item.strip() for item in forwarded.split(",") if item.strip()]
+            if forwarded_candidates:
+                candidate = forwarded_candidates[-1]
+        try:
+            return str(ipaddress.ip_address(candidate))
+        except ValueError:
+            return str(self.client_address[0] or "unknown")
 
     def bettor_token(self) -> str | None:
         value = self.headers.get(BET_TOKEN_HEADER)
@@ -3925,8 +3941,7 @@ class TournamentHandler(SimpleHTTPRequestHandler):
             self.send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": "Não foi possível cancelar a aposta.", "detail": str(error)})
 
     def handle_login(self) -> None:
-        forwarded_for = self.headers.get("X-Forwarded-For", "")
-        client_key = forwarded_for.split(",", 1)[0].strip() or self.client_address[0]
+        client_key = self.client_origin_key()
         retry_after = self.login_retry_after(client_key)
         if retry_after > 0:
             self.send_json(
