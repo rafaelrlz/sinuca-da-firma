@@ -4,7 +4,7 @@
   const STORAGE_KEY = "sinuca-da-firma-v3-cache";
   const LEGACY_STORAGE_KEY = "sinuca-da-firma-v1";
   const NEWS_VISITOR_STORAGE_KEY = "sinuca-news-visitor-v1";
-  const APP_VERSION = 4;
+  const APP_VERSION = 5;
   const SYNC_INTERVAL_MS = 4000;
   const MAX_PLAYERS = 32;
   const MAX_BALLS_PER_PLAYER = 8;
@@ -12,6 +12,22 @@
   const BASE_MATCH_GAP = 120;
   const MAX_NEWS_IMAGE_BYTES = 900 * 1024;
   const HIDDEN_VIEWS = new Set(["draw", "matches", "ranking"]);
+  const PUBLIC_VIEWS = new Set([
+    "dashboard",
+    "league",
+    "league-ranking",
+    "schedule",
+    "players",
+    "player",
+    "match",
+    "statistics",
+    "compare",
+    "news",
+    "hall",
+    "season",
+    "awards",
+    "community",
+  ]);
 
   const INITIAL_NAMES = [
     "Johnny",
@@ -38,6 +54,23 @@
     "edit-news",
     "delete-news",
     "delete-news-comment",
+    "set-next-match",
+    "toggle-featured-match",
+    "save-schedule",
+    "postpone-match",
+    "remove-schedule",
+    "save-availability",
+    "delete-availability",
+    "save-player-profile",
+    "archive-season",
+    "start-new-season",
+    "create-poll",
+    "close-poll",
+    "delete-poll",
+    "moderate-community",
+    "prepare-card",
+    "generate-match-news",
+    "download-card",
   ]);
 
   const VIEW_META = {
@@ -53,6 +86,10 @@
       title: "Liga por pontos",
       subtitle: "Todos se enfrentam e a classificação define o campeão.",
     },
+    schedule: {
+      title: "Agenda",
+      subtitle: "Organize a ordem real das partidas sem alterar as rodadas da liga.",
+    },
     "league-ranking": {
       title: "Ranking da liga",
       subtitle: "Classificação por pontos, vitórias e saldo de bolas.",
@@ -60,6 +97,46 @@
     news: {
       title: "Notícias",
       subtitle: "Histórias, resultados e bastidores do campeonato.",
+    },
+    player: {
+      title: "Perfil do jogador",
+      subtitle: "Campanha, forma recente e histórico competitivo.",
+    },
+    match: {
+      title: "Confronto",
+      subtitle: "Agenda, retrospecto e contexto completo da partida.",
+    },
+    statistics: {
+      title: "Estatísticas",
+      subtitle: "Números derivados dos resultados oficiais da temporada.",
+    },
+    compare: {
+      title: "Comparar jogadores",
+      subtitle: "Campanha e retrospecto direto lado a lado.",
+    },
+    cards: {
+      title: "Cards para compartilhar",
+      subtitle: "Crie artes do campeonato sem publicar automaticamente.",
+    },
+    seasons: {
+      title: "Temporadas",
+      subtitle: "Arquive a edição atual sem apagar o campeonato em andamento.",
+    },
+    hall: {
+      title: "Hall da Fama",
+      subtitle: "Campeões, pódios e recordes preservados.",
+    },
+    season: {
+      title: "Temporada",
+      subtitle: "Resumo imutável de uma edição arquivada.",
+    },
+    awards: {
+      title: "Premiações",
+      subtitle: "Enquetes e reconhecimentos da comunidade.",
+    },
+    community: {
+      title: "Mural da resenha",
+      subtitle: "Participação leve, moderada e segura.",
     },
     draw: {
       title: "Mata-mata",
@@ -81,6 +158,7 @@
 
   const dom = {
     content: document.querySelector("#app-content"),
+    sidebar: document.querySelector("#sidebar"),
     pageTitle: document.querySelector("#page-title"),
     pageSubtitle: document.querySelector("#page-subtitle"),
     brandTitle: document.querySelector("#brand-title"),
@@ -127,6 +205,18 @@
     leagueRoundFilter: "all",
     leagueMatchFilter: "all",
     playerSearch: "",
+    scheduleSearch: "",
+    scheduleRoundFilter: "all",
+    scheduleStatusFilter: "all",
+    scheduleAvailabilityFilter: "all",
+    selectedPlayerId: null,
+    selectedMatchId: null,
+    selectedSeasonId: null,
+    comparePlayerAId: "",
+    comparePlayerBId: "",
+    cardType: "next",
+    cardFormat: "square",
+    newsDraft: null,
     editingNewsId: null,
     selectedNewsId: null,
     moderatingNewsId: null,
@@ -139,12 +229,23 @@
   let newsLoading = true;
   let newsError = "";
   let newsEngagement = {};
+  let playerProfiles = [];
+  let seasons = [];
+  let seasonDetails = {};
+  let polls = [];
+  let awards = [];
+  let communityPosts = [];
+  let contentReactions = {};
+  let expansionLoading = true;
+  let expansionError = "";
   let auth = { authenticated: false, username: null };
   let serverRevision = 0;
   let pendingSaves = 0;
   let saveQueue = Promise.resolve();
+  let saveEpoch = 0;
   let syncInProgress = false;
   let lastSyncErrorToastAt = 0;
+  let menuReturnFocus = null;
 
   function createDefaultState() {
     const now = new Date().toISOString();
@@ -175,6 +276,8 @@
         createdAt: now,
       })),
       league: null,
+      availability: {},
+      adminTasks: [],
       tournament: null,
       activity: [
         {
@@ -218,7 +321,7 @@
           .filter((player) => player.name)
       : fallback.players;
 
-    return {
+    const normalized = {
       version: APP_VERSION,
       settings: {
         ...fallback.settings,
@@ -237,6 +340,13 @@
         parsed.league && typeof parsed.league === "object"
           ? parsed.league
           : null,
+      availability:
+        parsed.availability && typeof parsed.availability === "object"
+          ? parsed.availability
+          : {},
+      adminTasks: Array.isArray(parsed.adminTasks)
+        ? parsed.adminTasks.slice(0, 100)
+        : [],
       tournament:
         parsed.tournament && typeof parsed.tournament === "object"
           ? parsed.tournament
@@ -245,6 +355,8 @@
         ? parsed.activity.slice(0, 80)
         : fallback.activity,
     };
+    normalizeExpansionState(normalized);
+    return normalized;
   }
 
   function cacheState(snapshot = state) {
@@ -364,7 +476,9 @@
   function saveState() {
     if (!requireAdmin()) return;
     state.version = APP_VERSION;
+    normalizeExpansionState();
     const snapshot = JSON.parse(JSON.stringify(state));
+    const epoch = saveEpoch;
     cacheState(snapshot);
     updateBrand();
     pendingSaves += 1;
@@ -373,11 +487,19 @@
     saveQueue = saveQueue
       .catch(() => undefined)
       .then(async () => {
+        if (epoch !== saveEpoch) return;
         const response = await fetch("/api/state", {
           method: "PUT",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ state: snapshot }),
+          body: JSON.stringify({ state: snapshot, expectedRevision: serverRevision }),
         });
+        if (response.status === 409) {
+          const conflict = await response.json().catch(() => ({}));
+          const error = new Error("Os dados foram alterados por outro administrador.");
+          error.status = 409;
+          error.conflict = conflict;
+          throw error;
+        }
         if (!response.ok) {
           const error = new Error(`Falha ao salvar: HTTP ${response.status}`);
           error.status = response.status;
@@ -390,6 +512,7 @@
       .catch(async (error) => {
         console.error("Erro ao salvar no banco.", error);
         if (error.status === 401) {
+          saveEpoch += 1;
           auth = { authenticated: false, username: null };
           try {
             const payload = await readStateFromServer();
@@ -402,6 +525,19 @@
           setStorageStatus("online", `Banco compartilhado · revisão ${serverRevision}`);
           render();
           showToast("Sua sessão expirou. Entre novamente para salvar alterações.", "error");
+          return;
+        }
+        if (error.status === 409) {
+          saveEpoch += 1;
+          const conflictState = error.conflict?.state;
+          if (conflictState) {
+            state = normalizeLoadedState(conflictState, createDefaultState());
+            serverRevision = Number(error.conflict.revision) || serverRevision;
+            cacheState(state);
+            setStorageStatus("online", `Banco compartilhado · revisão ${serverRevision}`);
+            render();
+          }
+          showToast("Outra pessoa salvou antes. A versão mais recente foi carregada; refaça sua alteração.", "error");
           return;
         }
         setStorageStatus("offline", "Alterações mantidas apenas no cache local");
@@ -427,6 +563,66 @@
     const payload = await response.json();
     newsItems = Array.isArray(payload.articles) ? payload.articles : [];
     newsLoading = false;
+  }
+
+  async function fetchOptionalJSON(url, options = {}) {
+    const response = await fetch(url, { cache: "no-store", ...options });
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(payload.error || `Falha ao carregar ${url}.`);
+    return payload;
+  }
+
+  async function readExpansionData() {
+    expansionError = "";
+    const requests = await Promise.allSettled([
+      fetchOptionalJSON("/api/players/profiles"),
+      fetchOptionalJSON("/api/seasons"),
+      fetchOptionalJSON("/api/polls", { headers: { "X-Visitor-ID": newsVisitorId() } }),
+      fetchOptionalJSON("/api/awards"),
+      fetchOptionalJSON(isAdmin() ? "/api/community?contentType=all" : "/api/community"),
+    ]);
+    const [profilesResult, seasonsResult, pollsResult, awardsResult, communityResult] = requests;
+    if (profilesResult.status === "fulfilled") {
+      playerProfiles = Array.isArray(profilesResult.value.profiles) ? profilesResult.value.profiles : [];
+    }
+    if (seasonsResult.status === "fulfilled") {
+      seasons = Array.isArray(seasonsResult.value.seasons) ? seasonsResult.value.seasons : [];
+    }
+    if (pollsResult.status === "fulfilled") {
+      polls = Array.isArray(pollsResult.value.polls) ? pollsResult.value.polls : [];
+    }
+    if (awardsResult.status === "fulfilled") {
+      awards = Array.isArray(awardsResult.value.awards) ? awardsResult.value.awards : [];
+    }
+    if (communityResult.status === "fulfilled") {
+      communityPosts = Array.isArray(communityResult.value.posts) ? communityResult.value.posts : [];
+    }
+    const failures = requests.filter((result) => result.status === "rejected");
+    if (failures.length === requests.length) {
+      expansionError = "Os recursos ampliados estão temporariamente indisponíveis.";
+    }
+    expansionLoading = false;
+  }
+
+  function decodeRoutePart(value) {
+    try {
+      return decodeURIComponent(value || "");
+    } catch (error) {
+      return "";
+    }
+  }
+
+  function readRoute() {
+    const parts = window.location.hash.slice(1).split("/").filter(Boolean);
+    const view = parts[0] || "dashboard";
+    return { view, id: decodeRoutePart(parts.slice(1).join("/")) };
+  }
+
+  function applyRouteSelection(view, id) {
+    ui.selectedNewsId = view === "news" ? id || null : null;
+    ui.selectedPlayerId = view === "player" ? id || null : null;
+    ui.selectedMatchId = view === "match" ? id || null : null;
+    ui.selectedSeasonId = view === "season" ? id || null : null;
   }
 
   function newsVisitorId() {
@@ -462,6 +658,7 @@
     const authRequest = readAuthFromServer();
     const stateRequest = readStateFromServer();
     const newsRequest = readNewsFromServer();
+    const expansionRequest = readExpansionData();
 
     try {
       const authPayload = await authRequest;
@@ -500,17 +697,37 @@
       newsError = "Não foi possível buscar as notícias agora.";
     }
 
-    const requestedParts = window.location.hash.slice(1).split("/");
-    const requestedView = requestedParts[0];
-    if (requestedView === "news" && requestedParts[1]) {
-      ui.selectedNewsId = decodeURIComponent(requestedParts.slice(1).join("/"));
+    try {
+      await expansionRequest;
+    } catch (error) {
+      expansionLoading = false;
+      expansionError = "Os recursos ampliados estão temporariamente indisponíveis.";
+    }
+    if (isAdmin()) await readExpansionData().catch(() => undefined);
+
+    const requestedRoute = readRoute();
+    const requestedView = requestedRoute.view;
+    applyRouteSelection(requestedView, requestedRoute.id);
+    if (requestedView === "news" && ui.selectedNewsId) {
       try {
-        await readNewsEngagement(ui.selectedNewsId);
+        await Promise.all([
+          readNewsEngagement(ui.selectedNewsId),
+          loadReactions("news", ui.selectedNewsId).catch(() => null),
+        ]);
       } catch (error) {
         console.warn("Não foi possível carregar a conversa da notícia.", error);
       }
     }
-    if (VIEW_META[requestedView] && !HIDDEN_VIEWS.has(requestedView) && (isAdmin() || ["league", "league-ranking", "news"].includes(requestedView))) {
+    if (requestedView === "season" && ui.selectedSeasonId) {
+      await loadSeasonDetail(ui.selectedSeasonId).catch(() => null);
+    }
+    if (requestedView === "match" && ui.selectedMatchId) {
+      await Promise.allSettled([
+        loadReactions("match", ui.selectedMatchId),
+        reloadCommunity("match", ui.selectedMatchId),
+      ]);
+    }
+    if (VIEW_META[requestedView] && !HIDDEN_VIEWS.has(requestedView) && (isAdmin() || PUBLIC_VIEWS.has(requestedView))) {
       ui.currentView = requestedView;
     } else if (HIDDEN_VIEWS.has(requestedView)) {
       window.history.replaceState(null, "", `${window.location.pathname}${window.location.search}#league`);
@@ -530,7 +747,8 @@
       pendingSaves > 0 ||
       document.hidden ||
       dom.scoreDialog.open ||
-      dom.confirmDialog.open
+      dom.confirmDialog.open ||
+      Boolean(document.activeElement?.closest?.(".schedule-inline-form, #availability-form, #player-profile-form, #news-form, #poll-form, #archive-season-form, .community-form"))
     ) {
       return;
     }
@@ -548,6 +766,9 @@
         showToast("Dados atualizados por outro usuário.");
       }
       if (ui.currentView === "news") await readNewsFromServer();
+      if (["players", "player", "match", "seasons", "hall", "season", "awards", "community"].includes(ui.currentView)) {
+        await readExpansionData();
+      }
     } catch (error) {
       console.warn("Sincronização temporariamente indisponível.", error);
       setStorageStatus("offline", "Tentando reconectar automaticamente");
@@ -611,6 +832,125 @@
     return playerById(id)?.name || fallback;
   }
 
+  function leagueMatchMap(targetState = state) {
+    const matches = new Map();
+    (targetState.league?.rounds || []).forEach((round, roundIndex) => {
+      (round.matches || []).forEach((match) => {
+        if (!match?.id) return;
+        matches.set(String(match.id), {
+          ...match,
+          roundNumber: Number(round.number) || roundIndex + 1,
+          result: targetState.league?.results?.[match.id] || null,
+          inProgress: Boolean(targetState.league?.inProgress?.[match.id]),
+        });
+      });
+    });
+    return matches;
+  }
+
+  function normalizeExpansionState(targetState = state) {
+    targetState.availability =
+      targetState.availability && typeof targetState.availability === "object"
+        ? targetState.availability
+        : {};
+    targetState.adminTasks = Array.isArray(targetState.adminTasks)
+      ? targetState.adminTasks.slice(0, 100)
+      : [];
+    if (!targetState.league || typeof targetState.league !== "object") return;
+
+    const matchMap = leagueMatchMap(targetState);
+    const validPlayers = new Set((targetState.players || []).map((player) => String(player.id)));
+    const programming = targetState.league.programming && typeof targetState.league.programming === "object"
+      ? targetState.league.programming
+      : {};
+    const matches = programming.matches && typeof programming.matches === "object"
+      ? programming.matches
+      : {};
+    const normalizedMatches = {};
+    Object.entries(matches).forEach(([matchId, entry]) => {
+      const match = matchMap.get(matchId);
+      if (!match || match.result || !entry || typeof entry !== "object") return;
+      const status = ["unscheduled", "scheduled", "postponed", "cancelled"].includes(entry.status)
+        ? entry.status
+        : "unscheduled";
+      const scheduledAt = entry.scheduledAt && !Number.isNaN(new Date(entry.scheduledAt).getTime())
+        ? new Date(entry.scheduledAt).toISOString()
+        : "";
+      normalizedMatches[matchId] = {
+        scheduledAt,
+        location: String(entry.location || "").slice(0, 160),
+        status,
+        priority: Math.max(0, Math.min(99, Number(entry.priority) || 0)),
+        note: String(entry.note || "").slice(0, 600),
+        publicNote: String(entry.publicNote || "").slice(0, 300),
+        updatedAt: entry.updatedAt || "",
+        updatedBy: String(entry.updatedBy || ""),
+      };
+    });
+
+    const previousNextMatchId = String(programming.nextMatchId || "");
+    const nextMatch = matchMap.get(previousNextMatchId);
+    const nextMatchId = nextMatch && !nextMatch.result && nextMatch.playerAId && nextMatch.playerBId && normalizedMatches[previousNextMatchId]?.status !== "cancelled"
+      ? previousNextMatchId
+      : null;
+    const featuredMatchIds = [...new Set(
+      (Array.isArray(programming.featuredMatchIds) ? programming.featuredMatchIds : [])
+        .map(String)
+        .filter((matchId) => {
+          const match = matchMap.get(matchId);
+          return match && !match.result && match.playerAId && match.playerBId && normalizedMatches[matchId]?.status !== "cancelled";
+        }),
+    )].slice(0, 3);
+
+    targetState.league.programming = {
+      nextMatchId,
+      featuredMatchIds,
+      matches: normalizedMatches,
+    };
+
+    if (previousNextMatchId && nextMatch?.result && !nextMatchId) {
+      const targetPlayerName = (playerId) =>
+        targetState.players?.find((player) => player.id === playerId)?.name || "Jogador";
+      const hasTask = targetState.adminTasks.some(
+        (task) => task?.type === "choose-next-match" && task.status !== "done",
+      );
+      if (!hasTask) {
+        targetState.adminTasks.unshift({
+          id: createId("task"),
+          type: "choose-next-match",
+          status: "pending",
+          text: "Escolher o próximo jogo",
+          detail: `${targetPlayerName(nextMatch.playerAId)} × ${targetPlayerName(nextMatch.playerBId)} foi concluído.`,
+          createdAt: new Date().toISOString(),
+        });
+      }
+    }
+
+    const normalizedAvailability = {};
+    Object.entries(targetState.availability).forEach(([playerId, entries]) => {
+      if (!validPlayers.has(String(playerId)) || !Array.isArray(entries)) return;
+      normalizedAvailability[playerId] = entries
+        .filter((entry) => entry && typeof entry === "object")
+        .map((entry) => ({
+          id: String(entry.id || createId("availability")),
+          status: ["available", "maybe", "unavailable"].includes(entry.status)
+            ? entry.status
+            : "not_informed",
+          startsAt: entry.startsAt && !Number.isNaN(new Date(entry.startsAt).getTime())
+            ? new Date(entry.startsAt).toISOString()
+            : "",
+          endsAt: entry.endsAt && !Number.isNaN(new Date(entry.endsAt).getTime())
+            ? new Date(entry.endsAt).toISOString()
+            : "",
+          note: String(entry.note || "").slice(0, 300),
+          updatedAt: entry.updatedAt || "",
+          updatedBy: String(entry.updatedBy || ""),
+        }))
+        .slice(0, 30);
+    });
+    targetState.availability = normalizedAvailability;
+  }
+
   function updateBrand() {
     const title = state.settings.title.trim() || "Sinuca da Firma";
     dom.brandTitle.textContent = title;
@@ -625,6 +965,7 @@
       text,
       detail,
       at: new Date().toISOString(),
+      updatedBy: auth.username || "admin",
     });
     state.activity = state.activity.slice(0, 80);
   }
@@ -653,13 +994,19 @@
   }
 
   function navigate(view, options = {}) {
+    const [requestedView, ...routeParts] = String(view || "").split("/");
+    const routeId = routeParts.join("/");
+    view = requestedView;
     if (!VIEW_META[view]) return;
     if (HIDDEN_VIEWS.has(view)) view = "league";
-    if (!isAdmin() && !["dashboard", "league", "league-ranking", "news"].includes(view)) {
+    if (!isAdmin() && !PUBLIC_VIEWS.has(view)) {
       view = "dashboard";
     }
     ui.currentView = view;
-    const nextHash = view === "dashboard" ? "" : `#${view}`;
+    applyRouteSelection(view, routeId);
+    const nextHash = view === "dashboard"
+      ? ""
+      : `#${view}${routeId ? `/${encodeURIComponent(routeId)}` : ""}`;
     const historyMethod = options.replace ? "replaceState" : "pushState";
     window.history[historyMethod](null, "", `${window.location.pathname}${window.location.search}${nextHash}`);
     updateNavigationState(view);
@@ -692,11 +1039,16 @@
   }
 
   function openMenu() {
+    menuReturnFocus = document.activeElement;
     document.body.classList.add("menu-open");
+    dom.menuButton.setAttribute("aria-expanded", "true");
+    window.requestAnimationFrame(() => dom.sidebar?.querySelector(".nav-item")?.focus());
   }
 
-  function closeMenu() {
+  function closeMenu({ restoreFocus = false } = {}) {
     document.body.classList.remove("menu-open");
+    dom.menuButton.setAttribute("aria-expanded", "false");
+    if (restoreFocus && menuReturnFocus instanceof HTMLElement) menuReturnFocus.focus();
   }
 
   function render() {
@@ -708,6 +1060,7 @@
       dom.pageSubtitle.textContent = viewMeta.subtitle;
       updateNavigationState(ui.currentView);
       normalizeLeagueResults();
+      normalizeExpansionState();
       normalizeTournamentResults();
       updateBrand();
       updateQuickActions();
@@ -717,6 +1070,17 @@
         players: renderPlayers,
         league: renderLeague,
         "league-ranking": renderLeagueRanking,
+        schedule: renderSchedule,
+        player: renderPlayerProfile,
+        match: renderMatchPage,
+        statistics: renderStatistics,
+        compare: renderCompare,
+        cards: renderCardsCenter,
+        seasons: renderSeasonsAdmin,
+        hall: renderHallOfFame,
+        season: renderSeasonDetail,
+        awards: renderAwards,
+        community: renderCommunity,
         news: renderNews,
         draw: renderDraw,
         matches: renderMatches,
@@ -726,6 +1090,7 @@
       dom.content.innerHTML = renderers[ui.currentView]();
       applyAuthorizationToView();
       setupPublicMotion();
+      if (ui.currentView === "cards") window.requestAnimationFrame(drawSelectedCard);
     } catch (error) {
       console.error("Erro ao renderizar a tela.", error);
       dom.content.innerHTML = `
@@ -808,6 +1173,11 @@
       rounds,
       results: {},
       inProgress: {},
+      programming: {
+        nextMatchId: null,
+        featuredMatchIds: [],
+        matches: {},
+      },
     };
   }
 
@@ -943,8 +1313,10 @@
   }
 
   function findNextLeagueMatch() {
-    const pending = flattenLeagueMatches().filter((match) => !match.result);
-    return pending.find((match) => match.inProgress) || pending[0] || null;
+    const nextMatchId = state.league?.programming?.nextMatchId;
+    if (!nextMatchId) return null;
+    const match = leagueMatchMap().get(String(nextMatchId));
+    return match && !match.result ? match : null;
   }
 
   function calculateLeagueStandings() {
@@ -1706,7 +2078,13 @@
   function renderPublicDashboard() {
     const leagueStats = getLeagueStats();
     const standings = calculateLeagueStandings();
-    const pendingMatches = flattenLeagueMatches().filter((match) => !match.result).slice(0, 3);
+    const officialNext = findNextLeagueMatch();
+    const featuredMatches = (state.league?.programming?.featuredMatchIds || [])
+      .map((matchId) => leagueMatchMap().get(matchId))
+      .filter((match) => match && !match.result);
+    const pendingMatches = [officialNext, ...featuredMatches]
+      .filter((match, index, items) => match && items.findIndex((item) => item?.id === match.id) === index)
+      .slice(0, 3);
     const leader = standings[0] || null;
     const title = escapeHTML(state.settings.title || "Sinuca da Firma");
     const statusLabel = leagueStats.isComplete
@@ -1765,8 +2143,8 @@
 
           <section class="public-upcoming reveal" aria-labelledby="upcoming-title">
             <div class="public-block-title public-block-title-light">
-              <div><span class="public-overline">Na sequência</span><h2 id="upcoming-title">Próximas partidas</h2></div>
-              <span class="public-live-pill"><i></i>${state.league ? "Tabela atualizada" : "Aguardando tabela"}</span>
+              <div><span class="public-overline">Programação oficial</span><h2 id="upcoming-title">Próximo jogo e destaques</h2></div>
+              <span class="public-live-pill"><i></i>${officialNext ? "Próximo definido" : "Aguardando escolha"}</span>
             </div>
             <div class="public-match-list">${renderPublicMatches(pendingMatches)}</div>
           </section>
@@ -1799,7 +2177,7 @@
       <li>
         <span class="public-rank-number">${String(index + 1).padStart(2, "0")}</span>
         <span class="avatar">${escapeHTML(getInitials(row.name))}</span>
-        <span class="public-rank-player"><strong>${escapeHTML(row.name)}</strong><small>${escapeHTML(row.stage)}</small></span>
+        <button class="public-rank-player public-rank-player-link" data-action="open-player" data-player-id="${escapeHTML(row.id)}"><strong>${escapeHTML(row.name)}</strong><small>${escapeHTML(row.stage)}</small></button>
         <span><strong>${row.wins}</strong><small>vitórias</small></span>
         <span><strong>${row.ballsMade}</strong><small>matadas</small></span>
         <span><strong>${row.ballsLeft}</strong><small>na mesa</small></span>
@@ -1810,14 +2188,19 @@
 
   function renderPublicMatches(matches) {
     if (!state.league) return `<div class="public-match-empty"><span>8</span><div><strong>A primeira rodada vem aí.</strong><p>O calendário aparece aqui quando a liga for gerada.</p></div></div>`;
-    if (!matches.length) return `<div class="public-match-empty"><span>✓</span><div><strong>Todas as partidas foram concluídas.</strong><p>Confira a classificação final da temporada.</p></div></div>`;
+    if (!matches.length) {
+      const stats = getLeagueStats();
+      return stats.isComplete
+        ? `<div class="public-match-empty"><span>✓</span><div><strong>Todas as partidas foram concluídas.</strong><p>Confira a classificação final da temporada.</p></div></div>`
+        : `<div class="public-match-empty"><span>◷</span><div><strong>O próximo jogo ainda não foi escolhido.</strong><p>A organização selecionará manualmente um dos ${stats.pending} confrontos pendentes.</p></div></div>`;
+    }
     return matches.map((match) => `
       <article class="public-match-row">
         <span class="public-match-round">Rodada ${match.roundNumber}</span>
         <div><strong>${escapeHTML(playerName(match.playerAId))}</strong><span class="avatar">${escapeHTML(getInitials(playerName(match.playerAId)))}</span></div>
         <b>×</b>
         <div><span class="avatar">${escapeHTML(getInitials(playerName(match.playerBId)))}</span><strong>${escapeHTML(playerName(match.playerBId))}</strong></div>
-        <span class="public-match-status ${match.inProgress ? "is-live" : ""}">${match.inProgress ? "Em andamento" : "A jogar"}</span>
+        <span class="public-match-status ${match.inProgress ? "is-live" : ""}">${match.inProgress ? "Em andamento" : state.league.programming.nextMatchId === match.id ? "Próximo oficial" : "Destaque"}</span>
       </article>`).join("");
   }
 
@@ -1884,8 +2267,10 @@
         ${renderStatCard("Pendentes", state.league ? leagueStats.pending : "—", state.league ? "resultados a registrar" : "aguardando liga", "◷", "col-3")}
         ${renderStatCard("Progresso", state.league ? `${leagueStats.progress}%` : "0%", "da liga", "↗", "col-3", leagueStats.progress)}
 
+        ${state.adminTasks.some((task) => task.status !== "done") ? `<section class="admin-task-list col-12">${state.adminTasks.filter((task) => task.status !== "done").map((task) => `<div><span>!</span><p><strong>${escapeHTML(task.text)}</strong><small>${escapeHTML(task.detail || "")}</small></p><button class="button button-secondary" data-action="navigate" data-view="${task.type === "choose-next-match" ? "schedule" : "awards"}">Resolver</button></div>`).join("")}</section>` : ""}
+
         <section class="card col-7">
-          <div class="card-header"><div><h2>Próxima partida da liga</h2><p>Primeiro confronto ainda sem resultado.</p></div></div>
+          <div class="card-header"><div><h2>Próximo jogo oficial</h2><p>Escolhido manualmente na Agenda, independentemente da rodada.</p></div></div>
           <div class="card-body">${renderNextLeagueMatch(nextMatch)}</div>
         </section>
 
@@ -1938,6 +2323,16 @@
     if (!match) {
       const standings = calculateLeagueStandings();
       const stats = getLeagueStats();
+      if (stats.pending) {
+        return `
+          <div class="empty-state">
+            <div class="empty-state-icon">◷</div>
+            <h3>Próximo jogo ainda não escolhido</h3>
+            <p>${stats.pending} confronto(s) pendente(s) estão disponíveis, sem seleção automática.</p>
+            <button class="button button-primary" data-action="navigate" data-view="schedule">Escolher na Agenda</button>
+          </div>
+        `;
+      }
       return `
         <div class="empty-state">
           <div class="empty-state-icon">${stats.isComplete ? "🏆" : "✓"}</div>
@@ -2032,6 +2427,7 @@
   }
 
   function renderPlayers() {
+    if (!isAdmin()) return renderPublicPlayers();
     const query = ui.playerSearch.trim().toLocaleLowerCase("pt-BR");
     const filtered = state.players.filter((player) =>
       player.name.toLocaleLowerCase("pt-BR").includes(query),
@@ -2135,6 +2531,7 @@
                   <td><span class="badge badge-green">Inscrito</span></td>
                   <td>
                     <div class="table-actions">
+                      <button class="button button-small button-ghost" data-action="open-player" data-player-id="${player.id}">Perfil</button>
                       ${editing ? "" : `<button class="button button-small button-ghost" data-action="edit-player" data-player-id="${player.id}">Editar</button>`}
                       <button class="button button-small button-danger button-ghost" data-action="delete-player" data-player-id="${player.id}">Excluir</button>
                     </div>
@@ -2888,6 +3285,7 @@
             <figure class="news-article-cover">${renderNewsImage(article)}${article.imageAlt ? `<figcaption>${escapeHTML(article.imageAlt)}</figcaption>` : ""}</figure>
             <div class="news-article-body">${paragraphs}</div>
             ${newsVideoEmbed(article.videoUrl)}
+            <section class="news-reactions"><h2>Reaja à notícia</h2>${renderReactionBar("news", article.id)}</section>
             ${renderNewsComments(article)}
           </div>
           <aside class="news-article-aside">
@@ -2924,6 +3322,8 @@
 
   function renderNewsAdmin() {
     const editing = newsItems.find((article) => article.id === ui.editingNewsId) || null;
+    const draft = editing ? null : ui.newsDraft;
+    const source = editing || draft || {};
     return `
       <div class="workspace-page news-workspace">
         ${renderWorkspaceHeader("Central de notícias", "Publique resultados, histórias e bastidores sem mexer no código do site.", `${newsItems.length} ${newsItems.length === 1 ? "matéria cadastrada" : "matérias cadastradas"}`)}
@@ -2934,18 +3334,20 @@
               <div class="editorial-guidance"><strong>Publicação responsável</strong><p>Relate fatos verificáveis, resultados e contexto da competição. Evite humilhação, ataques pessoais e brincadeiras que possam expor colegas. Na descrição da imagem, diga objetivamente quem ou o que aparece.</p></div>
               <form id="news-form" class="form-grid">
                 <input type="hidden" name="id" value="${escapeHTML(editing?.id || "")}">
-                <label class="field col-8"><span>Título *</span><input name="title" maxlength="140" required value="${escapeHTML(editing?.title || "")}" placeholder="Ex.: Rodada decisiva muda a liderança"></label>
-                <label class="field col-4"><span>Categoria *</span><input name="category" maxlength="40" required value="${escapeHTML(editing?.category || "Campeonato")}" placeholder="Campeonato"></label>
-                <label class="field col-12"><span>Resumo *</span><textarea name="summary" maxlength="320" required placeholder="Uma chamada curta que explica por que vale a leitura.">${escapeHTML(editing?.summary || "")}</textarea><small class="field-help">Aparece na capa e na lista de notícias.</small></label>
-                <label class="field col-12"><span>Texto da notícia *</span><textarea class="news-body-input" name="body" maxlength="20000" required placeholder="Conte o que aconteceu. Separe os parágrafos com uma linha em branco.">${escapeHTML(editing?.body || "")}</textarea></label>
-                <label class="field col-6"><span>Autor *</span><input name="author" maxlength="80" required value="${escapeHTML(editing?.author || "Organização")}"></label>
-                <label class="field col-6"><span>Data de publicação *</span><input name="publishedAt" type="datetime-local" required value="${newsDateInputValue(editing?.publishedAt)}"></label>
+                <input type="hidden" name="matchId" value="${escapeHTML(source.matchId || source.associations?.matchId || "")}">
+                <input type="hidden" name="playerIds" value="${escapeHTML((source.playerIds || source.associations?.playerIds || []).join(","))}">
+                <label class="field col-8"><span>Título *</span><input name="title" maxlength="140" required value="${escapeHTML(source.title || "")}" placeholder="Ex.: Rodada decisiva muda a liderança"></label>
+                <label class="field col-4"><span>Categoria *</span><input name="category" maxlength="40" required value="${escapeHTML(source.category || "Campeonato")}" placeholder="Campeonato"></label>
+                <label class="field col-12"><span>Resumo *</span><textarea name="summary" maxlength="320" required placeholder="Uma chamada curta que explica por que vale a leitura.">${escapeHTML(source.summary || "")}</textarea><small class="field-help">Aparece na capa e na lista de notícias.</small></label>
+                <label class="field col-12"><span>Texto da notícia *</span><textarea class="news-body-input" name="body" maxlength="20000" required placeholder="Conte o que aconteceu. Separe os parágrafos com uma linha em branco.">${escapeHTML(source.body || "")}</textarea></label>
+                <label class="field col-6"><span>Autor *</span><input name="author" maxlength="80" required value="${escapeHTML(source.author || "Organização")}"></label>
+                <label class="field col-6"><span>Data de publicação *</span><input name="publishedAt" type="datetime-local" required value="${newsDateInputValue(source.publishedAt || new Date().toISOString())}"></label>
                 <label class="field col-6"><span>Imagem de capa</span><input name="image" type="file" accept="image/jpeg,image/png,image/webp"><small class="field-help">JPG, PNG ou WebP. A imagem é otimizada antes do envio.</small></label>
-                <label class="field col-6"><span>Descrição da imagem</span><input name="imageAlt" maxlength="180" value="${escapeHTML(editing?.imageAlt || "")}" placeholder="Ex.: Mind Rocha e Gracyanne Filth diante da mesa"><small class="field-help">Use uma descrição factual, sem julgamento sobre aparência.</small></label>
+                <label class="field col-6"><span>Descrição da imagem</span><input name="imageAlt" maxlength="180" value="${escapeHTML(source.imageAlt || "")}" placeholder="Ex.: Dois jogadores diante da mesa"><small class="field-help">Use uma descrição factual, sem julgamento sobre aparência.</small></label>
                 ${editing?.imageUrl ? `<div class="news-admin-cover col-12">${renderNewsImage(editing)}<span>Capa atual — escolha outro arquivo apenas para substituir.</span></div>` : ""}
-                <label class="field col-12"><span>Vídeo (opcional)</span><input name="videoUrl" type="url" value="${escapeHTML(editing?.videoUrl || "")}" placeholder="https://www.youtube.com/watch?v=..."><small class="field-help">Cole um link público do YouTube ou Vimeo.</small></label>
-                <label class="field col-6"><span>Status</span><select name="status"><option value="draft" ${!editing || editing?.status === "draft" ? "selected" : ""}>Rascunho</option><option value="published" ${editing?.status === "published" ? "selected" : ""}>Publicada</option></select></label>
-                <label class="news-check col-6"><input name="featured" type="checkbox" ${editing?.featured ? "checked" : ""}><span><strong>Destacar na capa</strong><small>A matéria ganha a posição principal.</small></span></label>
+                <label class="field col-12"><span>Vídeo (opcional)</span><input name="videoUrl" type="url" value="${escapeHTML(source.videoUrl || "")}" placeholder="https://www.youtube.com/watch?v=..."><small class="field-help">Cole um link público do YouTube ou Vimeo.</small></label>
+                <label class="field col-6"><span>Status</span><select name="status"><option value="draft" ${!editing || source.status === "draft" ? "selected" : ""}>Rascunho</option><option value="published" ${source.status === "published" ? "selected" : ""}>Publicada</option></select></label>
+                <label class="news-check col-6"><input name="featured" type="checkbox" ${source.featured ? "checked" : ""}><span><strong>Destacar na capa</strong><small>A matéria ganha a posição principal.</small></span></label>
                 <div class="news-form-actions col-12"><span id="news-form-status" role="status"></span><button class="button button-ghost" type="button" data-action="preview-news">Ver prévia completa</button><button class="button button-primary" type="submit">${editing ? "Salvar alterações" : "Salvar notícia"}</button></div>
               </form>
             </div>
@@ -2955,6 +3357,884 @@
             <div class="news-admin-list">${newsItems.length ? newsItems.map(renderNewsAdminItem).join("") : `<div class="empty-state"><div class="empty-state-icon">▤</div><h3>Nenhuma notícia ainda</h3><p>Use o formulário ao lado para publicar a primeira matéria.</p></div>`}</div>
           </section>
         </div>
+      </div>
+    `;
+  }
+
+  function localDateTimeInputValue(value) {
+    if (!value) return "";
+    const date = new Date(value);
+    if (Number.isNaN(date.getTime())) return "";
+    const offset = date.getTimezoneOffset() * 60000;
+    return new Date(date.getTime() - offset).toISOString().slice(0, 16);
+  }
+
+  function programmingEntry(matchId) {
+    return state.league?.programming?.matches?.[matchId] || {
+      scheduledAt: "",
+      location: "",
+      status: "unscheduled",
+      priority: 0,
+      note: "",
+      publicNote: "",
+      updatedAt: "",
+      updatedBy: "",
+    };
+  }
+
+  function availabilityAt(playerId, scheduledAt = "") {
+    const entries = Array.isArray(state.availability?.[playerId])
+      ? state.availability[playerId]
+      : [];
+    if (!entries.length) return { status: "not_informed", entries: [] };
+    const instant = scheduledAt ? new Date(scheduledAt).getTime() : Date.now();
+    const relevant = entries.filter((entry) => {
+      const starts = entry.startsAt ? new Date(entry.startsAt).getTime() : Number.NEGATIVE_INFINITY;
+      const ends = entry.endsAt ? new Date(entry.endsAt).getTime() : Number.POSITIVE_INFINITY;
+      return !Number.isNaN(starts) && !Number.isNaN(ends) && instant >= starts && instant <= ends;
+    });
+    const considered = relevant.length ? relevant : scheduledAt ? [] : entries.slice(0, 1);
+    const statuses = considered.map((entry) => entry.status);
+    const status = statuses.includes("unavailable")
+      ? "unavailable"
+      : statuses.includes("maybe")
+        ? "maybe"
+        : statuses.includes("available")
+          ? "available"
+          : "not_informed";
+    return { status, entries: considered };
+  }
+
+  function availabilityLabel(status) {
+    return {
+      available: "Disponível",
+      maybe: "Talvez",
+      unavailable: "Indisponível",
+      not_informed: "Não informado",
+    }[status] || "Não informado";
+  }
+
+  function availabilityConflict(match, scheduledAt = "") {
+    const playerA = availabilityAt(match.playerAId, scheduledAt);
+    const playerB = availabilityAt(match.playerBId, scheduledAt);
+    const hasConflict = [playerA.status, playerB.status].some((status) =>
+      ["unavailable", "maybe"].includes(status),
+    );
+    return {
+      hasConflict,
+      playerA,
+      playerB,
+      text: hasConflict
+        ? `${playerName(match.playerAId)}: ${availabilityLabel(playerA.status)} · ${playerName(match.playerBId)}: ${availabilityLabel(playerB.status)}`
+        : "",
+    };
+  }
+
+  function orderedAgendaMatches({ includeCompleted = false } = {}) {
+    const programming = state.league?.programming || {};
+    const featured = new Set(programming.featuredMatchIds || []);
+    return flattenLeagueMatches()
+      .filter((match) => includeCompleted || !match.result)
+      .sort((matchA, matchB) => {
+        const entryA = programmingEntry(matchA.id);
+        const entryB = programmingEntry(matchB.id);
+        const rank = (match, entry) => {
+          if (match.inProgress && !match.result) return 0;
+          if (programming.nextMatchId === match.id && !match.result) return 1;
+          if (entry.scheduledAt && entry.status === "scheduled" && !match.result) return 2;
+          if (featured.has(match.id) && !match.result) return 3;
+          if (!match.result) return 4;
+          return 5;
+        };
+        const rankDiff = rank(matchA, entryA) - rank(matchB, entryB);
+        if (rankDiff) return rankDiff;
+        const dateA = entryA.scheduledAt ? new Date(entryA.scheduledAt).getTime() : Number.MAX_SAFE_INTEGER;
+        const dateB = entryB.scheduledAt ? new Date(entryB.scheduledAt).getTime() : Number.MAX_SAFE_INTEGER;
+        return dateA - dateB || matchA.roundNumber - matchB.roundNumber;
+      });
+  }
+
+  function matchScheduleStatus(match) {
+    if (match.result) return "Concluída";
+    if (match.inProgress) return "Em andamento";
+    const entry = programmingEntry(match.id);
+    if (entry.status === "postponed") return "Adiada";
+    if (entry.status === "cancelled") return "Cancelada";
+    if (entry.scheduledAt && entry.status === "scheduled") return formatDateTime(entry.scheduledAt);
+    return "Sem data";
+  }
+
+  function renderAvailabilityPill(playerId, scheduledAt = "") {
+    const availability = availabilityAt(playerId, scheduledAt);
+    return `<span class="availability-pill is-${availability.status}" title="Disponibilidade informada">${escapeHTML(availabilityLabel(availability.status))}</span>`;
+  }
+
+  function renderPublicScheduleMatch(match, emphasis = "") {
+    const entry = programmingEntry(match.id);
+    const isNext = state.league?.programming?.nextMatchId === match.id;
+    const isFeatured = state.league?.programming?.featuredMatchIds?.includes(match.id);
+    const conflict = availabilityConflict(match, entry.scheduledAt);
+    return `
+      <article class="agenda-public-match ${emphasis} ${isNext ? "is-next" : ""}">
+        <div class="agenda-public-meta">
+          <span>Rodada ${match.roundNumber}</span>
+          <span>${escapeHTML(matchScheduleStatus(match))}</span>
+          ${isNext ? '<strong>Próximo jogo oficial</strong>' : ""}
+          ${isFeatured ? "<strong>Em destaque</strong>" : ""}
+        </div>
+        <div class="agenda-versus">
+          <button data-action="open-player" data-player-id="${escapeHTML(match.playerAId)}"><span class="avatar">${escapeHTML(getInitials(playerName(match.playerAId)))}</span><strong>${escapeHTML(playerName(match.playerAId))}</strong></button>
+          <b aria-label="contra">×</b>
+          <button data-action="open-player" data-player-id="${escapeHTML(match.playerBId)}"><span class="avatar">${escapeHTML(getInitials(playerName(match.playerBId)))}</span><strong>${escapeHTML(playerName(match.playerBId))}</strong></button>
+        </div>
+        <dl class="agenda-public-details">
+          <div><dt>Quando</dt><dd>${entry.scheduledAt ? `<time datetime="${escapeHTML(entry.scheduledAt)}">${escapeHTML(formatDateTime(entry.scheduledAt))}</time>` : "A definir"}</dd></div>
+          <div><dt>Local</dt><dd>${escapeHTML(entry.location || "A definir")}</dd></div>
+          ${entry.publicNote ? `<div><dt>Observação</dt><dd>${escapeHTML(entry.publicNote)}</dd></div>` : ""}
+        </dl>
+        ${conflict.hasConflict ? `<p class="agenda-public-notice">Disponibilidade ainda precisa ser confirmada pela organização.</p>` : ""}
+        <div class="agenda-actions">
+          <button class="button button-secondary" data-action="open-match" data-match-id="${escapeHTML(match.id)}">Ver confronto</button>
+          <button class="button button-ghost" data-action="download-ics" data-match-id="${escapeHTML(match.id)}" ${entry.scheduledAt ? "" : "disabled"}>Adicionar ao calendário</button>
+          <a class="button button-ghost" href="/bolao">Ir para o bolão</a>
+          <button class="button button-ghost" data-action="share-match" data-match-id="${escapeHTML(match.id)}">Compartilhar</button>
+        </div>
+      </article>
+    `;
+  }
+
+  function renderPublicSchedule() {
+    if (!state.league) {
+      return `
+        <div class="public-view">
+          ${renderPublicViewHeader("Agenda", "A mesa ainda está livre.", "A agenda aparecerá assim que a liga for criada.")}
+          <section class="public-view-content">${renderEmptyState("◷", "Nenhuma partida programada", "A organização ainda não gerou os confrontos da temporada.", "Ver jogadores", "players")}</section>
+        </div>
+      `;
+    }
+    const pending = orderedAgendaMatches();
+    const nextMatch = findNextLeagueMatch();
+    const today = pending.filter((match) => {
+      const value = programmingEntry(match.id).scheduledAt;
+      return value && new Date(value).toDateString() === new Date().toDateString();
+    });
+    const recent = orderedAgendaMatches({ includeCompleted: true })
+      .filter((match) => match.result)
+      .sort((a, b) => new Date(b.result.playedAt || 0) - new Date(a.result.playedAt || 0))
+      .slice(0, 5);
+    const listed = pending.filter((match) => match.id !== nextMatch?.id);
+
+    return `
+      <div class="public-view agenda-public-page">
+        ${renderPublicViewHeader(
+          "Agenda",
+          today.length ? "Hoje tem jogo." : "A ordem real da competição.",
+          "Rodadas organizam a liga; disponibilidade e programação definem quando cada duelo acontece.",
+          [
+            { label: "Pendentes", value: pending.length },
+            { label: "Hoje", value: today.length },
+            { label: "Em destaque", value: state.league.programming.featuredMatchIds.length },
+          ],
+        )}
+        <div class="public-view-content">
+          ${nextMatch
+            ? `<section class="agenda-next-section" aria-labelledby="agenda-next-title"><div class="public-block-title"><div><span class="public-overline">Escolha oficial</span><h2 id="agenda-next-title">Próximo jogo</h2></div></div>${renderPublicScheduleMatch(nextMatch, "agenda-next-card")}</section>`
+            : `<section class="agenda-next-empty"><h2>Próximo jogo ainda não definido</h2><p>A organização escolherá manualmente qualquer confronto pendente quando os jogadores estiverem alinhados.</p></section>`}
+          <section class="public-view-section" aria-labelledby="agenda-list-title">
+            <div class="public-block-title"><div><span class="public-overline">Programação</span><h2 id="agenda-list-title">Partidas pendentes</h2></div></div>
+            <div class="agenda-public-list">${listed.length ? listed.map((match) => renderPublicScheduleMatch(match)).join("") : `<div class="public-view-empty"><div><h2>Agenda concluída</h2><p>Todos os confrontos da temporada já possuem resultado.</p></div></div>`}</div>
+          </section>
+          ${recent.length ? `<section class="public-view-section"><div class="public-block-title"><div><span class="public-overline">Arquivo recente</span><h2>Últimos resultados</h2></div></div><div class="agenda-history-list">${recent.map((match) => `<button data-action="open-match" data-match-id="${escapeHTML(match.id)}"><span>Rodada ${match.roundNumber}</span><strong>${escapeHTML(playerName(match.playerAId))} ${match.result.scoreA} × ${match.result.scoreB} ${escapeHTML(playerName(match.playerBId))}</strong></button>`).join("")}</div></section>` : ""}
+        </div>
+      </div>
+    `;
+  }
+
+  function renderScheduleAdminMatch(match) {
+    const entry = programmingEntry(match.id);
+    const programming = state.league.programming;
+    const isNext = programming.nextMatchId === match.id;
+    const isFeatured = programming.featuredMatchIds.includes(match.id);
+    const conflict = availabilityConflict(match, entry.scheduledAt);
+    const replacementOptions = programming.featuredMatchIds
+      .map((matchId) => {
+        const featuredMatch = leagueMatchMap().get(matchId);
+        return featuredMatch
+          ? `<option value="${escapeHTML(matchId)}">${escapeHTML(playerName(featuredMatch.playerAId))} × ${escapeHTML(playerName(featuredMatch.playerBId))}</option>`
+          : "";
+      })
+      .join("");
+    return `
+      <article class="schedule-admin-match ${isNext ? "is-next" : ""}" data-match-id="${escapeHTML(match.id)}">
+        <header>
+          <div>
+            <span>Rodada ${match.roundNumber}</span>
+            <h3>${escapeHTML(playerName(match.playerAId))} <b>×</b> ${escapeHTML(playerName(match.playerBId))}</h3>
+          </div>
+          <div class="schedule-badges">
+            ${isNext ? '<span class="badge badge-green">Próximo oficial</span>' : ""}
+            ${isFeatured ? '<span class="badge badge-gold">Destaque</span>' : ""}
+            <span class="badge">${escapeHTML(matchScheduleStatus(match))}</span>
+          </div>
+        </header>
+        <div class="schedule-availability">
+          <span>${escapeHTML(playerName(match.playerAId))} ${renderAvailabilityPill(match.playerAId, entry.scheduledAt)}</span>
+          <span>${escapeHTML(playerName(match.playerBId))} ${renderAvailabilityPill(match.playerBId, entry.scheduledAt)}</span>
+        </div>
+        ${conflict.hasConflict ? `<div class="inline-warning" role="status"><strong>Aviso de disponibilidade</strong><span>${escapeHTML(conflict.text)}. A decisão continua liberada.</span></div>` : ""}
+        <form class="schedule-inline-form" data-match-id="${escapeHTML(match.id)}">
+          <label><span>Data e horário</span><input name="scheduledAt" type="datetime-local" value="${escapeHTML(localDateTimeInputValue(entry.scheduledAt))}"></label>
+          <label><span>Local</span><input name="location" maxlength="160" value="${escapeHTML(entry.location)}" placeholder="Sala de jogos"></label>
+          <label><span>Situação</span><select name="status"><option value="unscheduled" ${entry.status === "unscheduled" ? "selected" : ""}>Sem agenda</option><option value="scheduled" ${entry.status === "scheduled" ? "selected" : ""}>Agendada</option><option value="postponed" ${entry.status === "postponed" ? "selected" : ""}>Adiada</option><option value="cancelled" ${entry.status === "cancelled" ? "selected" : ""}>Cancelada</option></select></label>
+          <label class="schedule-note"><span>Observação pública</span><input name="publicNote" maxlength="300" value="${escapeHTML(entry.publicNote)}" placeholder="Informação útil para quem acompanha"></label>
+          <label class="schedule-note"><span>Nota interna</span><input name="note" maxlength="600" value="${escapeHTML(entry.note)}" placeholder="Visível apenas na administração"></label>
+          <div class="schedule-inline-actions">
+            <button class="button button-primary" type="submit">Salvar agenda</button>
+            <button class="button button-secondary" type="button" data-action="set-next-match" data-match-id="${escapeHTML(match.id)}" ${isNext ? "disabled" : ""}>${isNext ? "Próximo atual" : "Definir como próximo"}</button>
+            <button class="button button-ghost" type="button" data-action="toggle-featured-match" data-match-id="${escapeHTML(match.id)}">${isFeatured ? "Remover destaque" : "Destacar"}</button>
+            <button class="button button-ghost" type="button" data-action="remove-schedule" data-match-id="${escapeHTML(match.id)}">Limpar agenda</button>
+          </div>
+          ${!isFeatured && programming.featuredMatchIds.length >= 3 ? `<label class="featured-replacement"><span>Para destacar, substituir</span><select data-featured-replacement="${escapeHTML(match.id)}">${replacementOptions}</select></label>` : ""}
+        </form>
+        ${entry.updatedAt ? `<p class="schedule-audit">Última alteração por ${escapeHTML(entry.updatedBy || "admin")} em ${escapeHTML(formatDateTime(entry.updatedAt))}</p>` : ""}
+      </article>
+    `;
+  }
+
+  function renderAvailabilityAdmin() {
+    const entries = state.players.flatMap((player) =>
+      (state.availability[player.id] || []).map((entry) => ({ ...entry, player })),
+    ).sort((a, b) => new Date(b.updatedAt || 0) - new Date(a.updatedAt || 0));
+    return `
+      <section class="card availability-admin-card">
+        <div class="card-header"><div><h2>Disponibilidade dos jogadores</h2><p>Gera avisos na agenda, sem bloquear a decisão administrativa.</p></div></div>
+        <div class="card-body">
+          <form id="availability-form" class="availability-form">
+            <label><span>Jogador</span><select name="playerId" required><option value="">Selecione</option>${state.players.map((player) => `<option value="${escapeHTML(player.id)}">${escapeHTML(player.name)}</option>`).join("")}</select></label>
+            <label><span>Estado</span><select name="status"><option value="available">Disponível</option><option value="maybe">Talvez</option><option value="unavailable">Indisponível</option><option value="not_informed">Não informado</option></select></label>
+            <label><span>Início</span><input name="startsAt" type="datetime-local"></label>
+            <label><span>Fim</span><input name="endsAt" type="datetime-local"></label>
+            <label class="availability-note"><span>Observação</span><input name="note" maxlength="300" placeholder="Evite detalhes pessoais desnecessários"></label>
+            <button class="button button-primary" type="submit">Registrar disponibilidade</button>
+          </form>
+          <div class="availability-list">${entries.length ? entries.slice(0, 30).map((entry) => `
+            <div>
+              <span class="avatar">${escapeHTML(getInitials(entry.player.name))}</span>
+              <p><strong>${escapeHTML(entry.player.name)}</strong><span>${escapeHTML(availabilityLabel(entry.status))} · ${entry.startsAt ? formatDateTime(entry.startsAt) : "agora"}${entry.endsAt ? ` até ${formatDateTime(entry.endsAt)}` : ""}</span>${entry.note ? `<small>${escapeHTML(entry.note)}</small>` : ""}</p>
+              <button class="icon-button" data-action="delete-availability" data-player-id="${escapeHTML(entry.player.id)}" data-availability-id="${escapeHTML(entry.id)}" aria-label="Remover disponibilidade de ${escapeHTML(entry.player.name)}">×</button>
+            </div>`).join("") : "<p>Nenhuma disponibilidade informada.</p>"}</div>
+        </div>
+      </section>
+    `;
+  }
+
+  function renderScheduleAdmin() {
+    if (!state.league) {
+      return `<div class="workspace-page">${renderWorkspaceHeader("Agenda da competição", "Gere a liga antes de programar os confrontos.", "Nenhuma tabela ativa")}<section class="card">${renderEmptyState("◷", "A agenda precisa da tabela", "Crie os confrontos da liga; depois qualquer partida pendente poderá ser escolhida.", "Gerar liga", "league")}</section></div>`;
+    }
+    const rounds = state.league.rounds || [];
+    const allPending = orderedAgendaMatches();
+    const filtered = allPending.filter((match) => {
+      const haystack = `${playerName(match.playerAId)} ${playerName(match.playerBId)}`.toLocaleLowerCase("pt-BR");
+      const searchMatches = !ui.scheduleSearch || haystack.includes(ui.scheduleSearch.toLocaleLowerCase("pt-BR"));
+      const roundMatches = ui.scheduleRoundFilter === "all" || String(match.roundNumber) === ui.scheduleRoundFilter;
+      const status = programmingEntry(match.id).status;
+      const statusMatches = ui.scheduleStatusFilter === "all" || status === ui.scheduleStatusFilter;
+      const conflict = availabilityConflict(match, programmingEntry(match.id).scheduledAt);
+      const availabilityMatches = ui.scheduleAvailabilityFilter === "all"
+        || (ui.scheduleAvailabilityFilter === "conflict" && conflict.hasConflict)
+        || (ui.scheduleAvailabilityFilter === "available" && !conflict.hasConflict);
+      return searchMatches && roundMatches && statusMatches && availabilityMatches;
+    });
+    const nextMatch = findNextLeagueMatch();
+    const pendingTask = state.adminTasks.find((task) => task.type === "choose-next-match" && task.status !== "done");
+    return `
+      <div class="workspace-page schedule-workspace">
+        ${renderWorkspaceHeader(
+          "Agenda flexível",
+          "Escolha a ordem real das partidas sem alterar a estrutura esportiva das rodadas.",
+          `${allPending.length} confronto(s) pendente(s) · até 3 destaques`,
+          `<button class="button button-ghost" data-action="navigate" data-view="cards">Gerar cards</button>`,
+        )}
+        ${pendingTask ? `<section class="admin-task-banner" role="status"><div><strong>${escapeHTML(pendingTask.text)}</strong><span>${escapeHTML(pendingTask.detail || "O próximo jogo concluído não foi substituído automaticamente.")}</span></div><button class="button button-primary" data-action="focus-schedule-list">Escolher agora</button></section>` : ""}
+        <section class="card schedule-summary-card">
+          <div><span class="public-overline">Próximo jogo oficial</span><h2>${nextMatch ? `${escapeHTML(playerName(nextMatch.playerAId))} × ${escapeHTML(playerName(nextMatch.playerBId))}` : "Nenhum confronto selecionado"}</h2><p>${nextMatch ? `${matchScheduleStatus(nextMatch)} · rodada ${nextMatch.roundNumber}` : "A conclusão de um jogo nunca seleciona outro automaticamente."}</p></div>
+          <div class="schedule-summary-stats"><span><strong>${state.league.programming.featuredMatchIds.length}/3</strong> destaques</span><span><strong>${allPending.filter((match) => programmingEntry(match.id).scheduledAt).length}</strong> com data</span></div>
+        </section>
+        <section class="card schedule-list-card" id="schedule-match-list">
+          <div class="card-header"><div><h2>Todos os confrontos pendentes</h2><p>Partidas de qualquer rodada estão disponíveis para programação.</p></div></div>
+          <div class="schedule-filters">
+            <label><span>Buscar jogador</span><input id="schedule-search" type="search" value="${escapeHTML(ui.scheduleSearch)}" placeholder="Nome do jogador"></label>
+            <label><span>Rodada</span><select id="schedule-round-filter"><option value="all">Todas</option>${rounds.map((round, index) => `<option value="${Number(round.number) || index + 1}" ${ui.scheduleRoundFilter === String(Number(round.number) || index + 1) ? "selected" : ""}>Rodada ${Number(round.number) || index + 1}</option>`).join("")}</select></label>
+            <label><span>Situação</span><select id="schedule-status-filter"><option value="all">Todas</option><option value="unscheduled" ${ui.scheduleStatusFilter === "unscheduled" ? "selected" : ""}>Sem agenda</option><option value="scheduled" ${ui.scheduleStatusFilter === "scheduled" ? "selected" : ""}>Agendadas</option><option value="postponed" ${ui.scheduleStatusFilter === "postponed" ? "selected" : ""}>Adiadas</option><option value="cancelled" ${ui.scheduleStatusFilter === "cancelled" ? "selected" : ""}>Canceladas</option></select></label>
+            <label><span>Disponibilidade</span><select id="schedule-availability-filter"><option value="all">Todas</option><option value="available" ${ui.scheduleAvailabilityFilter === "available" ? "selected" : ""}>Sem conflito</option><option value="conflict" ${ui.scheduleAvailabilityFilter === "conflict" ? "selected" : ""}>Com aviso</option></select></label>
+          </div>
+          <div class="schedule-admin-list">${filtered.length ? filtered.map(renderScheduleAdminMatch).join("") : `<div class="empty-state compact"><div class="empty-state-icon">⌕</div><h3>Nenhum confronto encontrado</h3><p>Ajuste os filtros para ver outras partidas pendentes.</p></div>`}</div>
+        </section>
+        ${renderAvailabilityAdmin()}
+        <section class="card schedule-history-card"><div class="card-header"><div><h2>Histórico da programação</h2><p>Administrador, data e horário de cada operação registrada.</p></div></div>${renderActivity()}</section>
+      </div>
+    `;
+  }
+
+  function renderSchedule() {
+    return isAdmin() ? renderScheduleAdmin() : renderPublicSchedule();
+  }
+
+  function expansionDomain() {
+    return window.SinucaExpansionDomain || null;
+  }
+
+  function profileByPlayerId(playerId) {
+    return playerProfiles.find((profile) => profile.playerId === playerId || profile.player_id === playerId) || null;
+  }
+
+  function profileImageUrl(playerId) {
+    const profile = profileByPlayerId(playerId);
+    return profile?.imageUrl || profile?.image_url || (profile?.hasImage ? `/api/players/profile/image?id=${encodeURIComponent(playerId)}` : "");
+  }
+
+  function playerStats(playerId) {
+    const domain = expansionDomain();
+    if (domain?.calculatePlayerStats) return domain.calculatePlayerStats(state, playerId);
+    const standing = calculateLeagueStandings().find((row) => row.id === playerId) || null;
+    return {
+      playerId,
+      name: playerName(playerId),
+      standing,
+      currentStreak: { type: null, length: 0 },
+      maxWinStreak: 0,
+      form: [],
+      recentMatches: [],
+      allMatches: [],
+    };
+  }
+
+  function headToHead(playerAId, playerBId) {
+    const domain = expansionDomain();
+    if (domain?.calculateHeadToHead) return domain.calculateHeadToHead(state, playerAId, playerBId);
+    return { games: 0, wins: { [playerAId]: 0, [playerBId]: 0 }, leaderId: null, tied: true, matches: [] };
+  }
+
+  function nextOpponentForPlayer(playerId) {
+    const official = findNextLeagueMatch();
+    if (official && [official.playerAId, official.playerBId].includes(playerId)) {
+      return official.playerAId === playerId ? official.playerBId : official.playerAId;
+    }
+    const scheduled = orderedAgendaMatches().find((match) =>
+      [match.playerAId, match.playerBId].includes(playerId) && programmingEntry(match.id).scheduledAt,
+    );
+    if (!scheduled) return null;
+    return scheduled.playerAId === playerId ? scheduled.playerBId : scheduled.playerAId;
+  }
+
+  function renderPlayerAvatar(playerId, className = "") {
+    const name = playerName(playerId);
+    const imageUrl = profileImageUrl(playerId);
+    return imageUrl
+      ? `<img class="player-photo ${className}" src="${escapeHTML(imageUrl)}" alt="Foto de ${escapeHTML(name)}">`
+      : `<span class="player-photo player-photo-fallback ${className}" aria-label="Avatar de ${escapeHTML(name)}">${escapeHTML(getInitials(name))}</span>`;
+  }
+
+  function renderPublicPlayers() {
+    const standings = expansionDomain()?.calculateStandings
+      ? expansionDomain().calculateStandings(state)
+      : calculateLeagueStandings();
+    const positions = new Map(standings.map((row, index) => [row.id, row.position || index + 1]));
+    const query = ui.playerSearch.trim().toLocaleLowerCase("pt-BR");
+    const players = state.players.filter((player) => player.name.toLocaleLowerCase("pt-BR").includes(query));
+    return `
+      <div class="public-view players-public-page">
+        ${renderPublicViewHeader("Jogadores", "Cada campanha tem um rosto.", "Conheça o elenco, abra os perfis e acompanhe quem está em melhor fase.", [
+          { label: "Participantes", value: state.players.length },
+          { label: "Com perfil", value: playerProfiles.length },
+          { label: "Partidas", value: getLeagueStats().completed },
+        ])}
+        <div class="public-view-content">
+          <label class="public-search-field"><span>Buscar jogador</span><input id="player-search" type="search" value="${escapeHTML(ui.playerSearch)}" placeholder="Digite um nome"></label>
+          <div class="player-directory">${players.length ? players.map((player) => {
+            const profile = profileByPlayerId(player.id);
+            const stats = playerStats(player.id);
+            return `<article class="player-directory-item">
+              ${renderPlayerAvatar(player.id)}
+              <div><span>${positions.has(player.id) ? `${positions.get(player.id)}º lugar` : "Temporada atual"}</span><h2>${escapeHTML(profile?.nickname || player.name)}</h2>${profile?.nickname ? `<p>${escapeHTML(player.name)}</p>` : ""}<small>${stats.standing?.played || 0} jogos · ${stats.standing?.wins || 0} vitórias · ${stats.standing?.percentage || 0}%</small></div>
+              <button class="button button-secondary" data-action="open-player" data-player-id="${escapeHTML(player.id)}">Ver perfil</button>
+            </article>`;
+          }).join("") : `<div class="public-view-empty"><div><h2>Nenhum jogador encontrado</h2><p>Altere a busca para consultar o elenco.</p></div></div>`}</div>
+          <div class="public-subpage-footer"><button data-action="navigate" data-view="compare">Comparar jogadores</button><button data-action="navigate" data-view="statistics">Ver estatísticas</button><button data-action="navigate" data-view="hall">Hall da Fama</button></div>
+        </div>
+      </div>
+    `;
+  }
+
+  function renderProfileEditor(player, profile) {
+    if (!isAdmin()) return "";
+    return `
+      <section class="card profile-editor-card">
+        <div class="card-header"><div><h2>Editar perfil público</h2><p>O nome competitivo continua sendo alterado no cadastro de jogadores.</p></div></div>
+        <div class="card-body">
+          <form id="player-profile-form" class="form-grid" data-player-id="${escapeHTML(player.id)}">
+            <label class="field col-6"><span>Apelido</span><input name="nickname" maxlength="80" value="${escapeHTML(profile?.nickname || "")}"></label>
+            <label class="field col-6"><span>Entrada no campeonato</span><input name="joinedAt" type="date" value="${escapeHTML(String(profile?.joinedAt || profile?.joined_at || "").slice(0, 10))}"></label>
+            <label class="field col-12"><span>Biografia</span><textarea name="bio" maxlength="1200" placeholder="Uma apresentação curta e respeitosa.">${escapeHTML(profile?.bio || "")}</textarea></label>
+            <label class="field col-6"><span>Jogada favorita</span><input name="favoriteShot" maxlength="120" value="${escapeHTML(profile?.favoriteShot || profile?.favorite_shot || "")}"></label>
+            <label class="field col-6"><span>Foto (JPG, PNG ou WebP)</span><input name="image" type="file" accept="image/jpeg,image/png,image/webp"></label>
+            <div class="col-12 profile-editor-actions"><span id="profile-form-status" role="status"></span><button class="button button-primary" type="submit">Salvar perfil</button></div>
+          </form>
+        </div>
+      </section>
+    `;
+  }
+
+  function renderPlayerProfile() {
+    const player = playerById(ui.selectedPlayerId);
+    if (!player) {
+      return `<div class="public-view">${renderPublicViewHeader("Jogadores", "Jogador não encontrado.", "O cadastro pode ter sido removido ou o link está incompleto.")}<div class="public-view-content">${renderEmptyState("?", "Perfil indisponível", "Volte ao diretório para escolher outro participante.", "Ver jogadores", "players")}</div></div>`;
+    }
+    const profile = profileByPlayerId(player.id);
+    const stats = playerStats(player.id);
+    const standing = stats.standing || {};
+    const nextOpponentId = nextOpponentForPlayer(player.id);
+    const relatedNews = newsItems.filter((article) => Array.isArray(article.playerIds) && article.playerIds.includes(player.id)).slice(0, 3);
+    const opponents = state.players.filter((item) => item.id !== player.id).map((opponent) => ({
+      opponent,
+      h2h: headToHead(player.id, opponent.id),
+    })).filter((item) => item.h2h.games);
+    return `
+      <div class="${isAdmin() ? "workspace-page profile-admin-page" : "public-view player-profile-page"}">
+        <section class="player-profile-hero">
+          ${renderPlayerAvatar(player.id, "is-large")}
+          <div><button class="public-view-back" data-action="navigate" data-view="players">← Todos os jogadores</button><span>${standing.position ? `${standing.position}º no ranking` : "Participante"}</span><h1>${escapeHTML(profile?.nickname || player.name)}</h1>${profile?.nickname ? `<p class="player-real-name">${escapeHTML(player.name)}</p>` : ""}<p>${escapeHTML(profile?.bio || "Perfil em construção. A campanha e os resultados oficiais já estão disponíveis.")}</p></div>
+          <div class="player-profile-actions"><button class="button button-primary" data-action="open-compare-with" data-player-id="${escapeHTML(player.id)}">Comparar jogadores</button>${nextOpponentId ? `<button class="button button-ghost" data-action="open-player-match" data-player-id="${escapeHTML(player.id)}" data-opponent-id="${escapeHTML(nextOpponentId)}">Ir para o próximo jogo</button>` : ""}<button class="button button-ghost" data-action="share-player" data-player-id="${escapeHTML(player.id)}">Compartilhar perfil</button></div>
+        </section>
+        <div class="${isAdmin() ? "profile-admin-grid" : "public-view-content"}">
+          <section class="profile-stat-strip" aria-label="Resumo da campanha">
+            <div><strong>${standing.played || 0}</strong><span>partidas</span></div>
+            <div><strong>${standing.wins || 0}</strong><span>vitórias</span></div>
+            <div><strong>${standing.percentage || 0}%</strong><span>aproveitamento</span></div>
+            <div><strong>${standing.ballsMade || 0}</strong><span>bolas matadas</span></div>
+            <div><strong>${Number(standing.ballBalance || 0) > 0 ? "+" : ""}${standing.ballBalance || 0}</strong><span>saldo</span></div>
+            <div><strong>${stats.currentStreak.length || 0}</strong><span>sequência atual</span></div>
+          </section>
+          <section class="profile-content-grid">
+            <article><h2>Forma recente</h2><div class="form-sequence">${stats.form.length ? stats.form.map((symbol) => `<span class="${symbol === "V" ? "is-win" : "is-loss"}">${symbol}</span>`).join("") : "<p>Ainda sem resultados.</p>"}</div><div class="profile-results">${stats.recentMatches.length ? [...stats.recentMatches].reverse().map((match) => `<button data-action="open-match" data-match-id="${escapeHTML(match.matchId)}"><span>${match.won ? "Vitória" : "Derrota"} · rodada ${match.roundNumber}</span><strong>contra ${escapeHTML(match.opponentName)}</strong></button>`).join("") : ""}</div></article>
+            <article><h2>Próximo adversário</h2>${nextOpponentId ? `<div class="profile-next-opponent">${renderPlayerAvatar(nextOpponentId)}<div><strong>${escapeHTML(playerName(nextOpponentId))}</strong><span>${escapeHTML(matchScheduleStatus(orderedAgendaMatches().find((match) => [match.playerAId, match.playerBId].includes(player.id) && [match.playerAId, match.playerBId].includes(nextOpponentId)) || {}))}</span></div></div>` : "<p>Nenhuma partida futura programada.</p>"}${profile?.favoriteShot ? `<p><strong>Jogada favorita:</strong> ${escapeHTML(profile.favoriteShot)}</p>` : ""}</article>
+            <article><h2>Retrospecto</h2>${opponents.length ? opponents.map(({ opponent, h2h }) => `<button class="profile-h2h-row" data-action="open-compare-pair" data-player-a-id="${escapeHTML(player.id)}" data-player-b-id="${escapeHTML(opponent.id)}"><span>${escapeHTML(opponent.name)}</span><strong>${h2h.wins[player.id] || 0} × ${h2h.wins[opponent.id] || 0}</strong></button>`).join("") : "<p>O primeiro confronto direto ainda será disputado.</p>"}</article>
+            <article><h2>Notícias relacionadas</h2>${relatedNews.length ? relatedNews.map((article) => `<button class="profile-news-row" data-action="open-news" data-news-id="${escapeHTML(article.id)}"><span>${escapeHTML(formatNewsDate(article.publishedAt))}</span><strong>${escapeHTML(article.title)}</strong></button>`).join("") : "<p>Nenhuma notícia vinculada a este jogador.</p>"}</article>
+          </section>
+          ${renderProfileEditor(player, profile)}
+        </div>
+      </div>
+    `;
+  }
+
+  function renderReactionBar(contentType, contentId) {
+    const key = `${contentType}:${contentId}`;
+    const engagement = contentReactions[key] || { counts: {}, userReaction: null };
+    const reactions = [
+      ["great_match", "Grande jogo"],
+      ["surprise", "Surpresa"],
+      ["played_well", "Jogou muito"],
+      ["rematch", "Revanche"],
+      ["historic", "Histórico"],
+    ];
+    return `<div class="reaction-bar" aria-label="Reações">${reactions.map(([value, label]) => `<button aria-pressed="${engagement.userReaction === value}" data-action="react-content" data-content-type="${escapeHTML(contentType)}" data-content-id="${escapeHTML(contentId)}" data-reaction="${value}"><span>${escapeHTML(label)}</span><strong>${Number(engagement.counts?.[value]) || 0}</strong></button>`).join("")}</div>`;
+  }
+
+  function renderMatchPage() {
+    const match = leagueMatchMap().get(String(ui.selectedMatchId || ""));
+    if (!match) {
+      return `<div class="public-view">${renderPublicViewHeader("Confronto", "Partida não encontrada.", "O duelo pode ter sido removido da temporada atual.")}<div class="public-view-content">${renderEmptyState("?", "Confronto indisponível", "Abra a Agenda para escolher outra partida.", "Ver agenda", "schedule")}</div></div>`;
+    }
+    const entry = programmingEntry(match.id);
+    const statsA = playerStats(match.playerAId);
+    const statsB = playerStats(match.playerBId);
+    const direct = headToHead(match.playerAId, match.playerBId);
+    const comments = communityPosts.filter((post) => post.contentType === "match" && post.contentId === match.id);
+    return `
+      <div class="public-view match-detail-page">
+        ${renderPublicViewHeader("Confronto", `${escapeHTML(playerName(match.playerAId))} × ${escapeHTML(playerName(match.playerBId))}`, `Rodada ${match.roundNumber} · ${matchScheduleStatus(match)}`, [
+          { label: "Retrospecto", value: `${direct.wins[match.playerAId] || 0} × ${direct.wins[match.playerBId] || 0}` },
+          { label: "Ranking", value: `${statsA.standing?.position || "—"}º / ${statsB.standing?.position || "—"}º` },
+          { label: "Local", value: entry.location || "A definir" },
+        ])}
+        <div class="public-view-content">
+          <section class="match-faceoff">
+            <button data-action="open-player" data-player-id="${escapeHTML(match.playerAId)}">${renderPlayerAvatar(match.playerAId, "is-large")}<strong>${escapeHTML(playerName(match.playerAId))}</strong><span>${statsA.standing?.points || 0} pontos · forma ${statsA.form.join(" ") || "—"}</span>${renderAvailabilityPill(match.playerAId, entry.scheduledAt)}</button>
+            <div><span>${match.result ? "Resultado final" : match.inProgress ? "Em andamento" : "Próxima disputa"}</span><strong>${match.result ? `${match.result.scoreA} × ${match.result.scoreB}` : "×"}</strong>${match.result ? `<small>${escapeHTML(formatBallSummary(match.result))}</small>` : ""}</div>
+            <button data-action="open-player" data-player-id="${escapeHTML(match.playerBId)}">${renderPlayerAvatar(match.playerBId, "is-large")}<strong>${escapeHTML(playerName(match.playerBId))}</strong><span>${statsB.standing?.points || 0} pontos · forma ${statsB.form.join(" ") || "—"}</span>${renderAvailabilityPill(match.playerBId, entry.scheduledAt)}</button>
+          </section>
+          <section class="match-context-grid">
+            <article><h2>Agenda</h2><dl><div><dt>Data</dt><dd>${entry.scheduledAt ? formatDateTime(entry.scheduledAt) : "A definir"}</dd></div><div><dt>Local</dt><dd>${escapeHTML(entry.location || "A definir")}</dd></div><div><dt>Situação</dt><dd>${escapeHTML(matchScheduleStatus(match))}</dd></div></dl>${entry.publicNote ? `<p>${escapeHTML(entry.publicNote)}</p>` : ""}</article>
+            <article><h2>Retrospecto direto</h2><p><strong>${direct.games}</strong> confronto(s) concluído(s).</p><div class="h2h-score"><span>${escapeHTML(playerName(match.playerAId))} <strong>${direct.wins[match.playerAId] || 0}</strong></span><span>${escapeHTML(playerName(match.playerBId))} <strong>${direct.wins[match.playerBId] || 0}</strong></span></div></article>
+            <article><h2>Forma recente</h2><div class="match-form-row"><span>${escapeHTML(playerName(match.playerAId))}</span><div class="form-sequence">${statsA.form.map((item) => `<i class="${item === "V" ? "is-win" : "is-loss"}">${item}</i>`).join("") || "—"}</div></div><div class="match-form-row"><span>${escapeHTML(playerName(match.playerBId))}</span><div class="form-sequence">${statsB.form.map((item) => `<i class="${item === "V" ? "is-win" : "is-loss"}">${item}</i>`).join("") || "—"}</div></div></article>
+          </section>
+          <div class="agenda-actions match-primary-actions"><button class="button button-primary" data-action="download-ics" data-match-id="${escapeHTML(match.id)}" ${entry.scheduledAt ? "" : "disabled"}>Adicionar ao calendário</button><button class="button button-secondary" data-action="share-match" data-match-id="${escapeHTML(match.id)}">Compartilhar confronto</button><a class="button button-ghost" href="/bolao">Ir para o bolão</a>${isAdmin() ? `<button class="button button-ghost" data-action="prepare-card" data-match-id="${escapeHTML(match.id)}">Gerar card</button><button class="button button-ghost" data-action="generate-match-news" data-match-id="${escapeHTML(match.id)}">Publicar notícia</button>` : ""}</div>
+          <section class="match-engagement"><div class="public-block-title"><div><span class="public-overline">Reação da torcida</span><h2>Avalie o confronto</h2></div></div>${renderReactionBar("match", match.id)}</section>
+          <section class="community-thread" id="match-comments"><div class="public-block-title"><div><span class="public-overline">Resenha</span><h2>Comentários da partida</h2></div></div>${renderCommunityForm("match", match.id)}${renderCommunityPosts(comments, true)}</section>
+        </div>
+      </div>
+    `;
+  }
+
+  function renderStatistics() {
+    const statistics = expansionDomain()?.calculateStatistics
+      ? expansionDomain().calculateStatistics(state)
+      : { totals: { completed: 0 }, standings: calculateLeagueStandings(), leaders: {}, balancedMatches: [], biggestWins: [], playerStats: [], evolution: { rounds: [], players: [], textSummary: "Ainda não há resultados." } };
+    if (!statistics.totals.completed) {
+      return `<div class="${isAdmin() ? "workspace-page" : "public-view"}">${isAdmin() ? renderWorkspaceHeader("Estatísticas da temporada", "Todos os indicadores são derivados dos resultados oficiais.", "Sem partidas concluídas") : renderPublicViewHeader("Estatísticas", "Os números começam com o primeiro resultado.", "Nenhuma métrica é preenchida manualmente.")}<section class="${isAdmin() ? "card" : "public-view-content"}">${renderEmptyState("⌁", "Ainda não há estatísticas", "Registre o primeiro placar da liga para liberar líderes, sequências e evolução.", "Ver liga", "league")}</section></div>`;
+    }
+    const leaderBlock = (title, rows, key, suffix = "") => `<article><h2>${escapeHTML(title)}</h2>${(rows || []).slice(0, 5).map((row, index) => `<button data-action="open-player" data-player-id="${escapeHTML(row.id)}"><span>${index + 1}. ${escapeHTML(row.name)}</span><strong>${row[key]}${suffix}</strong></button>`).join("")}</article>`;
+    const evolution = statistics.evolution || { rounds: [], players: [], textSummary: "" };
+    return `
+      <div class="${isAdmin() ? "workspace-page statistics-page" : "public-view statistics-page"}">
+        ${isAdmin()
+          ? renderWorkspaceHeader("Estatísticas da temporada", "Diagnóstico calculado uma vez a partir dos resultados oficiais.", `${statistics.totals.completed} resultado(s) válido(s)`, `<button class="button button-ghost" data-action="navigate" data-view="compare">Comparar jogadores</button>`)
+          : renderPublicViewHeader("Estatísticas", "A temporada contada pelos números.", "Vitórias, bolas, saldo, sequências e evolução sem métricas manuais.", [
+            { label: "Jogos", value: statistics.totals.completed },
+            { label: "Jogadores", value: statistics.totals.players },
+            { label: "Pendentes", value: statistics.totals.pending },
+          ])}
+        <div class="${isAdmin() ? "statistics-admin-content" : "public-view-content"}">
+          <section class="statistics-leader-grid">
+            ${leaderBlock("Mais vitórias", statistics.leaders.wins, "wins")}
+            ${leaderBlock("Bolas matadas", statistics.leaders.ballsMade, "ballsMade")}
+            ${leaderBlock("Melhor saldo", statistics.leaders.ballBalance, "ballBalance")}
+            ${leaderBlock("Aproveitamento", statistics.leaders.percentage, "percentage", "%")}
+          </section>
+          <section class="statistics-story-grid">
+            <article><h2>Maiores sequências</h2>${(statistics.playerStats || []).sort((a, b) => b.maxWinStreak - a.maxWinStreak).slice(0, 5).map((item) => `<button data-action="open-player" data-player-id="${escapeHTML(item.playerId)}"><span>${escapeHTML(item.name)}</span><strong>${item.maxWinStreak} vitória(s)</strong></button>`).join("")}</article>
+            <article><h2>Partidas equilibradas</h2>${(statistics.balancedMatches || []).slice(0, 5).map((item) => `<button data-action="open-match" data-match-id="${escapeHTML(item.match.id)}"><span>${escapeHTML(playerName(item.match.playerAId))} × ${escapeHTML(playerName(item.match.playerBId))}</span><strong>margem ${item.margin}</strong></button>`).join("")}</article>
+            <article><h2>Maiores vitórias</h2>${(statistics.biggestWins || []).slice(0, 5).map((item) => `<button data-action="open-match" data-match-id="${escapeHTML(item.match.id)}"><span>${escapeHTML(playerName(item.winnerId))}</span><strong>margem ${item.margin}</strong></button>`).join("")}</article>
+          </section>
+          <section class="evolution-section"><div><h2>Evolução por rodada</h2><p>${escapeHTML(evolution.textSummary || "")}</p></div><div class="evolution-chart" role="img" aria-label="${escapeHTML(evolution.textSummary || "Evolução de posições por rodada")}">${(evolution.players || []).slice(0, 8).map((player) => `<div><button data-action="open-player" data-player-id="${escapeHTML(player.id)}">${escapeHTML(player.name)}</button><span>${player.positions.map((point) => `<i style="--position:${point.position};--players:${statistics.totals.players}" title="Rodada ${point.roundNumber}: ${point.position}º">${point.position}</i>`).join("")}</span></div>`).join("")}</div><details><summary>Resumo textual do gráfico</summary><ul>${(evolution.players || []).map((player) => `<li>${escapeHTML(player.name)}: ${player.positions.map((point) => `${point.position}º na rodada ${point.roundNumber}`).join(", ")}.</li>`).join("")}</ul></details></section>
+          <div class="public-subpage-footer"><button data-action="navigate" data-view="compare">Comparar dois jogadores</button><button data-action="navigate" data-view="hall">Hall da Fama</button></div>
+        </div>
+      </div>
+    `;
+  }
+
+  function renderCompare() {
+    const options = state.players.map((player) => `<option value="${escapeHTML(player.id)}">${escapeHTML(player.name)}</option>`).join("");
+    const playerAId = ui.comparePlayerAId || state.players[0]?.id || "";
+    const playerBId = ui.comparePlayerBId || state.players.find((player) => player.id !== playerAId)?.id || "";
+    ui.comparePlayerAId = playerAId;
+    ui.comparePlayerBId = playerBId;
+    const comparison = playerAId && playerBId && playerAId !== playerBId
+      ? expansionDomain()?.calculateComparison?.(state, playerAId, playerBId)
+      : null;
+    return `
+      <div class="${isAdmin() ? "workspace-page compare-page" : "public-view compare-page"}">
+        ${isAdmin() ? renderWorkspaceHeader("Comparar jogadores", "Use a mesma base estatística dos perfis e do ranking.", "Comparativo oficial") : renderPublicViewHeader("Comparar", "Dois jogadores, a mesma régua.", "Campanha, forma e retrospecto direto lado a lado.")}
+        <div class="${isAdmin() ? "compare-admin-content" : "public-view-content"}">
+          <form id="compare-form" class="compare-selectors">
+            <label><span>Primeiro jogador</span><select name="playerAId">${options.replace(`value="${escapeHTML(playerAId)}"`, `value="${escapeHTML(playerAId)}" selected`)}</select></label>
+            <b aria-hidden="true">×</b>
+            <label><span>Segundo jogador</span><select name="playerBId">${options.replace(`value="${escapeHTML(playerBId)}"`, `value="${escapeHTML(playerBId)}" selected`)}</select></label>
+            <button class="button button-primary" type="submit">Comparar</button>
+          </form>
+          ${comparison ? `<section class="comparison-board">
+            <div class="comparison-player">${renderPlayerAvatar(playerAId, "is-large")}<h2>${escapeHTML(playerName(playerAId))}</h2><span>${comparison.playerA.standing?.position || "—"}º lugar</span></div>
+            <div class="comparison-metrics">${comparison.metrics.map((metric) => `<div><strong class="${metric.leaderId === playerAId ? "is-leading" : ""}">${metric.playerA}${metric.key === "percentage" ? "%" : ""}</strong><span>${escapeHTML(metric.label)}</span><strong class="${metric.leaderId === playerBId ? "is-leading" : ""}">${metric.playerB}${metric.key === "percentage" ? "%" : ""}</strong></div>`).join("")}<div><strong>${comparison.headToHead.wins[playerAId] || 0}</strong><span>Confronto direto</span><strong>${comparison.headToHead.wins[playerBId] || 0}</strong></div></div>
+            <div class="comparison-player">${renderPlayerAvatar(playerBId, "is-large")}<h2>${escapeHTML(playerName(playerBId))}</h2><span>${comparison.playerB.standing?.position || "—"}º lugar</span></div>
+          </section><div class="comparison-actions"><button class="button button-secondary" data-action="share-comparison">Compartilhar comparação</button>${comparison.headToHead.matches[0] ? `<button class="button button-ghost" data-action="open-match" data-match-id="${escapeHTML(comparison.headToHead.matches[0].id)}">Ver confronto</button>` : ""}</div>` : `<div class="empty-state"><div class="empty-state-icon">↔</div><h3>Escolha jogadores diferentes</h3><p>O comparativo precisa de dois participantes distintos.</p></div>`}
+        </div>
+      </div>
+    `;
+  }
+
+  function cardSourceData() {
+    const domain = expansionDomain();
+    const matches = domain?.flattenMatches ? domain.flattenMatches(state) : flattenLeagueMatches();
+    const completed = matches.filter((match) => match.completed || match.result);
+    const nextMatch = findNextLeagueMatch();
+    const featuredId = state.league?.programming?.featuredMatchIds?.[0];
+    const featuredMatch = featuredId ? leagueMatchMap().get(featuredId) : null;
+    const standings = domain?.calculateStandings ? domain.calculateStandings(state) : calculateLeagueStandings();
+    const champion = getLeagueStats().isComplete ? standings[0] : null;
+    const closedPoll = polls.find((poll) => poll.status === "closed" && poll.options?.some((option) => option.playerId));
+    const pollWinner = closedPoll?.options?.slice().sort((a, b) => b.voteCount - a.voteCount)[0];
+    const type = ui.cardType;
+    const match = type === "next"
+      ? nextMatch
+      : type === "featured"
+        ? featuredMatch
+        : type === "result"
+          ? completed.at(-1)
+          : null;
+    return { type, match, standings, champion, pollWinner };
+  }
+
+  function buildSelectedCardModel() {
+    const domain = expansionDomain();
+    if (!domain?.createCardModel) return null;
+    const data = cardSourceData();
+    const typeMap = {
+      next: "next-match",
+      featured: "featured-match",
+      result: "result",
+      ranking: "ranking",
+      mvp: "mvp",
+      champion: "champion",
+    };
+    const profiles = Object.fromEntries(playerProfiles.map((profile) => [profile.playerId, profile]));
+    return domain.createCardModel(typeMap[data.type], {
+      source: state,
+      match: data.match,
+      programming: state.league?.programming,
+      ranking: data.standings,
+      playerId: data.pollWinner?.playerId || data.champion?.id,
+      profiles,
+    }, { format: ui.cardFormat, footer: state.settings.title || "Sinuca da Firma" });
+  }
+
+  function wrapCanvasText(context, text, maxWidth, maxLines = 2) {
+    const words = String(text || "").split(/\s+/);
+    const lines = [];
+    let current = "";
+    words.forEach((word) => {
+      const candidate = current ? `${current} ${word}` : word;
+      if (context.measureText(candidate).width <= maxWidth || !current) {
+        current = candidate;
+      } else {
+        lines.push(current);
+        current = word;
+      }
+    });
+    if (current) lines.push(current);
+    if (lines.length > maxLines) {
+      lines.length = maxLines;
+      let last = lines[maxLines - 1];
+      while (last.length && context.measureText(`${last}…`).width > maxWidth) last = last.slice(0, -1);
+      lines[maxLines - 1] = `${last}…`;
+    }
+    return lines;
+  }
+
+  function drawSelectedCard() {
+    const canvas = document.querySelector("#share-card-canvas");
+    const description = document.querySelector("#card-alt-text");
+    if (!canvas) return;
+    const model = buildSelectedCardModel();
+    const context = canvas.getContext("2d");
+    if (!model) {
+      canvas.width = 1080;
+      canvas.height = 1080;
+      context.fillStyle = "#062c21";
+      context.fillRect(0, 0, canvas.width, canvas.height);
+      context.fillStyle = "#ffffff";
+      context.font = "700 48px Inter, sans-serif";
+      context.fillText("Dados insuficientes para este card.", 80, 160);
+      if (description) description.textContent = "Dados insuficientes para gerar esta arte.";
+      return;
+    }
+    canvas.width = model.canvas.width;
+    canvas.height = model.canvas.height;
+    const { width, height } = canvas;
+    const safe = model.canvas.safeArea;
+    context.fillStyle = model.theme.background;
+    context.fillRect(0, 0, width, height);
+    context.fillStyle = model.theme.surface;
+    context.fillRect(safe, safe, width - safe * 2, height - safe * 2);
+    context.fillStyle = model.theme.primary;
+    context.fillRect(safe, safe, Math.max(14, width * 0.018), height - safe * 2);
+    context.fillStyle = model.theme.mutedText;
+    context.font = `700 ${Math.max(24, width * 0.027)}px Inter, sans-serif`;
+    context.fillText(model.label, safe * 1.5, safe * 1.75);
+    context.fillStyle = model.theme.text;
+    context.font = `850 ${Math.max(42, width * 0.064)}px Inter, sans-serif`;
+    const titleLines = wrapCanvasText(context, model.title, width - safe * 3, 2);
+    titleLines.forEach((line, index) => context.fillText(line, safe * 1.5, safe * 2.9 + index * width * 0.075));
+    let cursorY = safe * 5.3;
+    if (model.participants.length >= 2) {
+      model.participants.slice(0, 2).forEach((participant, index) => {
+        const x = index === 0 ? safe * 1.5 : width / 2 + safe * 0.35;
+        context.fillStyle = participant.avatar.background;
+        context.beginPath();
+        context.arc(x + width * 0.055, cursorY, width * 0.052, 0, Math.PI * 2);
+        context.fill();
+        context.fillStyle = participant.avatar.foreground;
+        context.font = `800 ${Math.max(26, width * 0.034)}px Inter, sans-serif`;
+        context.textAlign = "center";
+        context.fillText(participant.avatar.initials, x + width * 0.055, cursorY + width * 0.012);
+        context.textAlign = "left";
+        context.fillStyle = model.theme.text;
+        context.font = `800 ${Math.max(28, width * 0.035)}px Inter, sans-serif`;
+        wrapCanvasText(context, participant.name, width / 2 - safe * 2, 2).forEach((line, lineIndex) => {
+          context.fillText(line, x, cursorY + width * 0.1 + lineIndex * width * 0.04);
+        });
+      });
+      context.textAlign = "center";
+      context.fillStyle = model.theme.earnedGold;
+      context.font = `850 ${Math.max(44, width * 0.07)}px Inter, sans-serif`;
+      context.fillText(model.score ? `${model.score.playerA} × ${model.score.playerB}` : "×", width / 2, cursorY + width * 0.025);
+      context.textAlign = "left";
+    } else if (model.participants.length === 1) {
+      const participant = model.participants[0];
+      context.fillStyle = participant.avatar.background;
+      context.beginPath();
+      context.arc(width / 2, cursorY, width * 0.1, 0, Math.PI * 2);
+      context.fill();
+      context.fillStyle = participant.avatar.foreground;
+      context.font = `850 ${Math.max(42, width * 0.06)}px Inter, sans-serif`;
+      context.textAlign = "center";
+      context.fillText(participant.avatar.initials, width / 2, cursorY + width * 0.02);
+      context.fillStyle = model.theme.text;
+      context.font = `850 ${Math.max(38, width * 0.055)}px Inter, sans-serif`;
+      context.fillText(participant.name, width / 2, cursorY + width * 0.17);
+      context.textAlign = "left";
+    }
+    if (model.ranking.length) {
+      cursorY = safe * 4.9;
+      context.font = `700 ${Math.max(22, width * 0.027)}px Inter, sans-serif`;
+      model.ranking.forEach((row, index) => {
+        context.fillStyle = index === 0 ? model.theme.earnedGold : model.theme.text;
+        context.fillText(`${row.position}º  ${row.name}`, safe * 1.5, cursorY + index * width * 0.055);
+        context.textAlign = "right";
+        context.fillText(`${row.points} pts`, width - safe * 1.5, cursorY + index * width * 0.055);
+        context.textAlign = "left";
+      });
+    }
+    context.fillStyle = model.theme.mutedText;
+    context.font = `600 ${Math.max(20, width * 0.022)}px Inter, sans-serif`;
+    context.fillText(model.metadata.join(" · ") || "Campeonato interno", safe * 1.5, height - safe * 1.8);
+    context.fillStyle = model.theme.text;
+    context.font = `800 ${Math.max(22, width * 0.025)}px Inter, sans-serif`;
+    context.fillText(model.footer, safe * 1.5, height - safe);
+    if (description) description.textContent = model.altText;
+  }
+
+  function renderCardsCenter() {
+    if (!isAdmin()) return renderEmptyState("▣", "Acesso administrativo", "A central de cards é usada pela organização.", "Voltar ao início", "dashboard");
+    const source = cardSourceData();
+    return `
+      <div class="workspace-page cards-center-page">
+        ${renderWorkspaceHeader("Cards para compartilhar", "Gere PNGs no navegador. Nenhuma arte é publicada ou armazenada automaticamente.", "Canvas local · confirmação obrigatória")}
+        <section class="card cards-control-card">
+          <div class="card-body card-control-grid">
+            <label><span>Modelo</span><select id="card-type"><option value="next" ${ui.cardType === "next" ? "selected" : ""}>Próximo confronto</option><option value="featured" ${ui.cardType === "featured" ? "selected" : ""}>Jogo em destaque</option><option value="result" ${ui.cardType === "result" ? "selected" : ""}>Resultado final</option><option value="ranking" ${ui.cardType === "ranking" ? "selected" : ""}>Classificação</option><option value="mvp" ${ui.cardType === "mvp" ? "selected" : ""}>Craque da rodada</option><option value="champion" ${ui.cardType === "champion" ? "selected" : ""}>Campeão</option></select></label>
+            <label><span>Formato</span><select id="card-format"><option value="square" ${ui.cardFormat === "square" ? "selected" : ""}>Quadrado · 1080×1080</option><option value="vertical" ${ui.cardFormat === "vertical" ? "selected" : ""}>Vertical · 1080×1350</option><option value="horizontal" ${ui.cardFormat === "horizontal" ? "selected" : ""}>Horizontal · 1600×900</option></select></label>
+            <button class="button button-primary" data-action="download-card">Exportar PNG</button>
+          </div>
+          <p class="card-source-status">${source.match ? `Confronto: ${escapeHTML(playerName(source.match.playerAId))} × ${escapeHTML(playerName(source.match.playerBId))}` : source.champion ? `Campeão: ${escapeHTML(source.champion.name)}` : source.pollWinner ? `Craque: ${escapeHTML(playerName(source.pollWinner.playerId))}` : "O modelo usará os dados oficiais disponíveis."}</p>
+        </section>
+        <section class="card card-preview-card"><canvas id="share-card-canvas" aria-describedby="card-alt-text"></canvas><p id="card-alt-text" class="sr-only"></p></section>
+      </div>
+    `;
+  }
+
+  function seasonChampionName(season) {
+    return season.championName || season.champion_name || playerName(season.championPlayerId || season.champion_player_id, "Campeão não informado");
+  }
+
+  async function loadSeasonDetail(seasonId) {
+    if (!seasonId || seasonDetails[seasonId]) return seasonDetails[seasonId] || null;
+    const payload = await fetchOptionalJSON(`/api/seasons?id=${encodeURIComponent(seasonId)}`);
+    if (payload.season) seasonDetails[seasonId] = payload.season;
+    return payload.season || null;
+  }
+
+  function renderSeasonsAdmin() {
+    if (!isAdmin()) return renderHallOfFame();
+    const stats = getLeagueStats();
+    return `
+      <div class="workspace-page seasons-admin-page">
+        ${renderWorkspaceHeader("Temporadas", "Arquive um snapshot imutável sem apagar ou reiniciar o campeonato atual.", `${seasons.length} edição(ões) arquivada(s)`, `<button class="button button-ghost" data-action="navigate" data-view="hall">Ver Hall da Fama</button>`)}
+        <section class="card season-archive-card">
+          <div class="card-header"><div><h2>Encerrar e arquivar edição</h2><p>${stats.pending ? `${stats.pending} partida(s) continuam pendentes e exigirão confirmação especial.` : "Todas as partidas da liga foram concluídas."}</p></div></div>
+          <div class="card-body">
+            <form id="archive-season-form" class="form-grid">
+              <label class="field col-6"><span>Título da temporada *</span><input name="title" maxlength="140" required placeholder="Temporada 2026"></label>
+              <label class="field col-6"><span>Resumo</span><input name="summary" maxlength="1000" placeholder="A história desta edição em uma frase"></label>
+              <label class="field col-6"><span>Início</span><input name="startedAt" type="date" value="${escapeHTML(String(state.league?.createdAt || "").slice(0, 10))}"></label>
+              <label class="field col-6"><span>Fim</span><input name="endedAt" type="date" value="${new Date().toISOString().slice(0, 10)}"></label>
+              <div class="col-12 season-form-actions"><span id="season-form-status" role="status"></span><button class="button button-primary" type="submit">Arquivar temporada</button></div>
+            </form>
+          </div>
+        </section>
+        <section class="card season-reset-card"><div><h2>Iniciar outra temporada</h2><p>Esta é uma ação separada. Ela limpa tabela e resultados atuais, mas preserva jogadores, perfis, notícias e temporadas arquivadas.</p></div><button class="button button-danger button-ghost" data-action="start-new-season">Iniciar nova temporada</button></section>
+        <section class="card"><div class="card-header"><div><h2>Arquivo histórico</h2><p>Snapshots preservados no banco.</p></div></div><div class="season-admin-list">${seasons.length ? seasons.map((season) => `<button data-action="open-season" data-season-id="${escapeHTML(season.id)}"><span>${escapeHTML(season.title)}</span><strong>${escapeHTML(seasonChampionName(season))}</strong><small>${escapeHTML(season.summary || "")}</small></button>`).join("") : "<p>Nenhuma temporada arquivada.</p>"}</div></section>
+      </div>
+    `;
+  }
+
+  function renderHallOfFame() {
+    const currentStandings = expansionDomain()?.calculateStandings?.(state) || calculateLeagueStandings();
+    const currentChampion = getLeagueStats().isComplete ? currentStandings[0] : null;
+    return `
+      <div class="public-view hall-page">
+        ${renderPublicViewHeader("Hall da Fama", "A história fica na mesa.", "Campeões, pódios e temporadas preservados para consulta.", [
+          { label: "Temporadas", value: seasons.length },
+          { label: "Campeões", value: new Set(seasons.map((season) => season.championPlayerId || season.champion_player_id).filter(Boolean)).size },
+          { label: "Atual", value: currentChampion?.name || "Em disputa" },
+        ])}
+        <div class="public-view-content">
+          <section class="hall-current-champion"><span>${currentChampion ? "Campeão atual" : "Temporada atual"}</span><h2>${escapeHTML(currentChampion?.name || "Título ainda em disputa")}</h2><p>${currentChampion ? `${currentChampion.points} pontos · ${currentChampion.wins} vitórias` : `${getLeagueStats().pending} confronto(s) ainda podem definir o campeão.`}</p></section>
+          <section class="hall-season-list"><div class="public-block-title"><div><span class="public-overline">Arquivo</span><h2>Temporadas anteriores</h2></div></div>${seasons.length ? seasons.map((season) => `<article><div><span>${escapeHTML(String(season.endedAt || season.ended_at || "").slice(0, 10) || "Edição arquivada")}</span><h3>${escapeHTML(season.title)}</h3><p>${escapeHTML(season.summary || "Snapshot completo disponível.")}</p></div><div><small>Campeão</small><strong>${escapeHTML(seasonChampionName(season))}</strong><button class="button button-secondary" data-action="open-season" data-season-id="${escapeHTML(season.id)}">Ver temporada</button></div></article>`).join("") : `<div class="public-view-empty"><div><h2>O arquivo começa nesta edição</h2><p>A primeira temporada arquivada aparecerá aqui sem alterar a competição atual.</p></div></div>`}</section>
+          <section class="hall-awards"><div class="public-block-title"><div><span class="public-overline">Reconhecimento</span><h2>Premiações registradas</h2></div></div>${awards.length ? awards.slice(0, 12).map((award) => `<button data-action="open-player" data-player-id="${escapeHTML(award.playerId)}"><span>★</span><div><strong>${escapeHTML(award.title)}</strong><small>${escapeHTML(playerName(award.playerId))} · ${escapeHTML(String(award.awardedAt || "").slice(0, 10))}</small></div></button>`).join("") : "<p>Nenhuma premiação registrada até agora.</p>"}</section>
+        </div>
+      </div>
+    `;
+  }
+
+  function renderSeasonDetail() {
+    const season = seasonDetails[ui.selectedSeasonId] || seasons.find((item) => item.id === ui.selectedSeasonId);
+    if (!season) {
+      return `<div class="public-view">${renderPublicViewHeader("Temporadas", expansionLoading ? "Carregando temporada..." : "Temporada não encontrada.", "O arquivo pode ter sido removido ou o link está incompleto.")}<div class="public-view-content">${renderEmptyState("◇", "Arquivo indisponível", "Volte ao Hall da Fama para escolher outra edição.", "Hall da Fama", "hall")}</div></div>`;
+    }
+    const snapshot = season.snapshot || season.snapshotJson || season.snapshot_json;
+    const parsedSnapshot = typeof snapshot === "string" ? JSON.parse(snapshot) : snapshot;
+    const ranking = parsedSnapshot?.ranking || parsedSnapshot?.standings || parsedSnapshot?.league?.standings || [];
+    return `
+      <div class="public-view season-detail-page">
+        ${renderPublicViewHeader("Temporada", season.title, season.summary || "Snapshot histórico do campeonato.", [
+          { label: "Campeão", value: seasonChampionName(season) },
+          { label: "Vice", value: season.runnerUpName || playerName(season.runnerUpPlayerId || season.runner_up_player_id, "—") },
+          { label: "Encerrada", value: String(season.endedAt || season.ended_at || "").slice(0, 10) || "—" },
+        ])}
+        <div class="public-view-content">
+          <section class="season-podium"><div><span>1</span><strong>${escapeHTML(seasonChampionName(season))}</strong></div><div><span>2</span><strong>${escapeHTML(season.runnerUpName || playerName(season.runnerUpPlayerId || season.runner_up_player_id, "Não informado"))}</strong></div>${ranking[2] ? `<div><span>3</span><strong>${escapeHTML(ranking[2].name || playerName(ranking[2].id))}</strong></div>` : ""}</section>
+          <section class="public-view-section"><div class="public-block-title"><div><span class="public-overline">Classificação final</span><h2>Ranking da edição</h2></div></div>${ranking.length ? `<ol class="season-ranking">${ranking.map((row, index) => `<li><span>${row.position || index + 1}º</span><strong>${escapeHTML(row.name || playerName(row.id))}</strong><small>${Number(row.points) || 0} pontos · ${Number(row.wins) || 0} vitórias</small></li>`).join("")}</ol>` : "<p>Abra esta temporada novamente para carregar o snapshot completo.</p>"}</section>
+          <div class="public-subpage-footer"><button data-action="navigate" data-view="hall">Voltar ao Hall da Fama</button><button data-action="navigate" data-view="statistics">Estatísticas atuais</button></div>
+        </div>
+      </div>
+    `;
+  }
+
+  function renderPoll(poll) {
+    const isOpen = poll.status === "open";
+    return `<article class="poll-card"><div><span class="badge ${isOpen ? "badge-green" : ""}">${isOpen ? "Votação aberta" : poll.status === "closed" ? "Encerrada" : "Rascunho"}</span><h2>${escapeHTML(poll.title)}</h2><p>${escapeHTML(poll.description || "")}</p></div><div class="poll-options">${(poll.options || []).map((option) => `<button data-action="vote-poll" data-poll-id="${escapeHTML(poll.id)}" data-option-id="${escapeHTML(option.id)}" aria-pressed="${poll.userOptionId === option.id}" ${isOpen ? "" : "disabled"}><span>${escapeHTML(option.label || playerName(option.playerId))}</span><strong>${Number(option.voteCount) || 0}</strong></button>`).join("")}</div><p>${Number(poll.totalVotes) || 0} voto(s)</p>${isAdmin() ? `<div class="poll-admin-actions">${poll.status !== "closed" ? `<button class="button button-secondary" data-action="close-poll" data-poll-id="${escapeHTML(poll.id)}">Encerrar e premiar</button>` : ""}<button class="button button-danger button-ghost" data-action="delete-poll" data-poll-id="${escapeHTML(poll.id)}">Excluir</button></div>` : ""}</article>`;
+  }
+
+  function renderAwards() {
+    return `
+      <div class="${isAdmin() ? "workspace-page awards-page" : "public-view awards-page"}">
+        ${isAdmin() ? renderWorkspaceHeader("Premiações e enquetes", "Abra votações; o fechamento registra o vencedor no perfil.", `${polls.length} enquete(s)`, `<button class="button button-ghost" data-action="navigate" data-view="hall">Hall da Fama</button>`) : renderPublicViewHeader("Premiações", "A resenha também reconhece quem brilhou.", "Cada navegador possui um voto por enquete aberta.")}
+        <div class="${isAdmin() ? "awards-admin-content" : "public-view-content"}">
+          ${isAdmin() ? `<section class="card poll-editor-card"><div class="card-header"><div><h2>Nova votação</h2><p>Use para craque da rodada ou outro reconhecimento recreativo.</p></div></div><div class="card-body"><form id="poll-form" class="form-grid"><label class="field col-6"><span>Título *</span><input name="title" maxlength="180" required placeholder="Craque da rodada 4"></label><label class="field col-6"><span>Tipo</span><select name="type"><option value="round_mvp">Craque da rodada</option><option value="season_award">Premiação da temporada</option></select></label><label class="field col-12"><span>Descrição</span><input name="description" maxlength="600"></label><fieldset class="poll-player-options col-12"><legend>Jogadores indicados</legend>${state.players.map((player) => `<label><input type="checkbox" name="playerIds" value="${escapeHTML(player.id)}"><span>${escapeHTML(player.name)}</span></label>`).join("")}</fieldset><label class="field col-6"><span>Início</span><input name="startsAt" type="datetime-local"></label><label class="field col-6"><span>Fim</span><input name="endsAt" type="datetime-local"></label><button class="button button-primary col-12" type="submit">Abrir votação</button></form></div></section>` : ""}
+          <section class="poll-list">${polls.length ? polls.map(renderPoll).join("") : `<div class="empty-state"><div class="empty-state-icon">★</div><h3>Nenhuma votação agora</h3><p>As próximas premiações aparecerão aqui.</p></div>`}</section>
+          <section class="award-history"><div class="public-block-title"><div><span class="public-overline">Histórico</span><h2>Reconhecimentos</h2></div></div>${awards.length ? awards.map((award) => `<button data-action="open-player" data-player-id="${escapeHTML(award.playerId)}"><span>★</span><div><strong>${escapeHTML(award.title)}</strong><small>${escapeHTML(playerName(award.playerId))} · ${escapeHTML(award.description || "")}</small></div></button>`).join("") : "<p>Ainda não há vencedores registrados.</p>"}</section>
+        </div>
+      </div>
+    `;
+  }
+
+  function renderCommunityForm(contentType = "community", contentId = "") {
+    return `<form class="community-form" data-content-type="${escapeHTML(contentType)}" data-content-id="${escapeHTML(contentId)}"><div class="community-rules"><strong>Resenha com respeito</strong><p>Sem ataques, discriminação, exposição de dados pessoais ou conteúdo ofensivo. Mensagens podem ser denunciadas e moderadas.</p></div><label><span>Seu nome</span><input name="author" maxlength="80" placeholder="Anônimo"></label><label class="community-body"><span>Mensagem</span><textarea name="body" minlength="2" maxlength="800" required placeholder="${contentType === "match" ? "Comente a partida" : "Puxe a conversa do campeonato"}"></textarea></label><label class="honeypot" aria-hidden="true">Site<input name="website" tabindex="-1" autocomplete="off"></label><button class="button button-primary" type="submit">Publicar mensagem</button><span class="community-form-status" role="status"></span></form>`;
+  }
+
+  function renderCommunityPosts(posts = communityPosts, compact = false) {
+    const visible = posts.filter((post) => post.status === "published" || (isAdmin() && post.status !== "deleted"));
+    if (!visible.length) return `<div class="empty-state compact"><div class="empty-state-icon">☵</div><h3>A resenha começa aqui</h3><p>Publique a primeira mensagem respeitando as regras de convivência.</p></div>`;
+    return `<div class="community-post-list ${compact ? "is-compact" : ""}">${visible.map((post) => `<article class="${post.status !== "published" ? "is-hidden" : ""}"><header><strong>${escapeHTML(post.author || "Anônimo")}</strong><time datetime="${escapeHTML(post.createdAt)}">${escapeHTML(formatRelativeTime(post.createdAt))}</time></header><p>${escapeHTML(post.body)}</p><footer><button data-action="report-community" data-post-id="${escapeHTML(post.id)}">Denunciar</button>${Number(post.reportCount) ? `<span>${Number(post.reportCount)} denúncia(s)</span>` : ""}${isAdmin() ? `<button data-action="moderate-community" data-post-id="${escapeHTML(post.id)}" data-status="${post.status === "published" ? "hidden" : "published"}">${post.status === "published" ? "Ocultar" : "Republicar"}</button><button data-action="moderate-community" data-post-id="${escapeHTML(post.id)}" data-status="deleted">Excluir</button>` : ""}</footer></article>`).join("")}</div>`;
+  }
+
+  function renderCommunity() {
+    const muralPosts = communityPosts.filter((post) => !post.contentType || post.contentType === "community");
+    return `
+      <div class="${isAdmin() ? "workspace-page community-page" : "public-view community-page"}">
+        ${isAdmin() ? renderWorkspaceHeader("Mural da resenha", "Modere mensagens e denúncias sem tirar a leveza da conversa.", `${muralPosts.length} mensagem(ns)`, `<button class="button button-ghost" data-action="reload-community">Atualizar</button>`) : renderPublicViewHeader("Mural", "A conversa continua fora da mesa.", "Um espaço curto e moderado para comentários sobre o campeonato.")}
+        <div class="${isAdmin() ? "community-admin-content" : "public-view-content"}">${renderCommunityForm()}${expansionError ? `<div class="inline-error" role="alert">${escapeHTML(expansionError)} <button data-action="reload-community">Tentar novamente</button></div>` : ""}${renderCommunityPosts(muralPosts)}</div>
       </div>
     `;
   }
@@ -3235,6 +4515,7 @@
       state.league.results[matchId] = result;
       delete state.league.inProgress[matchId];
       normalizeLeagueResults();
+      registerRoundPollTask(matchId);
     } else if (kind === "third") {
       state.tournament.thirdPlaceResult = result;
     } else {
@@ -3253,6 +4534,7 @@
     render();
     const adjacent = continuation ? adjacentScoreMatch(matchId, kind, continuation) : null;
     if (adjacent) window.setTimeout(() => openScoreDialog(adjacent.id, kind), 30);
+    if (kind === "league" && !adjacent) offerResultNewsDraft(matchId);
   }
 
   function saveQuickLeagueScore(form) {
@@ -3281,10 +4563,12 @@
     state.league.results[match.id] = result;
     delete state.league.inProgress[match.id];
     normalizeLeagueResults();
+    registerRoundPollTask(match.id);
     logActivity("score", `${playerName(winnerId)} venceu`, `${match.roundName} · lançamento rápido · ${formatBallSummary(result).toLocaleLowerCase("pt-BR")}`);
     saveState();
     showToast("Resultado salvo. Próxima partida liberada para lançamento.");
     render();
+    offerResultNewsDraft(match.id);
   }
 
   async function deleteScoreFromDialog() {
@@ -3344,10 +4628,12 @@
     render();
   }
 
-  function askConfirm(title, message, actionLabel = "Confirmar") {
+  function askConfirm(title, message, actionLabel = "Confirmar", actionKind = "danger") {
     dom.confirmTitle.textContent = title;
     dom.confirmMessage.textContent = message;
     dom.confirmAction.textContent = actionLabel;
+    dom.confirmAction.classList.toggle("button-danger", actionKind === "danger");
+    dom.confirmAction.classList.toggle("button-primary", actionKind !== "danger");
     dom.confirmDialog.returnValue = "";
     dom.confirmDialog.showModal();
     return new Promise((resolve) => {
@@ -3489,12 +4775,16 @@
     if (!requireAdmin()) return;
     const player = playerById(playerId);
     if (!player) return;
+    if (state.league) {
+      showToast("Para preservar confrontos e páginas da temporada atual, arquive a edição antes de remover um jogador.", "error");
+      navigate("seasons");
+      return;
+    }
     const allowed = await prepareRosterChange(`${player.name} será removido.`);
     if (!allowed) return;
 
     state.players = state.players.filter((item) => item.id !== playerId);
     if (state.tournament) state.tournament = null;
-    if (state.league) state.league = null;
     logActivity("player", `${player.name} foi removido`, "Lista de jogadores atualizada");
     saveState();
     showToast("Jogador removido.");
@@ -3655,6 +4945,8 @@
         imageAlt: String(formData.get("imageAlt") || "").trim(),
         videoUrl: String(formData.get("videoUrl") || "").trim(),
         imageData,
+        matchId: String(formData.get("matchId") || "").trim(),
+        playerIds: String(formData.get("playerIds") || "").split(",").map((item) => item.trim()).filter(Boolean),
       };
       status.textContent = "Salvando no banco...";
       const response = await fetch("/api/news", {
@@ -3666,6 +4958,7 @@
       if (!response.ok) throw new Error(result.error || "Não foi possível salvar a notícia.");
       await readNewsFromServer();
       ui.editingNewsId = null;
+      ui.newsDraft = null;
       logActivity("news", payload.id ? "Notícia atualizada" : "Notícia publicada", payload.title);
       saveState();
       showToast(payload.status === "draft" ? "Rascunho salvo." : "Notícia publicada no site.");
@@ -3858,6 +5151,614 @@
     render();
   }
 
+  function markScheduleChange(type, text, detail) {
+    logActivity(type, text, detail);
+    saveState();
+    render();
+  }
+
+  async function setNextMatch(matchId) {
+    const match = leagueMatchMap().get(String(matchId));
+    if (!match || match.result) {
+      showToast("Somente partidas pendentes podem ser escolhidas.", "error");
+      return;
+    }
+    const nextValidation = expansionDomain()?.validateNextMatch?.(match.id, state, state.league?.programming);
+    if (nextValidation && !nextValidation.valid) {
+      showToast(nextValidation.errors[0]?.message || "Esta partida não pode ser escolhida.", "error");
+      return;
+    }
+    const conflict = availabilityConflict(match, programmingEntry(match.id).scheduledAt);
+    if (conflict.hasConflict) {
+      const confirmed = await askConfirm(
+        "Definir mesmo com aviso de disponibilidade?",
+        `${conflict.text}. A disponibilidade orienta, mas não bloqueia a decisão.`,
+        "Definir como próximo",
+        "primary",
+      );
+      if (!confirmed) return;
+    }
+    const previousId = state.league.programming.nextMatchId;
+    state.league.programming.nextMatchId = match.id;
+    state.adminTasks.forEach((task) => {
+      if (task.type === "choose-next-match" && task.status !== "done") {
+        task.status = "done";
+        task.completedAt = new Date().toISOString();
+        task.completedBy = auth.username || "admin";
+      }
+    });
+    markScheduleChange(
+      "schedule",
+      "Próximo jogo definido",
+      `${playerName(match.playerAId)} × ${playerName(match.playerBId)}${previousId ? " substituiu a seleção anterior" : ""}`,
+    );
+    showToast("Próximo jogo atualizado.");
+  }
+
+  async function toggleFeaturedMatch(matchId) {
+    const programming = state.league?.programming;
+    const match = leagueMatchMap().get(String(matchId));
+    if (!programming || !match || match.result) return;
+    if (programmingEntry(match.id).status === "cancelled") {
+      showToast("Partidas canceladas não podem ficar em destaque.", "error");
+      return;
+    }
+    const current = programming.featuredMatchIds;
+    if (current.includes(match.id)) {
+      programming.featuredMatchIds = current.filter((id) => id !== match.id);
+      markScheduleChange("schedule", "Destaque removido", `${playerName(match.playerAId)} × ${playerName(match.playerBId)}`);
+      showToast("Partida removida dos destaques.");
+      return;
+    }
+    if (current.length >= 3) {
+      const selector = document.querySelector(`[data-featured-replacement="${CSS.escape(match.id)}"]`);
+      const replacementId = selector?.value;
+      if (!replacementId) {
+        showToast("Escolha qual destaque substituir.", "error");
+        return;
+      }
+      const replacement = leagueMatchMap().get(replacementId);
+      const confirmed = await askConfirm(
+        "Substituir jogo em destaque?",
+        `${playerName(replacement?.playerAId)} × ${playerName(replacement?.playerBId)} sairá para dar lugar a ${playerName(match.playerAId)} × ${playerName(match.playerBId)}.`,
+        "Substituir destaque",
+        "primary",
+      );
+      if (!confirmed) return;
+      programming.featuredMatchIds = current.map((id) => id === replacementId ? match.id : id);
+    } else {
+      programming.featuredMatchIds.push(match.id);
+    }
+    markScheduleChange("schedule", "Jogo destacado", `${playerName(match.playerAId)} × ${playerName(match.playerBId)}`);
+    showToast("Destaques atualizados.");
+  }
+
+  async function saveScheduleForm(form) {
+    const matchId = form.dataset.matchId;
+    const match = leagueMatchMap().get(String(matchId));
+    if (!match || match.result) {
+      showToast("Esta partida não está mais pendente.", "error");
+      return;
+    }
+    const values = new FormData(form);
+    const rawDate = String(values.get("scheduledAt") || "");
+    const scheduledAt = rawDate ? new Date(rawDate).toISOString() : "";
+    const entry = {
+      scheduledAt,
+      location: String(values.get("location") || "").trim(),
+      status: String(values.get("status") || (scheduledAt ? "scheduled" : "unscheduled")),
+      priority: programmingEntry(match.id).priority || 0,
+      publicNote: String(values.get("publicNote") || "").trim(),
+      note: String(values.get("note") || "").trim(),
+      updatedAt: new Date().toISOString(),
+      updatedBy: auth.username || "admin",
+    };
+    if (entry.status === "scheduled" && !scheduledAt) {
+      showToast("Informe data e horário para marcar como agendada.", "error");
+      return;
+    }
+    const validation = expansionDomain()?.validateSchedule?.(match.id, entry, state, state.availability);
+    if (validation && !validation.valid) {
+      showToast(validation.errors[0]?.message || "Revise os dados da agenda.", "error");
+      return;
+    }
+    const conflict = availabilityConflict(match, scheduledAt);
+    if (conflict.hasConflict) {
+      const confirmed = await askConfirm(
+        "Salvar com aviso de disponibilidade?",
+        `${conflict.text}. A partida será programada se você confirmar.`,
+        "Salvar agenda",
+        "primary",
+      );
+      if (!confirmed) return;
+    }
+    state.league.programming.matches[match.id] = entry;
+    markScheduleChange("schedule", entry.status === "postponed" ? "Partida adiada" : "Agenda atualizada", `${playerName(match.playerAId)} × ${playerName(match.playerBId)} · ${entry.location || "local a definir"}`);
+    showToast(entry.status === "postponed" ? "Adiamento registrado." : "Agenda salva.");
+    if (entry.status === "scheduled") {
+      const createCard = await askConfirm(
+        "Gerar card do confronto?",
+        "A central de cards será aberta com os dados oficiais. A arte não será publicada automaticamente.",
+        "Abrir central de cards",
+        "primary",
+      );
+      if (createCard) {
+        ui.cardType = state.league.programming.nextMatchId === match.id ? "next" : "featured";
+        navigate("cards");
+      }
+    }
+  }
+
+  async function removeSchedule(matchId) {
+    const match = leagueMatchMap().get(String(matchId));
+    if (!match || !state.league?.programming?.matches?.[matchId]) return;
+    const confirmed = await askConfirm(
+      "Limpar a programação desta partida?",
+      "Data, local e observações serão removidos. O confronto continuará pendente na liga.",
+      "Limpar agenda",
+    );
+    if (!confirmed) return;
+    delete state.league.programming.matches[matchId];
+    markScheduleChange("schedule", "Programação removida", `${playerName(match.playerAId)} × ${playerName(match.playerBId)}`);
+    showToast("Programação removida.");
+  }
+
+  function saveAvailability(form) {
+    const values = new FormData(form);
+    const playerId = String(values.get("playerId") || "");
+    if (!playerById(playerId)) {
+      showToast("Selecione um jogador.", "error");
+      return;
+    }
+    const startsAtRaw = String(values.get("startsAt") || "");
+    const endsAtRaw = String(values.get("endsAt") || "");
+    const startsAt = startsAtRaw ? new Date(startsAtRaw).toISOString() : "";
+    const endsAt = endsAtRaw ? new Date(endsAtRaw).toISOString() : "";
+    if (startsAt && endsAt && new Date(endsAt) <= new Date(startsAt)) {
+      showToast("O fim precisa ser posterior ao início.", "error");
+      return;
+    }
+    const entry = {
+      id: createId("availability"),
+      status: String(values.get("status") || "not_informed"),
+      startsAt,
+      endsAt,
+      note: String(values.get("note") || "").trim(),
+      updatedAt: new Date().toISOString(),
+      updatedBy: auth.username || "admin",
+    };
+    state.availability[playerId] = state.availability[playerId] || [];
+    state.availability[playerId].unshift(entry);
+    logActivity("availability", "Disponibilidade registrada", `${playerName(playerId)} · ${availabilityLabel(entry.status)}`);
+    saveState();
+    showToast("Disponibilidade registrada.");
+    render();
+  }
+
+  function deleteAvailability(playerId, availabilityId) {
+    const entries = state.availability[playerId] || [];
+    const removed = entries.find((entry) => entry.id === availabilityId);
+    state.availability[playerId] = entries.filter((entry) => entry.id !== availabilityId);
+    logActivity("availability", "Disponibilidade removida", `${playerName(playerId)} · ${availabilityLabel(removed?.status)}`);
+    saveState();
+    showToast("Disponibilidade removida.");
+    render();
+  }
+
+  function icsEscape(value) {
+    return String(value || "").replace(/\\/g, "\\\\").replace(/\r?\n/g, "\\n").replace(/([,;])/g, "\\$1");
+  }
+
+  function downloadMatchCalendar(matchId) {
+    const match = leagueMatchMap().get(String(matchId));
+    const entry = programmingEntry(matchId);
+    if (!match || !entry.scheduledAt) return;
+    const start = new Date(entry.scheduledAt);
+    const end = new Date(start.getTime() + 60 * 60 * 1000);
+    const stamp = (date) => date.toISOString().replace(/[-:]/g, "").replace(/\.\d{3}Z$/, "Z");
+    const content = [
+      "BEGIN:VCALENDAR",
+      "VERSION:2.0",
+      "PRODID:-//Sinuca da Firma//Agenda//PT-BR",
+      "CALSCALE:GREGORIAN",
+      "BEGIN:VEVENT",
+      `UID:${icsEscape(match.id)}@sinuca-da-firma`,
+      `DTSTAMP:${stamp(new Date())}`,
+      `DTSTART:${stamp(start)}`,
+      `DTEND:${stamp(end)}`,
+      `SUMMARY:${icsEscape(`${playerName(match.playerAId)} × ${playerName(match.playerBId)}`)}`,
+      `LOCATION:${icsEscape(entry.location)}`,
+      `DESCRIPTION:${icsEscape(entry.publicNote || `Rodada ${match.roundNumber} da liga`)}`,
+      `URL:${icsEscape(`${window.location.origin}${window.location.pathname}#match/${encodeURIComponent(match.id)}`)}`,
+      "END:VEVENT",
+      "END:VCALENDAR",
+    ].join("\r\n");
+    const url = URL.createObjectURL(new Blob([content], { type: "text/calendar;charset=utf-8" }));
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = `sinuca-${match.id}.ics`;
+    link.click();
+    URL.revokeObjectURL(url);
+  }
+
+  async function shareMatch(matchId) {
+    const match = leagueMatchMap().get(String(matchId));
+    if (!match) return;
+    const url = `${window.location.origin}${window.location.pathname}#match/${encodeURIComponent(match.id)}`;
+    const entry = programmingEntry(match.id);
+    const shareData = {
+      title: `${playerName(match.playerAId)} × ${playerName(match.playerBId)}`,
+      text: `Rodada ${match.roundNumber}${entry.scheduledAt ? ` · ${formatDateTime(entry.scheduledAt)}` : ""}${entry.location ? ` · ${entry.location}` : ""}`,
+      url,
+    };
+    try {
+      if (navigator.share) await navigator.share(shareData);
+      else {
+        await navigator.clipboard.writeText(`${shareData.title}\n${shareData.text}\n${url}`);
+        showToast("Dados do confronto copiados.");
+      }
+    } catch (error) {
+      if (error.name !== "AbortError") showToast("Não foi possível compartilhar agora.", "error");
+    }
+  }
+
+  async function optimizeProfileImage(file) {
+    if (!(file instanceof File) || !file.size) return "";
+    if (!["image/jpeg", "image/png", "image/webp"].includes(file.type)) {
+      throw new Error("Use uma imagem JPG, PNG ou WebP.");
+    }
+    const source = await readFileAsDataUrl(file);
+    const image = new Image();
+    await new Promise((resolve, reject) => {
+      image.onload = resolve;
+      image.onerror = () => reject(new Error("Não foi possível abrir a foto."));
+      image.src = source;
+    });
+    const size = Math.min(640, image.naturalWidth, image.naturalHeight);
+    const canvas = document.createElement("canvas");
+    canvas.width = size;
+    canvas.height = size;
+    const context = canvas.getContext("2d");
+    const side = Math.min(image.naturalWidth, image.naturalHeight);
+    const sx = (image.naturalWidth - side) / 2;
+    const sy = (image.naturalHeight - side) / 2;
+    context.drawImage(image, sx, sy, side, side, 0, 0, size, size);
+    return canvas.toDataURL("image/webp", 0.82);
+  }
+
+  async function savePlayerProfile(form) {
+    const playerId = form.dataset.playerId;
+    const status = form.querySelector("#profile-form-status");
+    const button = form.querySelector('button[type="submit"]');
+    const values = new FormData(form);
+    button.disabled = true;
+    status.textContent = "Preparando perfil...";
+    try {
+      const image = values.get("image");
+      const imageData = image instanceof File && image.size ? await optimizeProfileImage(image) : "";
+      const payload = {
+        playerId,
+        nickname: String(values.get("nickname") || "").trim(),
+        bio: String(values.get("bio") || "").trim(),
+        favoriteShot: String(values.get("favoriteShot") || "").trim(),
+        joinedAt: String(values.get("joinedAt") || ""),
+        imageData,
+      };
+      const result = await fetchOptionalJSON("/api/players/profile", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+      playerProfiles = playerProfiles.filter((profile) => profile.playerId !== playerId);
+      playerProfiles.push(result.profile);
+      showToast("Perfil atualizado.");
+      render();
+    } catch (error) {
+      status.textContent = error.message;
+      showToast(error.message, "error");
+      button.disabled = false;
+    }
+  }
+
+  async function loadReactions(contentType, contentId) {
+    const payload = await fetchOptionalJSON(`/api/reactions?contentType=${encodeURIComponent(contentType)}&contentId=${encodeURIComponent(contentId)}`, {
+      headers: { "X-Visitor-ID": newsVisitorId() },
+    });
+    contentReactions[`${contentType}:${contentId}`] = payload;
+    return payload;
+  }
+
+  async function reactContent(contentType, contentId, reaction) {
+    try {
+      const key = `${contentType}:${contentId}`;
+      const current = contentReactions[key]?.userReaction;
+      const payload = await fetchOptionalJSON("/api/reactions", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "X-Visitor-ID": newsVisitorId() },
+        body: JSON.stringify({ contentType, contentId, reaction: current === reaction ? "" : reaction }),
+      });
+      contentReactions[key] = payload;
+      render();
+    } catch (error) {
+      showToast(error.message, "error");
+    }
+  }
+
+  async function reloadCommunity(contentType = "community", contentId = "") {
+    const query = `contentType=${encodeURIComponent(contentType)}${contentId ? `&contentId=${encodeURIComponent(contentId)}` : ""}`;
+    const payload = await fetchOptionalJSON(`/api/community?${query}`);
+    if (contentType === "community") {
+      communityPosts = communityPosts.filter((post) => post.contentType && post.contentType !== "community");
+    } else {
+      communityPosts = communityPosts.filter((post) => post.contentType !== contentType || post.contentId !== contentId);
+    }
+    communityPosts.push(...(payload.posts || []));
+  }
+
+  async function submitCommunity(form) {
+    const button = form.querySelector('button[type="submit"]');
+    const status = form.querySelector(".community-form-status");
+    const values = new FormData(form);
+    const contentType = form.dataset.contentType || "community";
+    const contentId = form.dataset.contentId || "";
+    button.disabled = true;
+    status.textContent = "Publicando...";
+    try {
+      await fetchOptionalJSON("/api/community", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "X-Visitor-ID": newsVisitorId() },
+        body: JSON.stringify({
+          contentType,
+          contentId,
+          author: String(values.get("author") || "").trim(),
+          body: String(values.get("body") || "").trim(),
+          website: String(values.get("website") || ""),
+        }),
+      });
+      await reloadCommunity(contentType, contentId);
+      showToast("Mensagem publicada.");
+      render();
+    } catch (error) {
+      status.textContent = error.message;
+      showToast(error.message, "error");
+      button.disabled = false;
+    }
+  }
+
+  async function reportCommunity(postId) {
+    const confirmed = await askConfirm("Denunciar esta mensagem?", "A organização receberá a denúncia para revisão.", "Enviar denúncia", "primary");
+    if (!confirmed) return;
+    try {
+      await fetchOptionalJSON("/api/community/report", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "X-Visitor-ID": newsVisitorId() },
+        body: JSON.stringify({ postId }),
+      });
+      showToast("Denúncia enviada.");
+    } catch (error) {
+      showToast(error.message, "error");
+    }
+  }
+
+  async function moderateCommunity(postId, status) {
+    try {
+      await fetchOptionalJSON("/api/community/moderate", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ postId, status }),
+      });
+      await readExpansionData();
+      showToast(status === "deleted" ? "Mensagem excluída." : status === "hidden" ? "Mensagem ocultada." : "Mensagem republicada.");
+      render();
+    } catch (error) {
+      showToast(error.message, "error");
+    }
+  }
+
+  async function createPoll(form) {
+    const values = new FormData(form);
+    const playerIds = values.getAll("playerIds").map(String);
+    if (playerIds.length < 2) {
+      showToast("Escolha pelo menos dois jogadores.", "error");
+      return;
+    }
+    try {
+      await fetchOptionalJSON("/api/polls", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          type: String(values.get("type") || "round_mvp"),
+          title: String(values.get("title") || "").trim(),
+          description: String(values.get("description") || "").trim(),
+          startsAt: values.get("startsAt") ? new Date(String(values.get("startsAt"))).toISOString() : "",
+          endsAt: values.get("endsAt") ? new Date(String(values.get("endsAt"))).toISOString() : "",
+          status: "open",
+          options: playerIds.map((playerId) => ({ playerId, label: playerName(playerId) })),
+        }),
+      });
+      await readExpansionData();
+      const task = state.adminTasks.find((item) => String(item.type).startsWith("round-mvp-") && item.status !== "done");
+      if (task) {
+        task.status = "done";
+        task.completedAt = new Date().toISOString();
+        task.completedBy = auth.username || "admin";
+        saveState();
+      }
+      showToast("Votação aberta.");
+      render();
+    } catch (error) {
+      showToast(error.message, "error");
+    }
+  }
+
+  async function votePoll(pollId, optionId) {
+    try {
+      const result = await fetchOptionalJSON("/api/polls/vote", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "X-Visitor-ID": newsVisitorId() },
+        body: JSON.stringify({ pollId, optionId }),
+      });
+      polls = polls.map((poll) => poll.id === pollId ? result.poll : poll);
+      showToast("Voto registrado.");
+      render();
+    } catch (error) {
+      showToast(error.message, "error");
+    }
+  }
+
+  async function closePoll(pollId) {
+    const poll = polls.find((item) => item.id === pollId);
+    if (!poll) return;
+    const confirmed = await askConfirm("Encerrar votação?", "O resultado ficará fechado e o vencedor será registrado como premiação.", "Encerrar votação", "primary");
+    if (!confirmed) return;
+    try {
+      await fetchOptionalJSON("/api/polls", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ ...poll, status: "closed", options: poll.options }),
+      });
+      await readExpansionData();
+      showToast("Votação encerrada e premiação registrada.");
+      render();
+    } catch (error) {
+      showToast(error.message, "error");
+    }
+  }
+
+  async function deletePoll(pollId) {
+    const confirmed = await askConfirm("Excluir esta votação?", "Votos e opções serão removidos.", "Excluir votação");
+    if (!confirmed) return;
+    try {
+      await fetchOptionalJSON(`/api/polls?id=${encodeURIComponent(pollId)}`, { method: "DELETE" });
+      await readExpansionData();
+      showToast("Votação excluída.");
+      render();
+    } catch (error) {
+      showToast(error.message, "error");
+    }
+  }
+
+  async function archiveSeason(form) {
+    const values = new FormData(form);
+    const pending = getLeagueStats().pending;
+    let confirmPending = false;
+    if (pending) {
+      confirmPending = await askConfirm(
+        "Arquivar com partidas pendentes?",
+        `${pending} confronto(s) ainda não possuem resultado. O snapshot registrará exatamente este estado e a liga atual continuará intacta.`,
+        "Arquivar mesmo assim",
+        "primary",
+      );
+      if (!confirmPending) return;
+    }
+    const status = form.querySelector("#season-form-status");
+    try {
+      const result = await fetchOptionalJSON("/api/seasons/archive", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          title: String(values.get("title") || "").trim(),
+          summary: String(values.get("summary") || "").trim(),
+          startedAt: String(values.get("startedAt") || ""),
+          endedAt: String(values.get("endedAt") || ""),
+          confirmPending,
+        }),
+      });
+      seasons.unshift(result.season);
+      seasonDetails[result.season.id] = result.season;
+      showToast("Temporada arquivada sem alterar a liga atual.");
+      render();
+    } catch (error) {
+      status.textContent = error.message;
+      showToast(error.message, "error");
+    }
+  }
+
+  async function startNewSeason() {
+    if (!seasons.length) {
+      showToast("Arquive a temporada atual antes de iniciar outra.", "error");
+      return;
+    }
+    const confirmed = await askConfirm(
+      "Iniciar uma nova temporada?",
+      "A tabela e os resultados atuais serão removidos. Jogadores, perfis, notícias, bolão e temporadas arquivadas serão preservados.",
+      "Iniciar nova temporada",
+    );
+    if (!confirmed) return;
+    state.league = null;
+    state.availability = {};
+    state.adminTasks = [];
+    logActivity("season", "Nova temporada iniciada", "Tabela e resultados atuais foram limpos após arquivamento");
+    saveState();
+    showToast("Nova temporada pronta para gerar a liga.");
+    navigate("league");
+  }
+
+  async function downloadCard() {
+    const canvas = document.querySelector("#share-card-canvas");
+    if (!canvas) return;
+    const blob = await new Promise((resolve) => canvas.toBlob(resolve, "image/png"));
+    if (!blob) {
+      showToast("Não foi possível exportar a arte.", "error");
+      return;
+    }
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = `sinuca-${ui.cardType}-${ui.cardFormat}.png`;
+    link.click();
+    URL.revokeObjectURL(url);
+    showToast("PNG gerado no navegador.");
+  }
+
+  function prepareNewsDraft(matchId, mode = "result") {
+    const domain = expansionDomain();
+    const draft = mode === "schedule"
+      ? domain?.generateScheduleNewsDraft?.(state, matchId, state.league?.programming)
+      : domain?.generateResultNewsDraft?.(state, matchId);
+    if (!draft) {
+      showToast("Não foi possível montar o rascunho.", "error");
+      return;
+    }
+    ui.newsDraft = {
+      ...draft,
+      status: "draft",
+      matchId: draft.associations?.matchId || matchId,
+      playerIds: draft.associations?.playerIds || [],
+    };
+    ui.editingNewsId = null;
+    navigate("news");
+    showToast("Rascunho preenchido. Revise antes de publicar.");
+  }
+
+  function offerResultNewsDraft(matchId) {
+    window.setTimeout(async () => {
+      const confirmed = await askConfirm(
+        "Gerar notícia deste resultado?",
+        "O formulário será preenchido como rascunho com jogadores, rodada, placar e data. Nada será publicado sem sua confirmação.",
+        "Gerar rascunho",
+        "primary",
+      );
+      if (confirmed) prepareNewsDraft(matchId, "result");
+    }, 80);
+  }
+
+  function registerRoundPollTask(matchId) {
+    const match = leagueMatchMap().get(String(matchId));
+    const round = state.league?.rounds?.find((item, index) => (Number(item.number) || index + 1) === match?.roundNumber);
+    if (!round?.matches?.length || !round.matches.every((item) => state.league.results?.[item.id])) return;
+    const taskType = `round-mvp-${match.roundNumber}`;
+    if (state.adminTasks.some((task) => task.type === taskType)) return;
+    state.adminTasks.unshift({
+      id: createId("task"),
+      type: taskType,
+      status: "pending",
+      text: `Abrir votação de craque da rodada ${match.roundNumber}`,
+      detail: "Todos os confrontos desta rodada foram concluídos.",
+      createdAt: new Date().toISOString(),
+    });
+  }
+
   async function handleAction(button) {
     const action = button.dataset.action;
     if (!action) return;
@@ -3881,6 +5782,122 @@
         break;
       case "toggle-match-live":
         await toggleLeagueMatchLive(button.dataset.matchId);
+        break;
+      case "set-next-match":
+        await setNextMatch(button.dataset.matchId);
+        break;
+      case "toggle-featured-match":
+        await toggleFeaturedMatch(button.dataset.matchId);
+        break;
+      case "remove-schedule":
+        await removeSchedule(button.dataset.matchId);
+        break;
+      case "delete-availability":
+        deleteAvailability(button.dataset.playerId, button.dataset.availabilityId);
+        break;
+      case "focus-schedule-list":
+        document.querySelector("#schedule-match-list")?.scrollIntoView({ behavior: window.matchMedia("(prefers-reduced-motion: reduce)").matches ? "auto" : "smooth" });
+        break;
+      case "open-player":
+        navigate(`player/${button.dataset.playerId}`);
+        break;
+      case "open-match":
+        navigate(`match/${button.dataset.matchId}`);
+        await Promise.allSettled([
+          loadReactions("match", button.dataset.matchId),
+          reloadCommunity("match", button.dataset.matchId),
+        ]);
+        render();
+        break;
+      case "open-season":
+        await loadSeasonDetail(button.dataset.seasonId);
+        navigate(`season/${button.dataset.seasonId}`);
+        break;
+      case "open-compare-with":
+        ui.comparePlayerAId = button.dataset.playerId;
+        ui.comparePlayerBId = state.players.find((player) => player.id !== button.dataset.playerId)?.id || "";
+        navigate("compare");
+        break;
+      case "open-compare-pair":
+        ui.comparePlayerAId = button.dataset.playerAId;
+        ui.comparePlayerBId = button.dataset.playerBId;
+        navigate("compare");
+        break;
+      case "open-player-match": {
+        const match = orderedAgendaMatches().find((item) =>
+          [item.playerAId, item.playerBId].includes(button.dataset.playerId)
+          && [item.playerAId, item.playerBId].includes(button.dataset.opponentId),
+        );
+        if (match) navigate(`match/${match.id}`);
+        break;
+      }
+      case "share-player": {
+        const url = `${window.location.origin}${window.location.pathname}#player/${encodeURIComponent(button.dataset.playerId)}`;
+        try {
+          if (navigator.share) await navigator.share({ title: playerName(button.dataset.playerId), url });
+          else {
+            await navigator.clipboard.writeText(url);
+            showToast("Link do perfil copiado.");
+          }
+        } catch (error) {
+          if (error.name !== "AbortError") showToast("Não foi possível compartilhar agora.", "error");
+        }
+        break;
+      }
+      case "download-ics":
+        downloadMatchCalendar(button.dataset.matchId);
+        break;
+      case "share-match":
+        await shareMatch(button.dataset.matchId);
+        break;
+      case "share-comparison": {
+        const text = `${playerName(ui.comparePlayerAId)} × ${playerName(ui.comparePlayerBId)} — compare as campanhas na Sinuca da Firma.`;
+        const url = `${window.location.origin}${window.location.pathname}#compare`;
+        try {
+          if (navigator.share) await navigator.share({ title: "Comparação de jogadores", text, url });
+          else {
+            await navigator.clipboard.writeText(`${text}\n${url}`);
+            showToast("Comparação copiada.");
+          }
+        } catch (error) {
+          if (error.name !== "AbortError") showToast("Não foi possível compartilhar agora.", "error");
+        }
+        break;
+      }
+      case "react-content":
+        await reactContent(button.dataset.contentType, button.dataset.contentId, button.dataset.reaction);
+        break;
+      case "report-community":
+        await reportCommunity(button.dataset.postId);
+        break;
+      case "moderate-community":
+        await moderateCommunity(button.dataset.postId, button.dataset.status);
+        break;
+      case "reload-community":
+        await reloadCommunity();
+        render();
+        break;
+      case "vote-poll":
+        await votePoll(button.dataset.pollId, button.dataset.optionId);
+        break;
+      case "close-poll":
+        await closePoll(button.dataset.pollId);
+        break;
+      case "delete-poll":
+        await deletePoll(button.dataset.pollId);
+        break;
+      case "start-new-season":
+        await startNewSeason();
+        break;
+      case "prepare-card":
+        ui.cardType = "next";
+        navigate("cards");
+        break;
+      case "download-card":
+        await downloadCard();
+        break;
+      case "generate-match-news":
+        prepareNewsDraft(button.dataset.matchId, leagueMatchMap().get(button.dataset.matchId)?.result ? "result" : "schedule");
         break;
       case "edit-player":
         startPlayerEdit(button.dataset.playerId);
@@ -3908,7 +5925,11 @@
         ui.selectedNewsId = button.dataset.newsId;
         window.history.pushState(null, "", `${window.location.pathname}${window.location.search}#news/${encodeURIComponent(ui.selectedNewsId)}`);
         render();
-        if (!newsEngagement[ui.selectedNewsId]) await loadAndShowNewsEngagement(ui.selectedNewsId);
+        await Promise.allSettled([
+          newsEngagement[ui.selectedNewsId] ? Promise.resolve() : loadAndShowNewsEngagement(ui.selectedNewsId),
+          loadReactions("news", ui.selectedNewsId),
+        ]);
+        render();
         window.scrollTo({ top: 0, behavior: window.matchMedia("(prefers-reduced-motion: reduce)").matches ? "auto" : "smooth" });
         break;
       case "close-news":
@@ -3931,6 +5952,7 @@
         break;
       case "cancel-news-edit":
         ui.editingNewsId = null;
+        ui.newsDraft = null;
         render();
         break;
       case "delete-news":
@@ -4003,6 +6025,37 @@
       event.preventDefault();
       saveQuickLeagueScore(event.target);
     }
+    if (event.target.matches(".schedule-inline-form")) {
+      event.preventDefault();
+      if (requireAdmin()) saveScheduleForm(event.target);
+    }
+    if (event.target.matches("#availability-form")) {
+      event.preventDefault();
+      if (requireAdmin()) saveAvailability(event.target);
+    }
+    if (event.target.matches("#player-profile-form")) {
+      event.preventDefault();
+      if (requireAdmin()) savePlayerProfile(event.target);
+    }
+    if (event.target.matches("#compare-form")) {
+      event.preventDefault();
+      const values = new FormData(event.target);
+      ui.comparePlayerAId = String(values.get("playerAId") || "");
+      ui.comparePlayerBId = String(values.get("playerBId") || "");
+      render();
+    }
+    if (event.target.matches(".community-form")) {
+      event.preventDefault();
+      submitCommunity(event.target);
+    }
+    if (event.target.matches("#poll-form")) {
+      event.preventDefault();
+      if (requireAdmin()) createPoll(event.target);
+    }
+    if (event.target.matches("#archive-season-form")) {
+      event.preventDefault();
+      if (requireAdmin()) archiveSeason(event.target);
+    }
   });
 
   dom.content.addEventListener("input", (event) => {
@@ -4011,6 +6064,14 @@
       const position = event.target.selectionStart;
       render();
       const refreshed = document.querySelector("#player-search");
+      refreshed?.focus();
+      refreshed?.setSelectionRange(position, position);
+    }
+    if (event.target.matches("#schedule-search")) {
+      ui.scheduleSearch = event.target.value;
+      const position = event.target.selectionStart;
+      render();
+      const refreshed = document.querySelector("#schedule-search");
       refreshed?.focus();
       refreshed?.setSelectionRange(position, position);
     }
@@ -4032,6 +6093,26 @@
     if (event.target.matches("#settings-score-mode")) {
       const input = document.querySelector('[name="framesToWin"]');
       if (input) input.disabled = event.target.value === "points";
+    }
+    if (event.target.matches("#schedule-round-filter")) {
+      ui.scheduleRoundFilter = event.target.value;
+      render();
+    }
+    if (event.target.matches("#schedule-status-filter")) {
+      ui.scheduleStatusFilter = event.target.value;
+      render();
+    }
+    if (event.target.matches("#schedule-availability-filter")) {
+      ui.scheduleAvailabilityFilter = event.target.value;
+      render();
+    }
+    if (event.target.matches("#card-type")) {
+      ui.cardType = event.target.value;
+      drawSelectedCard();
+    }
+    if (event.target.matches("#card-format")) {
+      ui.cardFormat = event.target.value;
+      drawSelectedCard();
     }
   });
 
@@ -4079,7 +6160,24 @@
   });
 
   window.addEventListener("keydown", (event) => {
-    if (event.key === "Escape") closeMenu();
+    if (event.key === "Escape" && document.body.classList.contains("menu-open")) {
+      closeMenu({ restoreFocus: true });
+      return;
+    }
+    if (event.key === "Tab" && document.body.classList.contains("menu-open") && dom.sidebar) {
+      const focusable = [...dom.sidebar.querySelectorAll('button:not([disabled]), a[href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])')];
+      if (focusable.length) {
+        const first = focusable[0];
+        const last = focusable[focusable.length - 1];
+        if (event.shiftKey && document.activeElement === first) {
+          event.preventDefault();
+          last.focus();
+        } else if (!event.shiftKey && document.activeElement === last) {
+          event.preventDefault();
+          first.focus();
+        }
+      }
+    }
     if (dom.scoreDialog.open && event.ctrlKey && event.key === "Enter") {
       event.preventDefault();
       dom.scoreForm.requestSubmit(dom.scoreForm.querySelector('[name="score-continuation"][value="next"]'));
@@ -4087,13 +6185,28 @@
   });
 
   window.addEventListener("popstate", async () => {
-    const parts = window.location.hash.slice(1).split("/");
-    const requested = parts[0] || "dashboard";
-    const allowed = VIEW_META[requested] && !HIDDEN_VIEWS.has(requested) && (isAdmin() || ["dashboard", "league", "league-ranking", "news"].includes(requested));
+    const route = readRoute();
+    const requested = route.view;
+    const allowed = VIEW_META[requested] && !HIDDEN_VIEWS.has(requested) && (isAdmin() || PUBLIC_VIEWS.has(requested));
     ui.currentView = allowed ? requested : "dashboard";
-    ui.selectedNewsId = requested === "news" && parts[1] ? decodeURIComponent(parts.slice(1).join("/")) : null;
+    applyRouteSelection(ui.currentView, route.id);
+    closeMenu();
+    if (ui.currentView === "season" && ui.selectedSeasonId) {
+      await loadSeasonDetail(ui.selectedSeasonId).catch(() => null);
+    }
+    if (ui.currentView === "match" && ui.selectedMatchId) {
+      await Promise.allSettled([
+        loadReactions("match", ui.selectedMatchId),
+        reloadCommunity("match", ui.selectedMatchId),
+      ]);
+    }
     render();
-    if (ui.selectedNewsId && !newsEngagement[ui.selectedNewsId]) await loadAndShowNewsEngagement(ui.selectedNewsId);
+    if (ui.selectedNewsId) {
+      await Promise.allSettled([
+        newsEngagement[ui.selectedNewsId] ? Promise.resolve() : loadAndShowNewsEngagement(ui.selectedNewsId),
+        loadReactions("news", ui.selectedNewsId),
+      ]);
+    }
     window.scrollTo({ top: 0, behavior: "auto" });
   });
 

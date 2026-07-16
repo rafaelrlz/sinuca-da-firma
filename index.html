@@ -9,6 +9,7 @@
   <link rel="stylesheet" href="styles.css">
 </head>
 <body class="is-public" data-view="dashboard">
+  <a class="skip-link" href="#app-content">Pular para o conteúdo</a>
   <div class="app-shell">
     <aside class="sidebar" id="sidebar">
       <div class="brand">
@@ -24,6 +25,9 @@
         <button class="nav-item is-active" data-view="dashboard">
           <span aria-hidden="true">▦</span> Visão geral
         </button>
+        <button class="nav-item" data-view="schedule">
+          <span aria-hidden="true">◷</span> Agenda
+        </button>
         <button class="nav-item" data-view="players">
           <span aria-hidden="true">♟</span> Jogadores
         </button>
@@ -33,12 +37,27 @@
         <button class="nav-item" data-view="league-ranking">
           <span aria-hidden="true">↕</span> Ranking da liga
         </button>
+        <button class="nav-item" data-view="statistics">
+          <span aria-hidden="true">⌁</span> Estatísticas
+        </button>
+        <button class="nav-item" data-view="seasons">
+          <span aria-hidden="true">◇</span> Temporadas
+        </button>
         <span class="nav-section-label">Conteúdo</span>
         <a class="nav-item nav-anchor" href="/bolao">
           <span aria-hidden="true">◉</span> Bolão virtual
         </a>
         <button class="nav-item" data-view="news">
           <span aria-hidden="true">▤</span> Notícias
+        </button>
+        <button class="nav-item" data-view="awards">
+          <span aria-hidden="true">★</span> Premiações
+        </button>
+        <button class="nav-item" data-view="cards">
+          <span aria-hidden="true">▣</span> Cards
+        </button>
+        <button class="nav-item" data-view="community">
+          <span aria-hidden="true">☵</span> Mural
         </button>
         <span class="nav-section-label">Sistema</span>
         <button class="nav-item" data-view="settings">
@@ -66,14 +85,16 @@
         <nav class="public-nav" aria-label="Navegação pública">
           <button type="button" data-action="navigate" data-view="dashboard">Início</button>
           <button type="button" data-action="navigate" data-view="league">Liga</button>
+          <button type="button" data-action="navigate" data-view="schedule">Agenda</button>
           <button type="button" data-action="navigate-public-ranking" aria-controls="public-league-ranking">Ranking</button>
+          <button type="button" data-action="navigate" data-view="players">Jogadores</button>
           <a href="/bolao">Bolão</a>
           <button type="button" data-action="navigate" data-view="news">Notícias</button>
         </nav>
         <a class="public-admin-link" href="/login">Área administrativa</a>
       </header>
       <header class="topbar">
-        <button class="icon-button menu-button" id="menu-button" aria-label="Abrir menu">☰</button>
+        <button class="icon-button menu-button" id="menu-button" aria-label="Abrir menu" aria-controls="sidebar" aria-expanded="false">☰</button>
         <div class="topbar-title">
           <h1 id="page-title">Visão geral</h1>
           <p id="page-subtitle">Acompanhe o andamento do campeonato.</p>
@@ -180,6 +201,7 @@
   <div class="toast-region" id="toast-region" aria-live="polite" aria-atomic="true"></div>
 
   <script src="league-schedule.js"></script>
+  <script src="expansion-domain.js"></script>
   <script src="app.js"></script>
 </body>
 </html>
